@@ -40,6 +40,7 @@ class Program
 	static Font _font16, _font24, _font32, _font48;
 
 	static string _title = null;
+	static string _author = null;
 	static string _inputFileListFormat = null;
 	static string _outputType = null;
 
@@ -404,12 +405,16 @@ class Program
 					Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
 					HorizontalAlignment = HorizontalAlignment.Right,
 				}, readSpeedString, Color.White);
-				// .DrawText(new(_font48)
-				// {
-				// 	Origin = new Vector2(OutputVideoWidth / 2, 32 + 24),
-				// 	VerticalAlignment = VerticalAlignment.Center,
-				// 	HorizontalAlignment = HorizontalAlignment.Center,
-				// }, "@unai-d", Color.White);
+
+				if (_author != null)
+				{
+					ctx.DrawText(new(_font32)
+					{
+						Origin = new Vector2(OutputVideoWidth / 2, 32 + 24),
+						VerticalAlignment = VerticalAlignment.Center,
+						HorizontalAlignment = HorizontalAlignment.Center,
+					}, _author, Color.White);
+				}
 
 				if (_title != null)
 				{
@@ -470,6 +475,10 @@ class Program
 			{
 				case "--title":
 					_title = argKvp[1].Replace("\\n", "\n");
+					break;
+
+				case "--author":
+					_author = argKvp[1];
 					break;
 
 				case "--format":

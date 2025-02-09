@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net9.0</TargetFramework>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+		<PackageReference Include="SixLabors.Fonts" Version="2.0.3" />
+		<PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.2" />
+		<!-- Used by format parsers -->
+		<PackageReference Include="PeNet" Version="4.1.1" />
+		<!-- <PackageReference Include="DiscUtils" Version="0.16.13" /> -->
+		<!-- Used by SdlExportHandler -->
+		<PackageReference Include="SDL-Sharp" Version="2.2.5" />
+		<!-- Used by FfmpegExportHandler -->
+		<PackageReference Include="FFmpeg.AutoGen" Version="7.0.0" />
+	</ItemGroup>
+
+</Project>

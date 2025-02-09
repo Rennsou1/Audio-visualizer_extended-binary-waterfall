@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using FFmpeg.AutoGen;
 using SixLabors.ImageSharp;
@@ -25,7 +26,6 @@ public class FfmpegExportHandler : ExportHandler
 	private unsafe AVPacket* _audioAvPacket;
 
 	private unsafe SwsContext* _swsCtx;
-	private unsafe SwrContext* _swrCtx;
 
 	private byte[] _audioQueue = null;
 	private long _audioQueueOfs = 0;
@@ -58,14 +58,15 @@ public class FfmpegExportHandler : ExportHandler
 			ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, "matroska", "/dev/stdout");
 			if (fmtCtx == null) Console.Error.WriteLine("cannot allocate AVFormatContext");
 			_fmtCtx = fmtCtx;
-			// Console.Error.WriteLine($"{(nuint)_fmtCtx->oformat:x}");
-			// _fmtCtx->oformat->flags ^= ffmpeg.AVFMT_GLOBALHEADER;
+			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
+			{
+				Debug.WriteLine("format requested global stream headers");
+			}
 
 			// encoders
 			// ========
 
 			AVRational videoFps; videoFps.num = 60; videoFps.den = 1;
-			// AVRational videoFps = FfmpegUtils.GetRational(60, 1);
 
 			var videoEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
 			var audioEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_AAC);
@@ -75,9 +76,6 @@ public class FfmpegExportHandler : ExportHandler
 			_videoCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
 			_videoCtx->width = 1920;
 			_videoCtx->height = 1080;
-			// FfmpegUtils.SetRational(&_videoCtx->time_base, ffmpeg.av_inv_q(videoFps));
-			// FfmpegUtils.SetRational(&_videoCtx->framerate, videoFps);
-			// Console.Error.WriteLine(_videoCtx->time_base.ToStringEx());
 			_videoCtx->time_base.num = 1;
 			_videoCtx->time_base.den = videoFps.num;
 			_videoCtx->framerate.num = videoFps.num;
@@ -87,12 +85,15 @@ public class FfmpegExportHandler : ExportHandler
 			// Console.Error.WriteLine($"using {_videoCtx->thread_count} threads");
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
-				Console.Error.WriteLine("format requested global stream headers");
 				_videoCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
 			}
 			// ffmpeg.av_opt_set(_videoCtx->priv_data, "crf", "23", 0);
-			_videoCtx->extradata = (byte*)ffmpeg.av_malloc(32);
-			_videoCtx->extradata_size = 24;
+			// h264 codec fails with EINVAL/11 if extradata does not get allocated manually.
+			if (_videoCtx->codec->id == AVCodecID.AV_CODEC_ID_H264)
+			{
+				_videoCtx->extradata = (byte*)ffmpeg.av_malloc(32);
+				_videoCtx->extradata_size = 24;
+			}
 			AVDictionary* videoEncOpts;
 			var ret = ffmpeg.avcodec_open2(_videoCtx, videoEnc, &videoEncOpts);
 			FfmpegUtils.LogIfAvError(ret, "cannot open video codec");
@@ -112,7 +113,6 @@ public class FfmpegExportHandler : ExportHandler
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
 				_audioCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
-				// Console.Error.WriteLine($"{_audioCtx->flags:B32} == {ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER:B32}");
 			}
 			ret = ffmpeg.avcodec_open2(_audioCtx, audioEnc, null);
 			FfmpegUtils.LogIfAvError(ret, "cannot open audio codec");
@@ -128,13 +128,6 @@ public class FfmpegExportHandler : ExportHandler
 
 			ret = ffmpeg.avcodec_parameters_from_context(_videoStream->codecpar, _videoCtx);
 			FfmpegUtils.LogIfAvError(ret, "cannot set video codec params from codec context");
-			if (_videoStream->codecpar->codec_id == AVCodecID.AV_CODEC_ID_H264)
-			{
-				// _videoStream->codecpar->extradata_size = 16;
-				// _videoStream->codecpar->extradata = (byte*)ffmpeg.av_mallocz(16);
-				// _videoStream->codecpar->extradata[3] = 1;
-				// Console.Error.WriteLine($"extradata: {(nuint)_videoStream->codecpar->extradata:X}");
-			}
 
 			_audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
 			if (_videoStream == null) Console.Error.WriteLine("cannot allocate audio output stream");
@@ -146,24 +139,10 @@ public class FfmpegExportHandler : ExportHandler
 			if (_audioStream->codecpar->extradata == null)
 			{
 				Console.Error.WriteLine("audio codec did not create extradata buffer");
-				// _audioStream->codecpar->extradata = (byte*)ffmpeg.av_mallocz(32);
-			}
-			// if (_audioStream->codecpar->codec_id == AVCodecID.AV_CODEC_ID_AAC)
-			// if (true)
-			{
-				Console.Error.WriteLine($"aac extradata size {_audioStream->codecpar->extradata_size}");
-				Console.Error.WriteLine($"aac extradata+2 {_audioStream->codecpar->extradata[2]:B}");
-				Console.Error.WriteLine($"aac profile {_audioStream->codecpar->extradata[2] >> 6}");
-				Console.Error.WriteLine($"aac smprate idx {(_audioStream->codecpar->extradata[2] >> 2) & 0b1111}");
-
-				// _audioStream->codecpar->extradata[0] = 0xff;
-				// _audioStream->codecpar->extradata[1] = 0xf9;
-				// _audioStream->codecpar->extradata[2] = 0b01_0011_0_0;
-				// _audioStream->codecpar->extradata[3] = 0b10_0_0_0_0_00;
-				// _audioStream->codecpar->extradata[6] = 0xfc;
 			}
 
-			// Console.Error.WriteLine($"audio str: {_audioStream->codecpar->sample_rate}hz {_audioStream->codecpar->ch_layout.nb_channels}ch");
+			// output file/stream
+			// ==================
 
 			ret = ffmpeg.avio_open(&_fmtCtx->pb, "pipe:", ffmpeg.AVIO_FLAG_WRITE);
 			FfmpegUtils.LogIfAvError(ret, "cannot open stdout");
@@ -260,7 +239,6 @@ public class FfmpegExportHandler : ExportHandler
 			packet->stream_index = stream->index;
 			packet->time_base.num = stream->time_base.num;
 			packet->time_base.den = stream->time_base.den;
-			// Console.Error.WriteLine($"pkt: {packet->data[0]:x2} {packet->data[1]:x2} {packet->data[2]:x2} {packet->data[3]:x2}");
 			// FfmpegUtils.LogPacketData(packet);
 
 			ret = ffmpeg.av_interleaved_write_frame(_fmtCtx, packet);
@@ -347,7 +325,6 @@ public class FfmpegExportHandler : ExportHandler
 			var firstHalfSize = _audioQueue.Length - _audioQueueOfs;
 			var secondHalfSize = Math.Abs(_audioQueue.Length - newAudioBufferOfs);
 			Array.Copy(audioFrame, 0, _audioQueue, _audioQueueOfs, firstHalfSize);
-			// Console.Error.WriteLine($"audio buf overflow of {overflow}");
 			
 			_audioQueueOfs = 0;
 
@@ -368,7 +345,7 @@ public class FfmpegExportHandler : ExportHandler
 			Array.Copy(audioFrame, 0, _audioQueue, _audioQueueOfs, audioFrame.Length);
 			_audioQueueOfs += audioFrame.Length;
 		}
-		// Console.Error.WriteLine($"audio buf status: filled {_audioQueueOfs}/{_audioQueue.Length} {_audioQueue.Length - _audioQueueOfs} bytes left");
+		Debug.WriteLine($"audio buf status: filled {_audioQueueOfs}/{_audioQueue.Length} {_audioQueue.Length - _audioQueueOfs} bytes left");
 
 		if (_frameNum % 10 == 0)
 		{

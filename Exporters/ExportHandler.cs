@@ -1,6 +1,6 @@
 using SixLabors.ImageSharp;
 
-namespace Unai.ExtendedBinaryWaterfall;
+namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 public abstract class ExportHandler
 {

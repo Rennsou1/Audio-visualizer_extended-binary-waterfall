@@ -6,7 +6,7 @@ using SDL_Sharp.Loader;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
-namespace Unai.ExtendedBinaryWaterfall;
+namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 public class SdlExportHandler : ExportHandler
 {

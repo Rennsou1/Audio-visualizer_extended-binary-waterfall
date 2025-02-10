@@ -37,7 +37,8 @@ public class FfmpegExportHandler : ExportHandler
 	{
 		unsafe
 		{
-			if (Environment.OSVersion.Platform != PlatformID.Win32NT) ffmpeg.RootPath = "/usr/lib";
+			ffmpeg.RootPath = FfmpegUtils.GetFfmpegLibraryPath();
+			Logger.Debug($"FFmpeg library path: '{ffmpeg.RootPath}'.");
 			
 			ffmpeg.av_log_set_level(LogLevel);
 			av_log_set_callback_callback logCb = (p0, level, format, v1) =>

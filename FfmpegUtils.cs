@@ -1,5 +1,6 @@
 using System;
-using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using FFmpeg.AutoGen;
 
@@ -7,6 +8,40 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 public static class FfmpegUtils
 {
+	private static readonly string[] _ffmpegSearchPathsLinux =
+	[
+		"/usr/lib",
+		"/usr/lib64",
+		"/usr/lib32",
+		"/lib",
+		"/lib64",
+		"/lib32"
+	];
+
+	private static readonly string[] _ffmpegSearchPathsWindows =
+	[
+		"C:\\ffmpeg"
+	];
+
+	public static string GetFfmpegLibraryPath()
+	{
+		if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+		{
+			var ret = _ffmpegSearchPathsWindows
+				.Where(Directory.Exists)
+				.Where(x => Directory.GetFiles(x, "libavcodec-*.dll").Length > 0);
+			return ret.FirstOrDefault();
+		}
+		else
+		{
+			var ret = _ffmpegSearchPathsLinux
+				.Where(Directory.Exists)
+				.Where(x => File.Exists($"{x}/libavcodec.so"));
+			Logger.Debug($"{ret.Count()} auto-detected library paths.");
+			return ret.FirstOrDefault();
+		}
+	}
+
 	public unsafe static void LogIfAvError(int errorCode, string message)
 	{
 		if (errorCode < 0)

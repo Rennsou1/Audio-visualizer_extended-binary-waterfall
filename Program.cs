@@ -20,7 +20,7 @@ class Program
 {
 	static Stream _inputStream = null;
 	static Stream _inputFileListStream = null;
-	static ExportHandler _exporter = new FfmpegExportHandler();
+	static ExportHandler _exporter = null;
 
 	static List<SubFile> _subfiles = [];
 
@@ -114,27 +114,37 @@ class Program
 
 		Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
 
-		Logger.Info("Initializing export handler…");
+		Logger.Info("Setting exporter…");
+		Logger.Debug($"Requested exporter: '{_outputType}'.");
 
-		switch (_outputType)
+		if (_outputType != null)
 		{
-			case "sdl":
-				_exporter = new SdlExportHandler();
-				break;
-
-			case "null":
-				_exporter = new NullExportHandler();
-				break;
-
-			case null:
-				break;
-
-			default:
-				throw new Exception("Unknown output type.");
+			var availableExporters = Utils.GetTypesWithAttribute<ExporterAttribute>();
+			foreach (var exporter in availableExporters)
+			{
+				var exporterAttr = exporter.GetCustomAttribute<ExporterAttribute>();
+				if (exporterAttr.Id != _outputType)
+				{
+					continue;
+				}
+				_exporter = (ExportHandler)Activator.CreateInstance(exporter);
+				Logger.Debug($"Exporter {exporterAttr.Name} selected.");
+			}
+			if (_exporter == null)
+			{
+				Logger.Fail($"Unknown exporter ID: '{_outputType}'.");
+				return;
+			}
+		}
+		else
+		{
+			Logger.Debug("No exporter requested. Using SDL…");
+			_exporter = new SdlExportHandler();
 		}
 
+		Logger.Info("Preparing audio/video generation…");
+
 		int bytesPerFrame = WaterfallWidth * 4;
-		// int bytesPerLine = WaterfallWidth * 4;
 		int videoFrameX1 = OutputVideoWidth / 4 - WaterfallScaledWidth / 2;
 		int videoFrameX2 = OutputVideoWidth / 4 + WaterfallScaledWidth / 2;
 		int videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;

@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Processing;
 
@@ -230,5 +230,12 @@ public static class Utils
 		Console.Error.WriteLine($"[{br.BaseStream.Position:X12}] {bufHex} {bufAscii}");
 
 		br.BaseStream.Position = ofs;
+	}
+
+	public static IEnumerable<Type> GetTypesWithAttribute<T>(Assembly asm = null) where T : Attribute, new()
+	{
+		asm ??= Assembly.GetExecutingAssembly();
+		return asm.GetExportedTypes()
+			.Where(t => t.GetCustomAttribute<T>() != null);
 	}
 }

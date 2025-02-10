@@ -123,7 +123,8 @@ class Program
 				break;
 
 			case "null":
-				return;
+				_exporter = new NullExportHandler();
+				break;
 
 			case null:
 				break;

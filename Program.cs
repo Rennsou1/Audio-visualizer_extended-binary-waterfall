@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using SixLabors.Fonts;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing.Processing;
@@ -50,6 +51,9 @@ class Program
 	{
 		// Make decimals use "." instead of other characters.
 		CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+
+		var asmVer = FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
+		Logger.Info($"Extended Binary Waterfall {asmVer}");
 
 		if (!ParseCommandLineArguments(args))
 		{

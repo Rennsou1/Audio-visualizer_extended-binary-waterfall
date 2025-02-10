@@ -16,7 +16,6 @@ public class SdlExportHandler : ExportHandler
 	private Window _win;
 	private Renderer _ren;
 	private PSurface _surface;
-	// private AudioSpec _audioSpec;
 	private uint _audioDeviceId;
 
 	private Stopwatch _sw = new();
@@ -40,12 +39,10 @@ public class SdlExportHandler : ExportHandler
 			audioSpec.Format = 8;
 			audioSpec.Channels = 2;
 			audioSpec.Samples = (ushort)(2 * audioSpec.Frequency / Program.OutputFps);
-			// Console.Error.WriteLine($"{audioSpec.Frequency} {audioSpec.Samples}");
+			Logger.Debug($"SDL audio specs: {audioSpec.Frequency}Hz {audioSpec.Samples} samples");
 			_audioDeviceId = SDL.OpenAudioDevice(null, 0, &audioSpec, null, 0);
-			Console.Error.WriteLine($"OpenAudioDevice() = {_audioDeviceId}");
+			Logger.Debug($"OpenAudioDevice() = {_audioDeviceId}");
 			_ = SDL.PauseAudioDevice(_audioDeviceId, false);
-
-			// _audioSpec = audioSpec;
 		}
 		_sw.Start();
 		_init = true;
@@ -89,7 +86,10 @@ public class SdlExportHandler : ExportHandler
 			Marshal.Copy(_framebuffer, 0, (nint)((Surface*)_surface)->Pixels, _framebuffer.Length);
 				
 			var tex = SDL.CreateTextureFromSurface(_ren, _surface);
-			if (tex.IsNull) Console.Error.WriteLine("Texture is null!");
+			if (tex.IsNull)
+			{
+				Logger.Error("Texture is null!");
+			}
 			SDL.RenderCopy(_ren, tex, 0, 0);
 
 			SDL.RenderPresent(_ren);
@@ -113,7 +113,7 @@ public class SdlExportHandler : ExportHandler
 				fixed (byte* audioBufPtr = audioFrame)
 				{
 					var ret = SDL.QueueAudio(_audioDeviceId, audioBufPtr, audioFrame.Length);
-					// if (ret != 0) Console.Error.WriteLine($"cannot queue audio (errno {ret}): {SDL.GetError()}");
+					if (ret != 0) Logger.Error($"Cannot queue audio buffer (code {ret}): {SDL.GetError()}");
 				}
 			}
 		}

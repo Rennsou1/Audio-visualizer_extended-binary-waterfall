@@ -48,9 +48,17 @@ class Program
 
 	static void Main(string[] args)
 	{
+		// Make decimals use "." instead of other characters.
 		CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 
-		ParseCommandLineArguments(args);
+		if (!ParseCommandLineArguments(args))
+		{
+			Logger.Fail("Invalid command line arguments. Exiting…");
+			return;
+		}
+
+		Logger.Info("Parsing subfiles…");
+		Logger.Debug($"Target file format: '{_inputFileListFormat}'.");
 
 		switch (_inputFileListFormat)
 		{
@@ -97,9 +105,11 @@ class Program
 
 		_subfiles = [.. _subfiles
 			.OrderBy(sf => sf.StartOffset)
-			.Select(sf => Utils.ParsePe(_inputStream, sf))];
+			.Select(sf => Utils.ParseSubfile(_inputStream, sf))];
 
-		// 0. Prepare Video Generation
+		Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
+
+		Logger.Info("Initializing export handler…");
 
 		switch (_outputType)
 		{
@@ -126,7 +136,7 @@ class Program
 		int audioSampleRate = bytesPerFrame * OutputFps / 2;
 		int audioOutputBytesPerFrame = (48000 * 2) / OutputFps;
 
-		Console.Error.WriteLine($"Waterfall duration will be {TimeSpan.FromSeconds(_inputStream.Length / (bytesPerFrame * OutputFps))}.");
+		Logger.Debug($"Waterfall duration will be {TimeSpan.FromSeconds(_inputStream.Length / (bytesPerFrame * OutputFps))}.");
 
 		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
 		_audioBuffer = Enumerable.Repeat((byte)128, audioOutputBytesPerFrame).ToArray();
@@ -144,15 +154,17 @@ class Program
 
 		// 1. Intro
 
-		GenerateIntro(OutputVideoWidth, OutputVideoHeight, OutputFps, _font48, _font24);
+		GenerateIntro();
 
 		// 2. Main Video
 
 		GenerateMainVideo(targetFileReader, bytesPerFrame, videoFrameX1, videoFrameY1, audioOutputBytesPerFrame);
 	}
 
-	private static void GenerateIntro(int outputWidth, int outputHeight, int outputFramerate, Font font48, Font font24)
+	private static void GenerateIntro()
 	{
+		Logger.Info("Generating introduction…");
+
 		var totalFrames = (5 * OutputFps); // 60FPS = 300
 
 		for (long frameNumber = 0; frameNumber < totalFrames; frameNumber++)
@@ -160,18 +172,18 @@ class Program
 			_frameContent.Mutate(ctx => ctx.Clear(new Rgba32(16, 16, 16, 255)));
 
 			_frameContent.Mutate(av => av
-				.DrawText(new RichTextOptions(font48)
+				.DrawText(new RichTextOptions(_font48)
 				{
-					Origin = new Vector2(outputWidth / 2, outputHeight / 2),
+					Origin = new Vector2(OutputVideoWidth / 2, OutputVideoHeight / 2),
 					HorizontalAlignment = HorizontalAlignment.Center,
 					TextAlignment = TextAlignment.Center,
 				}, "DISCLAIMER\n\nThis video contains\nhigh speed flashing lights\nand loud noises", Color.White)
-				.DrawText(new RichTextOptions(font24)
+				.DrawText(new RichTextOptions(_font24)
 				{
-					Origin = new Vector2(outputWidth / 2, outputHeight - 128),
+					Origin = new Vector2(OutputVideoWidth / 2, OutputVideoHeight - 128),
 					HorizontalAlignment = HorizontalAlignment.Center,
-				}, $"Starting in {(totalFrames - frameNumber) / (float)outputFramerate:N1} seconds…", Color.White)
-				.DrawProgressBar(frameNumber / (float)totalFrames, (int)(outputWidth * 0.3), (int)(outputWidth * 0.7), outputHeight - 64));
+				}, $"Starting in {(totalFrames - frameNumber) / (float)OutputFps:N1} seconds…", Color.White)
+				.DrawProgressBar(frameNumber / (float)totalFrames, (int)(OutputVideoWidth * 0.3), (int)(OutputVideoWidth * 0.7), OutputVideoHeight - 64));
 
 			_exporter.PushNewFrame(_frameContent, _audioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
@@ -180,7 +192,7 @@ class Program
 
 	private static void GenerateMainVideo(BinaryReader targetFileReader, int bytesPerFrame, int videoFrameX1, int videoFrameY1, int audioOutputBytesPerFrame)
 	{
-		Console.Error.WriteLine("Binary waterfall started!");
+		Logger.Info("Generating binary waterfall…");
 
 		string avSettingsString = $"{bytesPerFrame * OutputFps / 2} Hz, PCM unsigned 8-bit, stereo\nRGBA (32bpp), {WaterfallWidth} px/line";
 		string readSpeedString = $"{(bytesPerFrame * OutputFps) / 1024} KiB/s";
@@ -454,16 +466,18 @@ class Program
 		_exporter.Finish();
 	}
 
-	private static void ParseCommandLineArguments(IEnumerable<string> args = null)
+	private static bool ParseCommandLineArguments(IEnumerable<string> args = null)
 	{
+		Logger.Info("Parsing command line arguments…");
+
 		foreach (var arg in args ?? Environment.GetCommandLineArgs()[1..])
 		{
 			if (!arg.StartsWith('-'))
 			{
 				if (_inputStream != null)
 				{
-					Console.Error.WriteLine("Cannot specify more than two input files.");
-					continue;
+					Logger.Error("Cannot specify more than two input files.");
+					return false;
 				}
 				_inputStream = File.OpenRead(arg);
 				_title ??= arg;
@@ -494,5 +508,7 @@ class Program
 					break;
 			}
 		}
+
+		return true;
 	}
 }

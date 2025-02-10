@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using FFmpeg.AutoGen;
 using SixLabors.ImageSharp;
@@ -32,17 +31,19 @@ public class FfmpegExportHandler : ExportHandler
 
 	private int _frameNum = 0;
 
+	public int LogLevel { get; set; } = ffmpeg.AV_LOG_INFO;
+
 	public void InitializeFfmpeg()
 	{
 		unsafe
 		{
 			if (Environment.OSVersion.Platform != PlatformID.Win32NT) ffmpeg.RootPath = "/usr/lib";
 			
-			// ffmpeg.av_log_set_level(ffmpeg.AV_LOG_DEBUG);
+			ffmpeg.av_log_set_level(LogLevel);
 			av_log_set_callback_callback logCb = (p0, level, format, v1) =>
 			{
 				if (level > ffmpeg.av_log_get_level()) return;
-				var messageBufferLen = 1024;
+				var messageBufferLen = 1024; // is this too much for the stack?
 				var messageBuffer = stackalloc byte[messageBufferLen];
 				var printPrefix = 1;
 				ffmpeg.av_log_format_line(p0, level, format, v1, messageBuffer, messageBufferLen, &printPrefix);
@@ -54,13 +55,15 @@ public class FfmpegExportHandler : ExportHandler
 			// format
 			// ======
 
-			AVFormatContext* fmtCtx = null;
-			ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, "matroska", "/dev/stdout");
-			if (fmtCtx == null) Console.Error.WriteLine("cannot allocate AVFormatContext");
-			_fmtCtx = fmtCtx;
+			{
+				AVFormatContext* fmtCtx = null;
+				ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, "matroska", "/dev/stdout");
+				if (fmtCtx == null) Console.Error.WriteLine("cannot allocate AVFormatContext");
+				_fmtCtx = fmtCtx;
+			}
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
-				Debug.WriteLine("format requested global stream headers");
+				Logger.Debug("Format requested global stream headers.");
 			}
 
 			// encoders
@@ -121,7 +124,7 @@ public class FfmpegExportHandler : ExportHandler
 			// =======
 
 			_videoStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
-			if (_videoStream == null) Console.Error.WriteLine("cannot allocate video output stream");
+			if (_videoStream == null) Logger.Error("cannot allocate video output stream");
 			_videoStream->index = (int)(_fmtCtx->nb_streams - 1);
 			_videoStream->time_base = _videoCtx->time_base;
 			_videoStream->r_frame_rate = videoFps;
@@ -130,7 +133,7 @@ public class FfmpegExportHandler : ExportHandler
 			FfmpegUtils.LogIfAvError(ret, "cannot set video codec params from codec context");
 
 			_audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
-			if (_videoStream == null) Console.Error.WriteLine("cannot allocate audio output stream");
+			if (_videoStream == null) Logger.Error("cannot allocate audio output stream");
 			_audioStream->index = (int)(_fmtCtx->nb_streams - 1);
 			_audioStream->time_base = FfmpegUtils.GetRational(1, 48000);
 			
@@ -138,7 +141,7 @@ public class FfmpegExportHandler : ExportHandler
 			FfmpegUtils.LogIfAvError(ret, "cannot set audio codec params from codec context");
 			if (_audioStream->codecpar->extradata == null)
 			{
-				Console.Error.WriteLine("audio codec did not create extradata buffer");
+				Logger.Error("audio codec did not create extradata buffer");
 			}
 
 			// output file/stream
@@ -188,18 +191,18 @@ public class FfmpegExportHandler : ExportHandler
 
 			if ((_audioCtx->codec->capabilities & ffmpeg.AV_CODEC_CAP_VARIABLE_FRAME_SIZE) == 0)
 			{
-				Console.Error.WriteLine("audio codec does not support variable frame size");
+				Logger.Error("audio codec does not support variable frame size");
 			}
 
 			ret = ffmpeg.av_frame_get_buffer(_audioAvFrame, 0);
 			FfmpegUtils.LogIfAvError(ret, "cannot allocate audio sample buffer");
 			_audioQueue = new byte[_audioAvFrame->nb_samples * _audioAvFrame->ch_layout.nb_channels];
 
-			// Console.Error.WriteLine($"original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
-			// Console.Error.WriteLine($"target linesize =   {_videoAvFrame->linesize[0]} {_videoAvFrame->linesize[1]} {_videoAvFrame->linesize[2]}");
-			// Console.Error.WriteLine($"req. frame size =   {_audioCtx->frame_size} * {_audioCtx->ch_layout.nb_channels}ch");
-			// Console.Error.WriteLine($"ch layout =         {_audioAvFrame->ch_layout.nb_channels} {_audioAvFrame->ch_layout.order} {_audioAvFrame->ch_layout.u.mask}");
-			// Console.Error.WriteLine($"audio linesizes =   {_audioAvFrame->linesize[0]} {_audioAvFrame->linesize[1]} {_audioAvFrame->linesize[2]} {_audioAvFrame->linesize[3]} {_audioAvFrame->linesize[4]} {_audioAvFrame->linesize[5]} {_audioAvFrame->linesize[6]} {_audioAvFrame->linesize[7]}");
+			Logger.Debug($"original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
+			Logger.Debug($"target linesize =   {_videoAvFrame->linesize[0]} {_videoAvFrame->linesize[1]} {_videoAvFrame->linesize[2]}");
+			Logger.Debug($"req. frame size =   {_audioCtx->frame_size} * {_audioCtx->ch_layout.nb_channels}ch");
+			Logger.Debug($"ch layout =         {_audioAvFrame->ch_layout.nb_channels} {_audioAvFrame->ch_layout.order} {_audioAvFrame->ch_layout.u.mask}");
+			Logger.Debug($"audio linesizes =   {_audioAvFrame->linesize[0]} {_audioAvFrame->linesize[1]} {_audioAvFrame->linesize[2]} {_audioAvFrame->linesize[3]} {_audioAvFrame->linesize[4]} {_audioAvFrame->linesize[5]} {_audioAvFrame->linesize[6]} {_audioAvFrame->linesize[7]}");
 
 			_videoAvPacket = ffmpeg.av_packet_alloc();
 			_audioAvPacket = ffmpeg.av_packet_alloc();
@@ -213,10 +216,7 @@ public class FfmpegExportHandler : ExportHandler
 	{
 		int ret;
 
-		// if (frame != null)
-		// {
-		// 	Console.Error.WriteLine($"frm: str={stream->index} pts={frame->pts} dts=n/a dur={frame->duration} tb={frame->time_base.num}/{frame->time_base.den}");
-		// }
+		FfmpegUtils.LogFrameData(frame);
 
 		ret = ffmpeg.avcodec_send_frame(cCtx, frame);
 		FfmpegUtils.LogIfAvError(ret, "cannot send frame to encoder");
@@ -239,7 +239,7 @@ public class FfmpegExportHandler : ExportHandler
 			packet->stream_index = stream->index;
 			packet->time_base.num = stream->time_base.num;
 			packet->time_base.den = stream->time_base.den;
-			// FfmpegUtils.LogPacketData(packet);
+			FfmpegUtils.LogPacketData(packet);
 
 			ret = ffmpeg.av_interleaved_write_frame(_fmtCtx, packet);
 			FfmpegUtils.LogIfAvError(ret, "cannot write packet");
@@ -274,12 +274,13 @@ public class FfmpegExportHandler : ExportHandler
 		_audioAvFrame->pts = (long)(_audioAvFrame->sample_rate * (_frameNum / (float)Program.OutputFps));
 		_audioAvFrame->duration = 48000 / 1024;
 
+		// TODO: move to init method
 		if (_swsCtx == null)
 		{
 			_swsCtx = ffmpeg.sws_getContext(videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFramePre->format, videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFrame->format, ffmpeg.SWS_BILINEAR, null, null, null);
 			if (_swsCtx == null)
 			{
-				Console.Error.WriteLine("cannot initialize sws context");
+				Logger.Error("cannot initialize sws context");
 			}
 		}
 
@@ -310,8 +311,6 @@ public class FfmpegExportHandler : ExportHandler
 				}
 			});
 		}
-
-		// Console.Error.WriteLine($"\n{(ulong)_videoAvFrame->data[0]:X16} {(ulong)_videoAvFrame->data[1]:X16} {(ulong)_videoAvFrame->data[2]:X16} {_videoAvFrame->width}x{_videoAvFrame->height} {_videoAvFrame->format:X}");
 
 		_videoAvFrame->time_base.num = _videoCtx->time_base.num;
 		_videoAvFrame->time_base.den = _videoCtx->time_base.den;
@@ -345,11 +344,11 @@ public class FfmpegExportHandler : ExportHandler
 			Array.Copy(audioFrame, 0, _audioQueue, _audioQueueOfs, audioFrame.Length);
 			_audioQueueOfs += audioFrame.Length;
 		}
-		Debug.WriteLine($"audio buf status: filled {_audioQueueOfs}/{_audioQueue.Length} {_audioQueue.Length - _audioQueueOfs} bytes left");
+		Logger.Trace($"audio buf status: filled {_audioQueueOfs}/{_audioQueue.Length} {_audioQueue.Length - _audioQueueOfs} bytes left");
 
 		if (_frameNum % 10 == 0)
 		{
-			Console.Error.Write($"frame {_frameNum}, ts {_frameNum / 60}, framegen speed {(int)(1/delta)} fps\x1b[K\x1b[G");
+			Logger.Trace($"frame {_frameNum}, ts {_frameNum / 60}, framegen speed {(int)(1/delta)} fps\x1b[K\x1b[G");
 		}
 
 		_frameNum++;
@@ -357,9 +356,11 @@ public class FfmpegExportHandler : ExportHandler
 
 	public override unsafe void Finish()
 	{
+		Logger.Debug("Flushing streams…");
 		DoEncode(_videoCtx, _videoStream, null, _videoAvPacket);
 		DoEncode(_audioCtx, _audioStream, null, _audioAvPacket);
 
+		Logger.Debug("Freeing FFmpeg resources…");
 		ffmpeg.sws_freeContext(_swsCtx);
 		var videoCtx = _videoCtx;
 		ffmpeg.avcodec_free_context(&videoCtx);

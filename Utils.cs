@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using SixLabors.ImageSharp;
@@ -143,11 +144,11 @@ public static class Utils
 		yield return output;
 	}
 
-	internal static SubFile ParsePe(Stream target, SubFile sf)
+	internal static SubFile ParseSubfile(Stream target, SubFile sf)
 	{
 		if (sf.Extension == ".exe" || sf.Extension == ".dll" || sf.Extension == ".sys" || sf.Extension == ".scr")
 		{
-			Console.Error.WriteLine($"parsing pe: {sf.Path}");
+			Logger.Debug($"Parsing PE executable from subfile '{sf.Path}'…");
 			try
 			{
 				target.Position = sf.StartOffset;
@@ -186,7 +187,7 @@ public static class Utils
 			}
 			catch (Exception ex)
 			{
-				Console.Error.WriteLine(ex.Message);
+				Logger.Error($"Cannot parse PE executable: {ex.Message}");
 			}
 		}
 		else if (sf.Extension == ".png" || sf.Extension == ".jpg" || sf.Extension == ".tif" || sf.Extension == ".gif")
@@ -200,11 +201,11 @@ public static class Utils
 			}
 			catch (Exception ex)
 			{
-				Console.Error.WriteLine(ex.Message);
+				Logger.Error($"Cannot read image subfile: {ex.Message}");
 			}
 		}
 					
-		sf.Icon?.Mutate(ctx => ctx.Resize(128, 128));
+		sf.Icon?.Mutate(ctx => ctx.Resize(0, 128));
 
 		return sf;
 	}

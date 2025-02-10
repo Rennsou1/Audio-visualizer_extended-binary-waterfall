@@ -13,15 +13,9 @@ public static class FfmpegUtils
 		{
 			byte* errbuf = (byte*)ffmpeg.av_malloc(1024);
 			ffmpeg.av_make_error_string(errbuf, 1024, errorCode);
-			Console.Error.WriteLine($"\x1b[91mFFmpeg error: {message}: {Marshal.PtrToStringUTF8((nint)errbuf)} ({errorCode})\x1b[0m");
+			Logger.Error($"FFmpeg error {errorCode}: {message}: {Marshal.PtrToStringUTF8((nint)errbuf)}");
 			ffmpeg.av_free(errbuf);
 		}
-	}
-
-	public static void LogCall(string s)
-	{
-		StackFrame sf = new(1);
-		Console.Error.WriteLine($" <--- {sf.GetMethod().Name} {s}");
 	}
 
 	public static AVRational GetRational(int num, int den)
@@ -32,8 +26,16 @@ public static class FfmpegUtils
 		return ret;
 	}
 
+	public unsafe static void LogFrameData(AVFrame* frame)
+	{
+		if (frame != null)
+		{
+			Logger.Trace($"frm: pts={frame->pts} dur={frame->duration} tb={frame->time_base.num}/{frame->time_base.den}");
+		}
+	}
+
 	public unsafe static void LogPacketData(AVPacket* packet)
 	{
-		Console.Error.WriteLine($"pkt: str={packet->stream_index} pts={packet->pts} dts={packet->dts} dur={packet->duration} tb={packet->time_base.num}/{packet->time_base.den}");
+		Logger.Trace($"pkt: str={packet->stream_index} pts={packet->pts} dts={packet->dts} dur={packet->duration} tb={packet->time_base.num}/{packet->time_base.den}");
 	}
 }

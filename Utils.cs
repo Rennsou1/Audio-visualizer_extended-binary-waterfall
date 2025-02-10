@@ -146,63 +146,67 @@ public static class Utils
 
 	internal static SubFile ParseSubfile(Stream target, SubFile sf)
 	{
-		if (sf.Extension == ".exe" || sf.Extension == ".dll" || sf.Extension == ".sys" || sf.Extension == ".scr")
-		{
-			Logger.Debug($"Parsing PE executable from subfile '{sf.Path}'…");
-			try
-			{
-				target.Position = sf.StartOffset;
-				byte[] peFileBuf = new byte[sf.Length];
-				target.ReadExactly(peFileBuf);
-				var peFile = new PeNet.PeFile(peFileBuf);
+		var ext = sf.Extension?.ToLower();
 
-				if (peFile.Resources != null)
+		switch (ext)
+		{
+			case ".exe" or ".dll" or ".sys" or ".scr":
+				Logger.Debug($"Parsing PE executable from subfile '{sf.Path}'…");
+				try
 				{
-					foreach (var stringEntry in peFile.Resources.VsVersionInfo.StringFileInfo.StringTable)
+					target.Position = sf.StartOffset;
+					byte[] peFileBuf = new byte[sf.Length];
+					target.ReadExactly(peFileBuf);
+					var peFile = new PeNet.PeFile(peFileBuf);
+
+					if (peFile.Resources != null)
 					{
-						sf.Description = $"{stringEntry.OriginalFilename}\n{stringEntry.ProductName}\n{stringEntry.FileDescription}\n{stringEntry.ProductVersion}";
-					}
-					if (peFile.Resources.GroupIconDirectories != null)
-					{
-						foreach (var giDir in peFile.Resources.GroupIconDirectories)
+						foreach (var stringEntry in peFile.Resources.VsVersionInfo.StringFileInfo.StringTable)
 						{
-							var bestIconGi = giDir.DirectoryEntries.OrderByDescending(gi => gi.WBitCount).FirstOrDefault();
-							var bestIcon = bestIconGi.AssociatedIcons(peFile).FirstOrDefault();
-							if (bestIcon != null)
+							sf.Description = $"{stringEntry.OriginalFilename}\n{stringEntry.ProductName}\n{stringEntry.FileDescription}\n{stringEntry.ProductVersion}";
+						}
+						if (peFile.Resources.GroupIconDirectories != null)
+						{
+							foreach (var giDir in peFile.Resources.GroupIconDirectories)
 							{
-								sf.Icon = Image.Load(bestIcon.AsIco());
+								var bestIconGi = giDir.DirectoryEntries.OrderByDescending(gi => gi.WBitCount).FirstOrDefault();
+								var bestIcon = bestIconGi.AssociatedIcons(peFile).FirstOrDefault();
+								if (bestIcon != null)
+								{
+									sf.Icon = Image.Load(bestIcon.AsIco());
+								}
 							}
 						}
 					}
-				}
 
-				if (sf.Icon != null)
-				{
-					var firstIcon = peFile.Icons().FirstOrDefault();
-					if (firstIcon != null)
+					if (sf.Icon != null)
 					{
-						sf.Icon = Image.Load(firstIcon);
+						var firstIcon = peFile.Icons().FirstOrDefault();
+						if (firstIcon != null)
+						{
+							sf.Icon = Image.Load(firstIcon);
+						}
 					}
 				}
-			}
-			catch (Exception ex)
-			{
-				Logger.Error($"Cannot parse PE executable: {ex.Message}");
-			}
-		}
-		else if (sf.Extension == ".png" || sf.Extension == ".jpg" || sf.Extension == ".tif" || sf.Extension == ".gif")
-		{
-			try
-			{
-				target.Position = sf.StartOffset;
-				byte[] imageBuf = new byte[sf.Length];
-				target.Read(imageBuf, 0, imageBuf.Length);
-				sf.Icon = Image.Load(imageBuf);
-			}
-			catch (Exception ex)
-			{
-				Logger.Error($"Cannot read image subfile: {ex.Message}");
-			}
+				catch (Exception ex)
+				{
+					Logger.Error($"Cannot parse PE executable: {ex.Message}");
+				}
+				break;
+			
+			case ".bmp" or ".jpg" or ".jpeg" or ".png" or ".tif" or ".tiff" or ".png" or ".webp" or ".tga":
+				try
+				{
+					target.Position = sf.StartOffset;
+					byte[] imageBuf = new byte[sf.Length];
+					target.ReadExactly(imageBuf);
+					sf.Icon = Image.Load(imageBuf);
+				}
+				catch (Exception ex)
+				{
+					Logger.Error($"Cannot read image subfile: {ex.Message}");
+				}
+				break;
 		}
 					
 		sf.Icon?.Mutate(ctx => ctx.Resize(0, 128));

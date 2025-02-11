@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
-namespace Unai.ExtendedBinaryWaterfall.Parsers;
+namespace Unai.ExtendedBinaryWaterfall.Parsers.WindowsImage;
 
 [Parser("wim", "Windows Image (WIM)", [ ".wim" ])]
 public class WindowsImageParser : IParser

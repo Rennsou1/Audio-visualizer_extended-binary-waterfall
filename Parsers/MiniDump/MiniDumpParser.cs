@@ -3,7 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 
-namespace Unai.ExtendedBinaryWaterfall.Parsers;
+namespace Unai.ExtendedBinaryWaterfall.Parsers.MiniDump;
 
 class ModuleEntry(string fileName, ulong baseAddress, ulong size, ulong endAddress, uint timestamp)
 {

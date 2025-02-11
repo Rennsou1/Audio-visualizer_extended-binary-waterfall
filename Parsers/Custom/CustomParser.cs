@@ -2,7 +2,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 
-namespace Unai.ExtendedBinaryWaterfall.Parsers;
+namespace Unai.ExtendedBinaryWaterfall.Parsers.Custom;
 
 [Parser("custom", "Unknown Format, Custom File Listing", null)]
 public class CustomParser : IParser

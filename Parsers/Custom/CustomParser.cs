@@ -12,6 +12,8 @@ public class CustomParser : IParser
 
 	public IEnumerable<SubFile> GetSubFiles()
 	{
+		if (AuxiliaryInputStream == null) yield break;
+
 		using var sr = new StreamReader(AuxiliaryInputStream);
 		var csvValues = sr.ReadToEnd()
 			.Split('\n')

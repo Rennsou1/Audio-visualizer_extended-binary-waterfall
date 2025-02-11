@@ -101,7 +101,7 @@ class Program
 			foreach (var parser in availableParsers)
 			{
 				var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
-				if (!parserAttr.FileExtensions?.Contains(inputFileExt) ?? false)
+				if ((!parserAttr.FileExtensions?.Contains(inputFileExt)) ?? false)
 				{
 					continue;
 				}

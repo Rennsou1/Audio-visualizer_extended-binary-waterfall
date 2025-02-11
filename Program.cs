@@ -13,13 +13,16 @@ using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using SixLabors.ImageSharp.Processing.Processors.Transforms;
 using Unai.ExtendedBinaryWaterfall.Exporters;
+using Unai.ExtendedBinaryWaterfall.Parsers;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
 class Program
 {
+	static string _inputFilePath = null;
 	static Stream _inputStream = null;
 	static Stream _inputFileListStream = null;
+	static IParser _parser = null;
 	static ExportHandler _exporter = null;
 
 	static List<SubFile> _subfiles = [];
@@ -62,48 +65,54 @@ class Program
 			return;
 		}
 
-		Logger.Info("Parsing subfiles…");
-		Logger.Debug($"Target file format: '{_inputFileListFormat}'.");
+		Logger.Info("Setting up parser…");
+		var availableParsers = Utils.GetTypesWithAttribute<ParserAttribute>();
 
-		switch (_inputFileListFormat)
+		if (_inputFileListFormat != null)
 		{
-			case "wim":
-				_subfiles = FileListingParsers.ParseWimDir(_inputFileListStream).ToList();
-				_subfiles = [.. _subfiles
-					.Where(sf => sf.Length > 0)
-					.GroupBy(sf => sf.StartOffset)
-					.Select(sfg => sfg.FirstOrDefault())
-					.OrderBy(sf => sf.StartOffset)];
-				_subfiles =
-				[
-					.. _subfiles,
-					new("WIM File Table", _subfiles.OrderBy(sf => sf.EndOffset).FirstOrDefault().EndOffset, _inputStream.Length) { IconString = "🔶" },
-				];
-				break;
+			Logger.Debug($"Requested parser: '{_inputFileListFormat}'.");
+			foreach (var parser in availableParsers)
+			{
+				var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
+				if (parserAttr.Id != _inputFileListFormat)
+				{
+					continue;
+				}
+				_parser = (IParser)Activator.CreateInstance(parser);
+			}
+			if (_parser == null)
+			{
+				Logger.Warning($"Unknown parser ID: '{_inputFileListFormat}'. Skipping subfile listing.");
+			}
+		}
+		else
+		{
+			Logger.Info("Guessing input format from file extension…");
+			var inputFileExt = Path.GetExtension(_inputFilePath).ToLower();
 
-			case "minidump_py":
-				_subfiles = FileListingParsers.ParseMinidumpPythonOutput(_inputFileListStream).ToList();
-				_subfiles = [.. _subfiles.MixLastOcurrences((sf, lsf) => sf.Path == lsf.Path, (lsf, sf) => { lsf.EndOffset = sf.EndOffset; })];
-				_subfiles =
-				[
-					new("Header", 0, _subfiles.OrderBy(sf => sf.StartOffset).FirstOrDefault().StartOffset) { IconString = "🔶" },
-					.. _subfiles,
-				];
-				break;
+			foreach (var parser in availableParsers)
+			{
+				var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
+				if (!parserAttr.FileExtensions?.Contains(inputFileExt) ?? false)
+				{
+					continue;
+				}
+				_parser = (IParser)Activator.CreateInstance(parser);
+			}
+			if (_parser == null)
+			{
+				Logger.Warning($"Unknown input format. Skipping subfile listing.");
+			}
+		}
+		Logger.Debug($"Selected parser: {_parser?.GetType().GetCustomAttribute<ParserAttribute>()?.Name ?? "<null>"}");
 
-			case "elf":
-				_subfiles = FileListingParsers.ParseElf(_inputStream).ToList();
-				break;
+		if (_parser != null)
+		{
+			Logger.Info("Parsing subfiles…");
 
-			case "iso":
-				_subfiles = FileListingParsers.ParseIso(_inputStream).ToList();
-				break;
-
-			// case "gamemaker":
-			// 	GameMakerData gm = new(_inputStream);
-			// 	gm.ParseDataWin();
-			// 	_subfiles = gm.GetSubFiles().ToList();
-			// 	break;
+			_parser.InputStream = _inputStream;
+			_parser.AuxiliaryInputStream = _inputFileListStream;
+			_subfiles = _parser.GetSubFiles().ToList();
 		}
 
 		using var targetFileReader = new BinaryReader(_inputStream);
@@ -114,7 +123,7 @@ class Program
 
 		Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
 
-		Logger.Info("Setting exporter…");
+		Logger.Info("Setting up exporter…");
 		Logger.Debug($"Requested exporter: '{_outputType}'.");
 
 		if (_outputType != null)
@@ -495,8 +504,9 @@ class Program
 					Logger.Error("Cannot specify more than two input files.");
 					return false;
 				}
+				_inputFilePath = arg;
 				_inputStream = File.OpenRead(arg);
-				_title ??= arg;
+				_title ??= Path.GetFileName(arg);
 				continue;
 			}
 

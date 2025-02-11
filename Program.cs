@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Reflection;
+using System.Text;
 using SixLabors.Fonts;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing.Processing;
@@ -19,6 +20,7 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 class Program
 {
+	static bool _helpMode = false;
 	static string _inputFilePath = null;
 	static Stream _inputStream = null;
 	static Stream _inputFileListStream = null;
@@ -62,6 +64,12 @@ class Program
 		if (!ParseCommandLineArguments(args))
 		{
 			Logger.Fail("Invalid command line arguments. Exiting…");
+			return;
+		}
+
+		if (_helpMode)
+		{
+			PrintHelp();
 			return;
 		}
 
@@ -513,6 +521,10 @@ class Program
 			var argKvp = arg.Split('=');
 			switch (argKvp[0])
 			{
+				case "--help":
+					_helpMode = true;
+					break;
+
 				case "--title":
 					_title = argKvp[1].Replace("\\n", "\n");
 					break;
@@ -536,5 +548,35 @@ class Program
 		}
 
 		return true;
+	}
+
+	private static void PrintHelp()
+	{
+		StringBuilder helpStrBld = new();
+		helpStrBld.AppendLine($"Usage: {Environment.GetCommandLineArgs()[0]} <file_input> [options]");
+		helpStrBld.AppendLine("Options:");
+		helpStrBld.AppendLine($"	--title=…       Set the target file's title");
+		helpStrBld.AppendLine($"	--author=…      Set the author name of the generated binary waterfall");
+		helpStrBld.AppendLine($"	--format=…      Set the target file's format (autodetected from extension if unset)");
+		helpStrBld.AppendLine($"	--file-list=…   Set the file list text file path (some parsers require it)");
+		helpStrBld.AppendLine($"	--output-type=… Set the output type/exporter (SDL window by default)");
+		helpStrBld.AppendLine();
+
+		helpStrBld.AppendLine("Available parsers/input formats:");
+		foreach (var parser in Utils.GetTypesWithAttribute<ParserAttribute>())
+		{
+			var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
+			helpStrBld.AppendLine($"	{parserAttr.Id.PadRight(16)} {parserAttr.Name}");
+		}
+		helpStrBld.AppendLine();
+
+		helpStrBld.AppendLine("Available exporters:");
+		foreach (var exporter in Utils.GetTypesWithAttribute<ExporterAttribute>())
+		{
+			var exporterAttr = exporter.GetCustomAttribute<ExporterAttribute>();
+			helpStrBld.AppendLine($"	{exporterAttr.Id.PadRight(16)} {exporterAttr.Name} – {exporterAttr.Description}");
+		}
+
+		Console.Error.WriteLine(helpStrBld);
 	}
 }

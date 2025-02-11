@@ -33,7 +33,8 @@ public class SdlExportHandler : ExportHandler
 			if (_win.IsNull) throw new Exception("SDL cannot create a window.");
 			_ren = SDL.CreateRenderer(_win, -1, RendererFlags.Accelerated);
 			if (_ren.IsNull) throw new Exception("SDL cannot create a renderer.");
-			SDL.CreateRGBSurface(0, 1920, 1080, 32, 0, 0, 0, 0, out _surface);
+			SDL.CreateRGBSurface(0, 1920, 1080, 32, 0xff, 0xff00, 0xff0000, 0, out _surface);
+			if (_surface.IsNull) throw new Exception("SDL cannot create a surface.");
 
 			AudioSpec audioSpec;
 			audioSpec.Frequency = 48000;

@@ -101,11 +101,12 @@ class Program
 			foreach (var parser in availableParsers)
 			{
 				var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
-				if ((!parserAttr.FileExtensions?.Contains(inputFileExt)) ?? false)
+				if (parserAttr.FileExtensions.Contains(inputFileExt))
 				{
-					continue;
+					Logger.Debug($"Parser '{parserAttr.Id}' recognizes '{inputFileExt}' as a valid file extension.");
+					_parser = (IParser)Activator.CreateInstance(parser);
+					break;
 				}
-				_parser = (IParser)Activator.CreateInstance(parser);
 			}
 			if (_parser == null)
 			{

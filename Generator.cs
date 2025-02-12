@@ -154,8 +154,8 @@ public class Generator
 		Logger.Info("Preparing audio/video generation…");
 
 		int bytesPerFrame = WaterfallWidth * 4;
-		int videoFrameX1 = OutputVideoWidth / 4 - WaterfallScaledWidth / 2;
-		int videoFrameX2 = OutputVideoWidth / 4 + WaterfallScaledWidth / 2;
+		int videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
+		int videoFrameX2 = videoFrameX1 + WaterfallScaledWidth;
 		int videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
 		int videoFrameY2 = OutputVideoHeight / 2 + WaterfallScaledHeight / 2;
 		int audioSampleRate = bytesPerFrame * OutputFps / 2;

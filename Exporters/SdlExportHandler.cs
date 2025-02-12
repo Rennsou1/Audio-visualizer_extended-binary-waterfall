@@ -39,7 +39,7 @@ public class SdlExportHandler : IExporter
 			if (_surface.IsNull) throw new Exception("SDL cannot create a surface.");
 
 			AudioSpec audioSpec;
-			audioSpec.Frequency = 48000;
+			audioSpec.Frequency = Generator.OutputSampleRate;
 			audioSpec.Format = 8;
 			audioSpec.Channels = 2;
 			audioSpec.Samples = (ushort)(2 * audioSpec.Frequency / Generator.OutputFps);

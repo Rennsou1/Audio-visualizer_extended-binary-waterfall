@@ -53,6 +53,9 @@ public class Generator
 	public int WaterfallHeight { get; set; } = 256;
 	public int WaterfallFrameLength => WaterfallWidth * WaterfallHeight * 4;
 
+	// Audio parameters.
+	public int OutputSampleRate { get; set; } = 48000;
+
 	public void Generate()
 	{
 		Logger.Info("Opening files…");
@@ -156,7 +159,7 @@ public class Generator
 		int videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
 		int videoFrameY2 = OutputVideoHeight / 2 + WaterfallScaledHeight / 2;
 		int audioSampleRate = bytesPerFrame * OutputFps / 2;
-		int audioOutputBytesPerFrame = (48000 * 2) / OutputFps;
+		int audioOutputBytesPerFrame = (OutputSampleRate * 2) / OutputFps;
 
 		Logger.Debug($"Waterfall duration will be {TimeSpan.FromSeconds(_inputFileStream.Length / (bytesPerFrame * OutputFps))}.");
 

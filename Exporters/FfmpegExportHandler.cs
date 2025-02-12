@@ -107,9 +107,9 @@ public class FfmpegExportHandler : IExporter
 			_audioCtx = ffmpeg.avcodec_alloc_context3(audioEnc);
 			_audioCtx->codec_type = AVMediaType.AVMEDIA_TYPE_AUDIO;
 			_audioCtx->sample_fmt = AVSampleFormat.AV_SAMPLE_FMT_FLTP;
-			_audioCtx->sample_rate = 48000;
+			_audioCtx->sample_rate = Generator.OutputSampleRate;
 			_audioCtx->time_base.num = 1;
-			_audioCtx->time_base.den = 48000;
+			_audioCtx->time_base.den = Generator.OutputSampleRate;
 			_audioCtx->ch_layout.nb_channels = 2;
 			_audioCtx->ch_layout.order = AVChannelOrder.AV_CHANNEL_ORDER_NATIVE;
 			_audioCtx->ch_layout.u.mask = ffmpeg.AV_CH_LAYOUT_STEREO;
@@ -138,7 +138,7 @@ public class FfmpegExportHandler : IExporter
 			_audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
 			if (_videoStream == null) Logger.Error("cannot allocate audio output stream");
 			_audioStream->index = (int)(_fmtCtx->nb_streams - 1);
-			_audioStream->time_base = FfmpegUtils.GetRational(1, 48000);
+			_audioStream->time_base = FfmpegUtils.GetRational(1, _audioCtx->sample_rate);
 			
 			ret = ffmpeg.avcodec_parameters_from_context(_audioStream->codecpar, _audioCtx);
 			FfmpegUtils.LogIfAvError(ret, "cannot set audio codec params from codec context");
@@ -186,7 +186,7 @@ public class FfmpegExportHandler : IExporter
 			_audioAvFrame = ffmpeg.av_frame_alloc();
 			_audioAvFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
 			ffmpeg.av_channel_layout_copy(&_audioAvFrame->ch_layout, &_audioCtx->ch_layout);
-			_audioAvFrame->sample_rate = 48000;
+			_audioAvFrame->sample_rate = _audioCtx->sample_rate;
 			_audioAvFrame->nb_samples = _audioCtx->frame_size;
 			_audioAvFrame->ch_layout.nb_channels = 2;
 			_audioAvFrame->ch_layout.u.mask = 3;
@@ -275,7 +275,7 @@ public class FfmpegExportHandler : IExporter
 		_audioAvFrame->time_base.num = _audioCtx->time_base.num;
 		_audioAvFrame->time_base.den = _audioCtx->time_base.den;
 		_audioAvFrame->pts = (long)(_audioAvFrame->sample_rate * (_frameNum / (float)Generator.OutputFps));
-		_audioAvFrame->duration = 48000 / 1024;
+		_audioAvFrame->duration = _audioCtx->sample_rate / 1024;
 
 		// TODO: move to init method
 		if (_swsCtx == null)

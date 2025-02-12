@@ -273,7 +273,7 @@ public class FfmpegExportHandler : ExportHandler
 
 		_audioAvFrame->time_base.num = _audioCtx->time_base.num;
 		_audioAvFrame->time_base.den = _audioCtx->time_base.den;
-		_audioAvFrame->pts = (long)(_audioAvFrame->sample_rate * (_frameNum / (float)Program.OutputFps));
+		_audioAvFrame->pts = (long)(_audioAvFrame->sample_rate * (_frameNum / (float)Generator.OutputFps));
 		_audioAvFrame->duration = 48000 / 1024;
 
 		// TODO: move to init method

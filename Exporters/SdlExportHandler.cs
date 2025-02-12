@@ -40,7 +40,7 @@ public class SdlExportHandler : ExportHandler
 			audioSpec.Frequency = 48000;
 			audioSpec.Format = 8;
 			audioSpec.Channels = 2;
-			audioSpec.Samples = (ushort)(2 * audioSpec.Frequency / Program.OutputFps);
+			audioSpec.Samples = (ushort)(2 * audioSpec.Frequency / Generator.OutputFps);
 			Logger.Debug($"SDL audio specs: {audioSpec.Frequency}Hz {audioSpec.Samples} samples");
 			_audioDeviceId = SDL.OpenAudioDevice(null, 0, &audioSpec, null, 0);
 			Logger.Debug($"OpenAudioDevice() = {_audioDeviceId}");
@@ -101,10 +101,10 @@ public class SdlExportHandler : ExportHandler
 
 		_frameCount++;
 		_ts = _sw.Elapsed.TotalSeconds;
-		var wcFrameCount = (int)(_ts * Program.OutputFps);
+		var wcFrameCount = (int)(_ts * Generator.OutputFps);
 		var framediff = _frameCount - wcFrameCount; // positive = too fast
 
-		if (framediff > 1) SDL.Delay((uint)(((1 / (float)Program.OutputFps) - delta) * 1000));
+		if (framediff > 1) SDL.Delay((uint)(((1 / (float)Generator.OutputFps) - delta) * 1000));
 
 		var audioQueue = SDL.GetQueuedAudioSize(_audioDeviceId);
 

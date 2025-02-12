@@ -21,7 +21,7 @@ public class Generator
 	private Stream _inputFileStream = null;
 	private Stream _inputAuxFileStream = null;
 	private IParser _parser = null;
-	private ExportHandler _exporter = null;
+	private IExporter _exporter = null;
 	private Stopwatch _timer = new();
 	
 	private List<SubFile> _subfiles = [];
@@ -131,7 +131,7 @@ public class Generator
 				{
 					continue;
 				}
-				_exporter = (ExportHandler)Activator.CreateInstance(exporter);
+				_exporter = (IExporter)Activator.CreateInstance(exporter);
 				Logger.Debug($"Exporter {exporterAttr.Name} selected.");
 			}
 			if (_exporter == null)

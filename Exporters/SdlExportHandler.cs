@@ -9,8 +9,10 @@ using SixLabors.ImageSharp.PixelFormats;
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 [Exporter("sdl", "SDL Window", "Show the generated audio and video data in a window.")]
-public class SdlExportHandler : ExportHandler
+public class SdlExportHandler : IExporter
 {
+	public Generator Generator { get; set; }
+
 	private bool _init = false;
 	private bool _quit = false;
 
@@ -52,7 +54,7 @@ public class SdlExportHandler : ExportHandler
 	
 	byte[] _framebuffer = new byte[1920 * 1080 * 4];
 
-	public override void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta)
+	public void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta)
 	{
 		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
 	}
@@ -123,7 +125,7 @@ public class SdlExportHandler : ExportHandler
 		Console.Error.Write($"frame={_frameCount,6} wcframe={wcFrameCount,6} diff={framediff,6} — {(int)(1 / delta)} fps aqueue={audioQueue}\x1b[K\x1b[G");
 	}
 
-	public override void Finish()
+	public void Finish()
 	{
 		_ = SDL.CloseAudioDevice(_audioDeviceId);
 		SDL.FreeSurface(_surface);

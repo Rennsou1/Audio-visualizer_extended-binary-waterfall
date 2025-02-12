@@ -7,8 +7,10 @@ using SixLabors.ImageSharp.PixelFormats;
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 [Exporter("ffmpeg", "FFmpeg Stream", "Use FFmpeg libraries to encode audio and video data and output it in Matroska format.")]
-public class FfmpegExportHandler : ExportHandler
+public class FfmpegExportHandler : IExporter
 {
+	public Generator Generator { get; set; }
+
 	private bool _init = false;
 	private bool _quit = false;
 
@@ -31,7 +33,6 @@ public class FfmpegExportHandler : ExportHandler
 	private long _audioQueueOfs = 0;
 
 	private int _frameNum = 0;
-
 	public int LogLevel { get; set; } = ffmpeg.AV_LOG_INFO;
 
 	public void InitializeFfmpeg()
@@ -249,7 +250,7 @@ public class FfmpegExportHandler : ExportHandler
 		}
 	}
 
-	public override void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta)
+	public void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta)
 	{
 		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
 	}
@@ -356,7 +357,7 @@ public class FfmpegExportHandler : ExportHandler
 		_frameNum++;
 	}
 
-	public override unsafe void Finish()
+	public unsafe void Finish()
 	{
 		Logger.Debug("Flushing streams…");
 		DoEncode(_videoCtx, _videoStream, null, _videoAvPacket);

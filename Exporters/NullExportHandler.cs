@@ -3,14 +3,16 @@ using SixLabors.ImageSharp;
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 [Exporter("null", "Null/Dummy Output", "Do nothing with the generated video. Useful for debugging purposes.")]
-public class NullExportHandler : ExportHandler
+public class NullExportHandler : IExporter
 {
-	public override void Finish()
+	public Generator Generator { get; set; }
+
+	public void Finish()
 	{
 		
 	}
 
-	public override void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta = 0.04)
+	public void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta = 0.04)
 	{
 		
 	}

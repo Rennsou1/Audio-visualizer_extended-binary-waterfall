@@ -2,9 +2,9 @@ using SixLabors.ImageSharp;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
-public abstract class ExportHandler
+public interface IExporter
 {
-	public Generator Generator { get; set; } = null;
+	public Generator Generator { get; set; }
 	public abstract void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta = 0.04);
 	public abstract void Finish();
 }

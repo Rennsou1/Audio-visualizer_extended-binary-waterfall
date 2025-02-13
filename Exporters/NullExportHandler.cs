@@ -12,7 +12,7 @@ public class NullExportHandler : IExporter
 		
 	}
 
-	public void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta = 0.04)
+	public void PushNewFrame(Image videoFrame, float[] audioFrame, double delta = 0.04)
 	{
 		
 	}

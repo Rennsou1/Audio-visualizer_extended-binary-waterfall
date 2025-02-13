@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -28,7 +29,8 @@ public class Generator
 
 	private Image<Rgba32> _frameContent = null;
 	private Image<Rgba32> _viewportFramebuf = null;
-	private byte[] _audioBuffer = null;
+	private float[] _inputAudioBuffer = null;
+	private float[] _outputAudioBuffer = null;
 
 	// ImageSharp-specific.
 	private FontCollection _fontCollection;
@@ -42,6 +44,8 @@ public class Generator
 	public string Author { get; set; } = null;
 	public string InputFileFormatId { get; set; } = null;
 	public string ExporterId { get; set; } = null;
+	public int InputBytesPerSecond { get; set; } = 24000 * 2 * 2;
+	public int InputBytesPerFrame => InputBytesPerSecond / OutputFps;
 
 	// Video parameters.
 	public int OutputVideoWidth { get; set; } = 1920;
@@ -54,7 +58,17 @@ public class Generator
 	public int WaterfallFrameLength => WaterfallWidth * WaterfallHeight * 4;
 
 	// Audio parameters.
-	public int OutputSampleRate { get; set; } = 48000;
+	public AudioSampleFormat AudioInputSampleFormat { get; set; } = AudioSampleFormat.Signed16LE;
+	public int AudioInputChannelCount { get; set; } = 2;
+	public int AudioInputSamplesPerFrame => (InputBytesPerFrame / AudioInputSampleFormat.GetByteSize());
+	public int AudioInputSampleRate => (InputBytesPerSecond / AudioInputSampleFormat.GetByteSize()) / AudioInputChannelCount;
+	public int AudioInputBytesPerFrame => InputBytesPerFrame;
+
+	public AudioSampleFormat AudioOutputSampleFormat => AudioSampleFormat.Float32;
+	public int AudioOutputChannelCount => 2;
+	public int AudioOutputSampleRate { get; set; } = 48000;
+	public int AudioOutputSamplesPerFrame => AudioOutputSampleRate * AudioOutputChannelCount / OutputFps;
+	public int AudioOutputBytesPerFrame => AudioOutputSampleFormat.GetByteSize() * AudioOutputSamplesPerFrame;
 
 	public void Generate()
 	{
@@ -153,18 +167,19 @@ public class Generator
 
 		Logger.Info("Preparing audio/video generation…");
 
-		int bytesPerFrame = WaterfallWidth * 4;
 		int videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
 		int videoFrameX2 = videoFrameX1 + WaterfallScaledWidth;
 		int videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
 		int videoFrameY2 = OutputVideoHeight / 2 + WaterfallScaledHeight / 2;
-		int audioSampleRate = bytesPerFrame * OutputFps / 2;
-		int audioOutputBytesPerFrame = (OutputSampleRate * 2) / OutputFps;
 
-		Logger.Debug($"Waterfall duration will be {TimeSpan.FromSeconds(_inputFileStream.Length / (bytesPerFrame * OutputFps))}.");
+		Logger.Debug($"Speed: {InputBytesPerFrame} b/f ({InputBytesPerSecond} b/s)");
+		Logger.Debug($"Waterfall duration will be {TimeSpan.FromSeconds(_inputFileStream.Length / (InputBytesPerSecond))}.");
+		Logger.Debug($"Audio input:  {AudioInputBytesPerFrame}bpf {AudioInputSamplesPerFrame}spf → {AudioInputSampleRate}Hz {AudioInputChannelCount}ch {8 * AudioInputSampleFormat.GetByteSize()}-bit");
+		Logger.Debug($"Audio output: {AudioOutputBytesPerFrame}bpf {AudioOutputSamplesPerFrame}spf → {AudioOutputSampleRate}Hz {AudioOutputChannelCount}ch {8 * AudioOutputSampleFormat.GetByteSize()}-bit");
 
 		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
-		_audioBuffer = Enumerable.Repeat((byte)128, audioOutputBytesPerFrame).ToArray();
+		_inputAudioBuffer = new float[AudioInputSamplesPerFrame];
+		_outputAudioBuffer = new float[AudioOutputSamplesPerFrame];
 
 		_fontCollection = new();
 		_fontCollection.AddSystemFonts();
@@ -183,7 +198,7 @@ public class Generator
 
 		// 2. Main Video
 
-		GenerateMainVideo(targetFileReader, bytesPerFrame, videoFrameX1, videoFrameY1, audioOutputBytesPerFrame);
+		GenerateMainVideo(targetFileReader, videoFrameX1, videoFrameY1);
 	}
 
 	private void GenerateIntro()
@@ -210,17 +225,17 @@ public class Generator
 				}, $"Starting in {(totalFrames - frameNumber) / (float)OutputFps:N1} seconds…", Color.White)
 				.DrawProgressBar(frameNumber / (float)totalFrames, (int)(OutputVideoWidth * 0.3), (int)(OutputVideoWidth * 0.7), OutputVideoHeight - 64));
 
-			_exporter.PushNewFrame(_frameContent, _audioBuffer, _timer.Elapsed.TotalSeconds);
+			_exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
 		}
 	}
 
-	private void GenerateMainVideo(BinaryReader targetFileReader, int bytesPerFrame, int videoFrameX1, int videoFrameY1, int audioOutputBytesPerFrame)
+	private void GenerateMainVideo(BinaryReader targetFileReader, int videoFrameX1, int videoFrameY1)
 	{
 		Logger.Info("Generating binary waterfall…");
 
-		string avSettingsString = $"{bytesPerFrame * OutputFps / 2} Hz, PCM unsigned 8-bit, stereo\nRGBA (32bpp), {WaterfallWidth} px/line";
-		string readSpeedString = $"{(bytesPerFrame * OutputFps) / 1024} KiB/s";
+		string avSettingsString = $"{AudioInputSampleRate} Hz, PCM {(AudioInputSampleFormat.IsSigned() ? "signed" : "unsigned")} {8 * AudioInputSampleFormat.GetByteSize()}-bit, {(AudioInputChannelCount == 2 ? "stereo" : "mono")}\nRGBA (32bpp), {WaterfallWidth} px/line";
+		string readSpeedString = $"{(InputBytesPerSecond) / 1024} KiB/s";
 
 		float subfileWindowIndex = 0f;
 		long currentOffset = 0;
@@ -231,7 +246,7 @@ public class Generator
 			// Get video buffer.
 
 			playHeadRelPos = 0;
-			var frameStartByteOffset = currentOffset - (WaterfallFrameLength / 2);
+			var frameStartByteOffset = currentOffset.Align(WaterfallWidth * 4) - (WaterfallFrameLength / 2);
 			if (frameStartByteOffset < 0)
 			{
 				playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallScaledWidth / 2));
@@ -248,19 +263,21 @@ public class Generator
 
 			// Get audio buffer.
 
-			var audioFrameStartByteOffset = currentOffset - (bytesPerFrame / 2);
+			var audioFrameStartByteOffset = currentOffset.Align(AudioInputSampleFormat.GetByteSize()) - (InputBytesPerFrame / 2);
 			if (audioFrameStartByteOffset < 0)
 			{
 				audioFrameStartByteOffset = 0;
 			}
-			else if (audioFrameStartByteOffset + bytesPerFrame >= _inputFileStream.Length)
+			else if (audioFrameStartByteOffset + InputBytesPerFrame >= _inputFileStream.Length)
 			{
-				audioFrameStartByteOffset = _inputFileStream.Length - WaterfallFrameLength;
+				audioFrameStartByteOffset = _inputFileStream.Length - InputBytesPerFrame;
 			}
-			var audioFrameEndByteOffset = audioFrameStartByteOffset + bytesPerFrame;
+			var audioFrameEndByteOffset = audioFrameStartByteOffset + InputBytesPerFrame;
 
 			_inputFileStream.Position = audioFrameStartByteOffset;
-			var currentAudioBuffer = targetFileReader.ReadBytes(bytesPerFrame);
+			var currentAudioBuffer = targetFileReader.ReadBytes(InputBytesPerFrame);
+
+			// Console.Error.WriteLine($"audio buf: {audioFrameStartByteOffset:X8}–{audioFrameEndByteOffset:X8}");
 
 			// Get video data.
 
@@ -280,19 +297,60 @@ public class Generator
 
 			// Get audio data.
 
-			_audioBuffer = currentAudioBuffer
-				.Select(x => (float)x)
-				.ToList()
-				.NearestNeighborResample(audioOutputBytesPerFrame)
-				.Select(x => (byte)x)
-				.Select(x => x >= 128 ? (byte)(128 - x) : (byte)(128 + x)) // signed to unsigned
+			switch (AudioInputSampleFormat)
+			{
+				case AudioSampleFormat.Unsigned8:
+					_inputAudioBuffer = currentAudioBuffer.Select(x => (x / 256f) - 1f).ToArray();
+					break;
+
+				case AudioSampleFormat.Unsigned16LE:
+					for (int i = 0; i < _inputAudioBuffer.Length; i++)
+					{
+						var srcIdx = i * 2;
+						var srcSample = BinaryPrimitives.ReadUInt16LittleEndian(currentAudioBuffer.AsSpan(srcIdx, 2));
+						// if (i == 0) Console.Error.WriteLine($"{srcIdx}/{currentAudioBuffer.Length} → {i}/{_inputAudioBuffer.Length} ({srcSample:X4})");
+						_inputAudioBuffer[i] = (srcSample / 32768f) - 1f;
+					}
+					break;
+
+				case AudioSampleFormat.Signed16LE:
+					for (int i = 0; i < _inputAudioBuffer.Length; i++)
+					{
+						var srcIdx = i * 2;
+						var srcSample = BinaryPrimitives.ReadInt16LittleEndian(currentAudioBuffer.AsSpan(srcIdx, 2));
+						// if (i % 16 == 0) Console.Error.WriteLine($"{srcIdx}/{currentAudioBuffer.Length} → {i}/{_inputAudioBuffer.Length} ({srcSample})");
+						_inputAudioBuffer[i] = srcSample / 32768f;
+					}
+					break;
+
+				default:
+					throw new InvalidOperationException("Audio sample format not implemented yet.");
+			}
+
+			_outputAudioBuffer = _inputAudioBuffer
+				.ToPlanar(2)
+				.Select(chData => chData.ToList().LinearResample(AudioOutputSamplesPerFrame / 2).ToList())
+				.ToArray()
+				.ToPacked()
 				.ToArray();
+
+			// using (var debugOutStr = File.Open("__debug.out", FileMode.Append))
+			// {
+			// 	using (var bw = new BinaryWriter(debugOutStr))
+			// 	{
+			// 		// debugOutStr.Write(_outputAudioBuffer);
+			// 		foreach (var sample in _outputAudioBuffer)
+			// 		{
+			// 			bw.Write(sample);
+			// 		}
+			// 	}
+			// }
 
 			// Compute registers.
 
 			var subfilesInFrame = _subfiles
 				.Select((sf, i) => new { key = i, value = sf })
-				.Where(kvp => kvp.value.Intersects(currentOffset - (bytesPerFrame / 2), currentOffset + (bytesPerFrame / 2)))
+				.Where(kvp => kvp.value.Intersects(currentOffset - (InputBytesPerFrame / 2), currentOffset + (InputBytesPerFrame / 2)))
 				.ToList();
 			var mainSubfile = subfilesInFrame.LastOrDefault();
 
@@ -482,10 +540,10 @@ public class Generator
 				}
 			});
 
-			_exporter.PushNewFrame(_frameContent, _audioBuffer, _timer.Elapsed.TotalSeconds);
+			_exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
 
-			currentOffset += bytesPerFrame;
+			currentOffset += InputBytesPerFrame;
 		}
 
 		_exporter.Finish();

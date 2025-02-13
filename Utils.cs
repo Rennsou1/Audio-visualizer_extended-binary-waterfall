@@ -218,10 +218,61 @@ public static class Utils
 	{
 		for (int i = 0; i < newSampleCount; i++)
 		{
-			double ratio = i / (float)newSampleCount;
+			double ratio = i / (double)newSampleCount;
 			int srcIndex = (int)(ratio * input.Count);
 			yield return input[srcIndex];
 		}
+	}
+
+	public static IEnumerable<float> LinearResample(this IList<float> input, int newSampleCount = 48000)
+	{
+		for (int i = 0; i < newSampleCount; i++)
+		{
+			double ratio = i / (double)newSampleCount;
+			float srcIndex = (float)(ratio * input.Count); // e.g.: 4.75
+			int srcIndexInt = (int)srcIndex; // 4
+			float srcIndexDec = srcIndex - srcIndexInt; // 0.75
+			yield return ((1 - srcIndexDec) * input[srcIndexInt]) + (srcIndexDec * input[(srcIndexInt + 1) % input.Count]);
+		}
+	}
+
+	public static IEnumerable<float>[] ToPlanar(this IEnumerable<float> input, int channelCount = 2)
+	{
+		var ret = new IEnumerable<float>[channelCount];
+		for (int i = 0; i < channelCount; i++)
+		{
+			int currentChannel = i;
+			ret[i] = input.Where((_, sampleIndex) =>
+			{
+				// Console.Error.WriteLine($"{sampleIndex} → {sampleIndex / channelCount} {currentChannel} → {_}");
+				return sampleIndex % channelCount == currentChannel;
+			});
+		}
+		return ret;
+	}
+
+	public static IEnumerable<float> ToPacked(this IList<float>[] input)
+	{
+		var channelCount = input.Length;
+		for (int i = 0; i < input[0].Count; i++)
+		{
+			for (int ch = 0; ch < channelCount; ch++) yield return input[ch][i];
+		}
+	}
+
+	public static int Align(this int input, int boundary)
+	{
+		return (input / boundary) * boundary;
+	}
+
+	public static long Align(this long input, int boundary)
+	{
+		return (input / boundary) * boundary;
+	}
+
+	public static float Align(this float input, int boundary)
+	{
+		return (int)(input / boundary) * boundary;
 	}
 
 	public static void PrintHex(BinaryReader br, int count = 4)

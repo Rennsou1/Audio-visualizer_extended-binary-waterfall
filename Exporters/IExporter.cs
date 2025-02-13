@@ -5,6 +5,6 @@ namespace Unai.ExtendedBinaryWaterfall.Exporters;
 public interface IExporter
 {
 	public Generator Generator { get; set; }
-	public abstract void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta = 0.04);
+	public abstract void PushNewFrame(Image videoFrame, float[] audioFrame, double delta = 0.04);
 	public abstract void Finish();
 }

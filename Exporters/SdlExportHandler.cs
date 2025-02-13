@@ -39,10 +39,10 @@ public class SdlExportHandler : IExporter
 			if (_surface.IsNull) throw new Exception("SDL cannot create a surface.");
 
 			AudioSpec audioSpec;
-			audioSpec.Frequency = Generator.OutputSampleRate;
-			audioSpec.Format = 8;
+			audioSpec.Frequency = Generator.AudioOutputSampleRate;
+			audioSpec.Format = 0x8120; // 32-bit float LE
 			audioSpec.Channels = 2;
-			audioSpec.Samples = (ushort)(2 * audioSpec.Frequency / Generator.OutputFps);
+			audioSpec.Samples = (ushort)(4 * 2 * audioSpec.Frequency / Generator.OutputFps);
 			Logger.Debug($"SDL audio specs: {audioSpec.Frequency}Hz {audioSpec.Samples} samples");
 			_audioDeviceId = SDL.OpenAudioDevice(null, 0, &audioSpec, null, 0);
 			Logger.Debug($"OpenAudioDevice() = {_audioDeviceId}");
@@ -54,12 +54,12 @@ public class SdlExportHandler : IExporter
 	
 	byte[] _framebuffer = new byte[1920 * 1080 * 4];
 
-	public void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta)
+	public void PushNewFrame(Image videoFrame, float[] audioFrame, double delta)
 	{
 		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
 	}
 
-	public void PushNewFrame(Image<Rgba32> videoFrame, byte[] audioFrame, double delta)
+	public void PushNewFrame(Image<Rgba32> videoFrame, float[] audioFrame, double delta)
 	{
 		if (!_init)
 		{
@@ -114,9 +114,9 @@ public class SdlExportHandler : IExporter
 		{
 			unsafe
 			{
-				fixed (byte* audioBufPtr = audioFrame)
+				fixed (float* audioBufPtr = audioFrame)
 				{
-					var ret = SDL.QueueAudio(_audioDeviceId, audioBufPtr, audioFrame.Length);
+					var ret = SDL.QueueAudio(_audioDeviceId, (byte*)audioBufPtr, audioFrame.Length);
 					if (ret != 0) Logger.Error($"Cannot queue audio buffer (code {ret}): {SDL.GetError()}");
 				}
 			}

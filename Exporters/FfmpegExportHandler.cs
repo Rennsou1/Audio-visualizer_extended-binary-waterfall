@@ -9,8 +9,6 @@ namespace Unai.ExtendedBinaryWaterfall.Exporters;
 [Exporter("ffmpeg", "FFmpeg Stream", "Use FFmpeg libraries to encode audio and video data and output it in Matroska format.")]
 public class FfmpegExportHandler : IExporter
 {
-	public Generator Generator { get; set; }
-
 	private bool _init = false;
 	private bool _quit = false;
 
@@ -29,10 +27,11 @@ public class FfmpegExportHandler : IExporter
 
 	private unsafe SwsContext* _swsCtx;
 
-	private byte[] _audioQueue = null;
-	private long _audioQueueOfs = 0;
+	private readonly AudioFrameResizer<float> _audioQueue = new();
 
 	private int _frameNum = 0;
+
+	public Generator Generator { get; set; }
 	public int LogLevel { get; set; } = ffmpeg.AV_LOG_INFO;
 
 	public void InitializeFfmpeg()
@@ -107,9 +106,9 @@ public class FfmpegExportHandler : IExporter
 			_audioCtx = ffmpeg.avcodec_alloc_context3(audioEnc);
 			_audioCtx->codec_type = AVMediaType.AVMEDIA_TYPE_AUDIO;
 			_audioCtx->sample_fmt = AVSampleFormat.AV_SAMPLE_FMT_FLTP;
-			_audioCtx->sample_rate = Generator.OutputSampleRate;
+			_audioCtx->sample_rate = Generator.AudioOutputSampleRate;
 			_audioCtx->time_base.num = 1;
-			_audioCtx->time_base.den = Generator.OutputSampleRate;
+			_audioCtx->time_base.den = Generator.AudioOutputSampleRate;
 			_audioCtx->ch_layout.nb_channels = 2;
 			_audioCtx->ch_layout.order = AVChannelOrder.AV_CHANNEL_ORDER_NATIVE;
 			_audioCtx->ch_layout.u.mask = ffmpeg.AV_CH_LAYOUT_STEREO;
@@ -190,22 +189,34 @@ public class FfmpegExportHandler : IExporter
 			_audioAvFrame->nb_samples = _audioCtx->frame_size;
 			_audioAvFrame->ch_layout.nb_channels = 2;
 			_audioAvFrame->ch_layout.u.mask = 3;
-			_audioAvFrame->time_base = _audioStream->time_base;
+			_audioAvFrame->time_base.num = _audioCtx->time_base.num;
+			_audioAvFrame->time_base.den = _audioCtx->time_base.den;
 
 			if ((_audioCtx->codec->capabilities & ffmpeg.AV_CODEC_CAP_VARIABLE_FRAME_SIZE) == 0)
 			{
-				Logger.Error("audio codec does not support variable frame size");
+				Logger.Warning("audio codec does not support variable frame size");
 			}
 
 			ret = ffmpeg.av_frame_get_buffer(_audioAvFrame, 0);
 			FfmpegUtils.LogIfAvError(ret, "cannot allocate audio sample buffer");
-			_audioQueue = new byte[_audioAvFrame->nb_samples * _audioAvFrame->ch_layout.nb_channels];
+			_audioQueue.BufferLength = _audioAvFrame->nb_samples * _audioAvFrame->ch_layout.nb_channels;
+			_audioQueue.OutputCallback = (buf) =>
+			{
+				float* ab0 = (float*)_audioAvFrame->data[0];
+				float* ab1 = (float*)_audioAvFrame->data[1];
+				for (int i = 0; i < _audioAvFrame->linesize[0] / sizeof(float); i++)
+				{
+					ab0[i] = buf[i * 2];
+					ab1[i] = buf[i * 2 + 1];
+				}
+				DoEncode(_audioCtx, _audioStream, _audioAvFrame, _audioAvPacket);
+			};
 
-			Logger.Debug($"original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
-			Logger.Debug($"target linesize =   {_videoAvFrame->linesize[0]} {_videoAvFrame->linesize[1]} {_videoAvFrame->linesize[2]}");
-			Logger.Debug($"req. frame size =   {_audioCtx->frame_size} * {_audioCtx->ch_layout.nb_channels}ch");
-			Logger.Debug($"ch layout =         {_audioAvFrame->ch_layout.nb_channels} {_audioAvFrame->ch_layout.order} {_audioAvFrame->ch_layout.u.mask}");
-			Logger.Debug($"audio linesizes =   {_audioAvFrame->linesize[0]} {_audioAvFrame->linesize[1]} {_audioAvFrame->linesize[2]} {_audioAvFrame->linesize[3]} {_audioAvFrame->linesize[4]} {_audioAvFrame->linesize[5]} {_audioAvFrame->linesize[6]} {_audioAvFrame->linesize[7]}");
+			Logger.Debug($"video original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
+			Logger.Debug($"video target linesize =   {_videoAvFrame->linesize[0]} {_videoAvFrame->linesize[1]} {_videoAvFrame->linesize[2]}");
+			Logger.Debug($"req. audio frame size =   {_audioCtx->frame_size} * {_audioCtx->ch_layout.nb_channels}ch");
+			Logger.Debug($"audio ch layout =         {_audioAvFrame->ch_layout.nb_channels} {_audioAvFrame->ch_layout.order} {_audioAvFrame->ch_layout.u.mask}");
+			Logger.Debug($"audio linesizes =         {_audioAvFrame->linesize[0]} {_audioAvFrame->linesize[1]} {_audioAvFrame->linesize[2]} {_audioAvFrame->linesize[3]} {_audioAvFrame->linesize[4]} {_audioAvFrame->linesize[5]} {_audioAvFrame->linesize[6]} {_audioAvFrame->linesize[7]}");
 
 			_videoAvPacket = ffmpeg.av_packet_alloc();
 			_audioAvPacket = ffmpeg.av_packet_alloc();
@@ -250,12 +261,12 @@ public class FfmpegExportHandler : IExporter
 		}
 	}
 
-	public void PushNewFrame(Image videoFrame, byte[] audioFrame, double delta)
+	public void PushNewFrame(Image videoFrame, float[] audioFrame, double delta)
 	{
 		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
 	}
 
-	public unsafe void PushNewFrame(Image<Rgba32> videoFrame, byte[] audioFrame, double delta)
+	public unsafe void PushNewFrame(Image<Rgba32> videoFrame, float[] audioFrame, double delta)
 	{
 		if (!_init)
 		{
@@ -272,10 +283,8 @@ public class FfmpegExportHandler : IExporter
 		ret = ffmpeg.av_frame_make_writable(_audioAvFrame);
 		FfmpegUtils.LogIfAvError(ret, "cannot make audio sample buffer writable");
 
-		_audioAvFrame->time_base.num = _audioCtx->time_base.num;
-		_audioAvFrame->time_base.den = _audioCtx->time_base.den;
 		_audioAvFrame->pts = (long)(_audioAvFrame->sample_rate * (_frameNum / (float)Generator.OutputFps));
-		_audioAvFrame->duration = _audioCtx->sample_rate / 1024;
+		_audioAvFrame->duration = Generator.AudioOutputSamplesPerFrame;
 
 		// TODO: move to init method
 		if (_swsCtx == null)
@@ -321,37 +330,11 @@ public class FfmpegExportHandler : IExporter
 		_videoAvFrame->duration = 1;
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
 
-		var newAudioBufferOfs = _audioQueueOfs + audioFrame.Length;
-		if (newAudioBufferOfs >= _audioQueue.Length)
-		{
-			var firstHalfSize = _audioQueue.Length - _audioQueueOfs;
-			var secondHalfSize = Math.Abs(_audioQueue.Length - newAudioBufferOfs);
-			Array.Copy(audioFrame, 0, _audioQueue, _audioQueueOfs, firstHalfSize);
-			
-			_audioQueueOfs = 0;
-
-			float* ab0 = (float*)_audioAvFrame->data[0];
-			float* ab1 = (float*)_audioAvFrame->data[1];
-			for (int i = 0; i < _audioAvFrame->linesize[0] / sizeof(float); i++)
-			{
-				ab0[i] = (_audioQueue[i * 2] - 128) / 128f;
-				ab1[i] = (_audioQueue[i * 2 + 1] - 128) / 128f;
-			}
-			DoEncode(_audioCtx, _audioStream, _audioAvFrame, _audioAvPacket);
-			
-			Array.Copy(audioFrame, firstHalfSize, _audioQueue, 0, secondHalfSize);
-			_audioQueueOfs = secondHalfSize;
-		}
-		else
-		{
-			Array.Copy(audioFrame, 0, _audioQueue, _audioQueueOfs, audioFrame.Length);
-			_audioQueueOfs += audioFrame.Length;
-		}
-		Logger.Trace($"audio buf status: filled {_audioQueueOfs}/{_audioQueue.Length} {_audioQueue.Length - _audioQueueOfs} bytes left");
+		_audioQueue.Push(audioFrame);
 
 		if (_frameNum % 10 == 0)
 		{
-			Logger.Trace($"frame {_frameNum}, ts {_frameNum / 60}, framegen speed {(int)(1/delta)} fps\x1b[K\x1b[G");
+			Logger.Trace($"frame {_frameNum}, ts {_frameNum / Generator.OutputFps}, framegen speed {(int)(1/delta)} fps\x1b[K\x1b[G");
 		}
 
 		_frameNum++;

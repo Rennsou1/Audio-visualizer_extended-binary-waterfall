@@ -235,7 +235,7 @@ public class Generator
 		Logger.Info("Generating binary waterfall…");
 
 		string avSettingsString = $"{AudioInputSampleRate} Hz, PCM {(AudioInputSampleFormat.IsSigned() ? "signed" : "unsigned")} {8 * AudioInputSampleFormat.GetByteSize()}-bit, {(AudioInputChannelCount == 2 ? "stereo" : "mono")}\nRGBA (32bpp), {WaterfallWidth} px/line";
-		string readSpeedString = $"{(InputBytesPerSecond) / 1024} KiB/s";
+		string readSpeedString = $"{InputBytesPerSecond / 1024} KiB/s";
 
 		float subfileWindowIndex = 0f;
 		long currentOffset = 0;
@@ -249,11 +249,12 @@ public class Generator
 			var frameStartByteOffset = currentOffset.Align(WaterfallWidth * 4) - (WaterfallFrameLength / 2);
 			if (frameStartByteOffset < 0)
 			{
-				playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallScaledWidth / 2));
+				playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallWidth * 4));
 				frameStartByteOffset = 0;
 			}
 			else if (frameStartByteOffset + WaterfallFrameLength >= _inputFileStream.Length)
 			{
+				playHeadRelPos = (int)((_inputFileStream.Length - (frameStartByteOffset + WaterfallFrameLength)) / (WaterfallWidth * 4));
 				frameStartByteOffset = _inputFileStream.Length - WaterfallFrameLength;
 			}
 			var frameEndByteOffset = frameStartByteOffset + WaterfallFrameLength;
@@ -276,8 +277,6 @@ public class Generator
 
 			_inputFileStream.Position = audioFrameStartByteOffset;
 			var currentAudioBuffer = targetFileReader.ReadBytes(InputBytesPerFrame);
-
-			// Console.Error.WriteLine($"audio buf: {audioFrameStartByteOffset:X8}–{audioFrameEndByteOffset:X8}");
 
 			// Get video data.
 
@@ -333,18 +332,6 @@ public class Generator
 				.ToArray()
 				.ToPacked()
 				.ToArray();
-
-			// using (var debugOutStr = File.Open("__debug.out", FileMode.Append))
-			// {
-			// 	using (var bw = new BinaryWriter(debugOutStr))
-			// 	{
-			// 		// debugOutStr.Write(_outputAudioBuffer);
-			// 		foreach (var sample in _outputAudioBuffer)
-			// 		{
-			// 			bw.Write(sample);
-			// 		}
-			// 	}
-			// }
 
 			// Compute registers.
 
@@ -427,7 +414,7 @@ public class Generator
 				.DrawImage(_viewportFramebuf, new Point(videoFrameX1, videoFrameY1), 1f)
 				.DrawText(new RichTextOptions(_font32)
 				{
-					Origin = new Vector2(32, (OutputVideoHeight / 2) + playHeadRelPos),
+					Origin = new Vector2(32, (OutputVideoHeight / 2) + (playHeadRelPos * (WaterfallScaledHeight / WaterfallHeight))),
 					VerticalAlignment = VerticalAlignment.Center,
 				}, "▶", Color.White)
 			);

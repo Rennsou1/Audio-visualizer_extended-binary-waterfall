@@ -12,7 +12,6 @@ namespace Unai.ExtendedBinaryWaterfall;
 class Program
 {
 	static bool _helpMode = false;
-	static string _inputFilePath = null;
 
 	static Generator _generator = new();
 
@@ -21,7 +20,16 @@ class Program
 		// Make decimals use "." instead of other characters.
 		CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 
-		var asmVer = FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
+		string asmVer = "unknown";
+		try
+		{
+			// FIXME: this is horrible, change it!
+			asmVer = FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
+		}
+		catch (Exception ex)
+		{
+			Logger.Error($"Cannot determine program version: {ex.Message}");
+		}
 		Logger.Info($"Extended Binary Waterfall {asmVer}");
 
 		if (!ParseCommandLineArguments(args))

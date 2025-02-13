@@ -92,12 +92,10 @@ class Program
 					_generator.InputFileFormatId = argKvp[1];
 					break;
 
-				case "--file-list":
-				case "--aux-file":
+				case "--file-listing":
 					_generator.InputAuxiliaryFilePath = argKvp[1];
 					break;
 
-				case "--output-type":
 				case "--exporter":
 					_generator.ExporterId = argKvp[1];
 					break;
@@ -112,11 +110,11 @@ class Program
 		StringBuilder helpStrBld = new();
 		helpStrBld.AppendLine($"Usage: {Environment.GetCommandLineArgs()[0]} <file_input> [options]");
 		helpStrBld.AppendLine("Options:");
-		helpStrBld.AppendLine($"	--title=…       Set the target file's title");
-		helpStrBld.AppendLine($"	--author=…      Set the author name of the generated binary waterfall");
-		helpStrBld.AppendLine($"	--format=…      Set the target file's format (autodetected from extension if unset)");
-		helpStrBld.AppendLine($"	--file-list=…   Set the file list text file path (some parsers require it)");
-		helpStrBld.AppendLine($"	--output-type=… Set the output type/exporter (SDL window by default)");
+		helpStrBld.AppendLine($"	--title=…          Set the target file's title");
+		helpStrBld.AppendLine($"	--author=…         Set the author name of the generated binary waterfall");
+		helpStrBld.AppendLine($"	--format=…         Set the target file's format (autodetected from extension if unset)");
+		helpStrBld.AppendLine($"	--file-listing=…   Set the file list text file path (some parsers require it)");
+		helpStrBld.AppendLine($"	--exporter=…       Set the output type/exporter (SDL window by default)");
 		helpStrBld.AppendLine();
 
 		helpStrBld.AppendLine("Available parsers/input formats:");

@@ -5,6 +5,8 @@
 		<TargetFramework>net9.0</TargetFramework>
 		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 		<DisableDiagnosticTracing>true</DisableDiagnosticTracing>
+		
+		<MinVerTagPrefix>v</MinVerTagPrefix>
 	</PropertyGroup>
 
 	<ItemGroup>

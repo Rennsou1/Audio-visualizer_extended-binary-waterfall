@@ -99,6 +99,10 @@ class Program
 				case "--exporter":
 					_generator.ExporterId = argKvp[1];
 					break;
+
+				default:
+					Logger.Error($"Unknown argument: `{argKvp[0]}`.");
+					return false;
 			}
 		}
 

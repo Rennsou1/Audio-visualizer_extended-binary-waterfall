@@ -23,8 +23,15 @@ class Program
 		string asmVer = "unknown";
 		try
 		{
-			// FIXME: this is horrible, change it!
-			asmVer = FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
+			var asmInfVerAttr = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+			if (asmInfVerAttr != null)
+			{
+				asmVer = asmInfVerAttr.InformationalVersion;
+			}
+			else
+			{
+				asmVer = FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
+			}
 		}
 		catch (Exception ex)
 		{

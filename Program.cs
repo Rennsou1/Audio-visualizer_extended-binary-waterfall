@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -21,24 +20,8 @@ class Program
 		// Make decimals use "." instead of other characters.
 		CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 
-		string asmVer = "unknown";
-		try
-		{
-			var asmInfVerAttr = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>();
-			if (asmInfVerAttr != null)
-			{
-				asmVer = asmInfVerAttr.InformationalVersion;
-			}
-			else
-			{
-				asmVer = FileVersionInfo.GetVersionInfo(Assembly.GetExecutingAssembly().Location).ProductVersion;
-			}
-		}
-		catch (Exception ex)
-		{
-			Logger.Error($"Cannot determine program version: {ex.Message}");
-		}
-		Logger.Info($"Extended Binary Waterfall {asmVer}");
+		string semVer = BuildInfo.SemVer ?? "unknown";
+		Logger.Info($"Extended Binary Waterfall {semVer}");
 
 		if (!ParseCommandLineArguments(args))
 		{

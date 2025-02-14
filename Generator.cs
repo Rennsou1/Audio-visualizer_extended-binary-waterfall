@@ -39,17 +39,26 @@ public class Generator
 	
 	// User-defined input.
 	public string InputFilePath { get; set; } = null;
+	[CliParameter("Input File Listing File Path", "file-listing", "Set the file path that contains a text-based file listing if the input file format cannot be parsed entirely by this program")]
 	public string InputAuxiliaryFilePath { get; set; } = null;
+	[CliParameter("Title", "title", 't', "Set the title that will be shown during the binary waterfall describing the target file")]
 	public string Title { get; set; } = null;
+	[CliParameter("Author", "author", 'a', "Set the author of the generated binary waterfall")]
 	public string Author { get; set; } = null;
+	[CliParameter("Input File Parser", "parser", 'p', "Force a specific parser for the input file")]
 	public string InputFileFormatId { get; set; } = null;
+	[CliParameter("Exporter", "exporter", 'e', "Set the exporter to be used to export the generated binary waterfall")]
 	public string ExporterId { get; set; } = null;
-	public int InputBytesPerSecond { get; set; } = 24000 * 2 * 2;
+	[CliParameter("Input Bytes per Second", "input-bps")]
+	public int InputBytesPerSecond { get; set; } = 48000 * 2 * 2;
 	public int InputBytesPerFrame => InputBytesPerSecond / OutputFps;
 
 	// Video parameters.
+	[CliParameter("Output Video Width", "output-width")]
 	public int OutputVideoWidth { get; set; } = 1920;
+	[CliParameter("Output Video Height", "output-height")]
 	public int OutputVideoHeight { get; set; } = 1080;
+	[CliParameter("Output Framerate", "output-fps")]
 	public int OutputFps { get; set; } = 60;
 	public int WaterfallScaledWidth { get; set; } = 768;
 	public int WaterfallScaledHeight { get; set; } = 768;
@@ -58,7 +67,9 @@ public class Generator
 	public int WaterfallFrameLength => WaterfallWidth * WaterfallHeight * 4;
 
 	// Audio parameters.
+	[CliParameter("Input Sample Format", "sample-format")]
 	public AudioSampleFormat AudioInputSampleFormat { get; set; } = AudioSampleFormat.Signed16LE;
+	[CliParameter("Input Audio Channel Count", "channel-count")]
 	public int AudioInputChannelCount { get; set; } = 2;
 	public int AudioInputSamplesPerFrame => (InputBytesPerFrame / AudioInputSampleFormat.GetByteSize());
 	public int AudioInputSampleRate => (InputBytesPerSecond / AudioInputSampleFormat.GetByteSize()) / AudioInputChannelCount;

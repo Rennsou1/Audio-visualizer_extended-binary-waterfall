@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 using Unai.ExtendedBinaryWaterfall.Parsers;
@@ -60,6 +61,8 @@ class Program
 
 		foreach (var arg in args ?? Environment.GetCommandLineArgs()[1..])
 		{
+			Logger.Debug($"Parsing command line argument: `{arg}`");
+
 			if (!arg.StartsWith('-'))
 			{
 				if (_generator.InputFilePath != null)
@@ -68,41 +71,67 @@ class Program
 					return false;
 				}
 				_generator.InputFilePath = arg;
-				// _inputStream = File.OpenRead(arg);
-				_generator.Title ??= Path.GetFileName(arg);
 				continue;
 			}
 
 			var argKvp = arg.Split('=');
+
 			switch (argKvp[0])
 			{
 				case "--help":
 					_helpMode = true;
 					break;
 
-				case "--title":
-					_generator.Title = argKvp[1].Replace("\\n", "\n");
-					break;
-
-				case "--author":
-					_generator.Author = argKvp[1];
-					break;
-
-				case "--format":
-					_generator.InputFileFormatId = argKvp[1];
-					break;
-
-				case "--file-listing":
-					_generator.InputAuxiliaryFilePath = argKvp[1];
-					break;
-
-				case "--exporter":
-					_generator.ExporterId = argKvp[1];
-					break;
-
 				default:
-					Logger.Error($"Unknown argument: `{argKvp[0]}`.");
-					return false;
+					var targetParam = Utils.GetPropertiesWithAttribute<CliParameterAttribute>()
+						.Where(p => p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argKvp[0][2..] || p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argKvp[0][2]).FirstOrDefault();
+
+					if (targetParam == null)
+					{
+						Logger.Error($"Unknown argument: `{argKvp[0]}`.");
+						return false;
+					}
+
+					// Can't do a `switch` statement here. :(
+					object targetObject = null;
+					if (targetParam.DeclaringType == typeof(Generator))
+					{
+						targetObject = _generator;
+					}
+					else
+					{
+						Logger.Error($"Cannot set property `{targetParam.Name}` because the instance of its declaring type is unknown.");
+						return false;
+					}
+
+					if (targetParam.PropertyType == typeof(string))
+					{
+						targetParam.SetValue(targetObject, argKvp[1]);
+					}
+					else if (targetParam.PropertyType == typeof(int))
+					{
+						targetParam.SetValue(targetObject, int.Parse(argKvp[1]));
+					}
+					else if (targetParam.PropertyType.IsEnum)
+					{
+						var ok = Enum.TryParse(targetParam.PropertyType, argKvp[1], true, out var pval);
+						if (!ok)
+						{
+							Logger.Error($"Cannot parse value '{argKvp[1]}' to enumeration '{targetParam.PropertyType.Name}'.");
+							Logger.Info("Valid values:");
+							foreach (var enumVal in Enum.GetValues(targetParam.PropertyType))
+							{
+								Logger.Info($"	{enumVal}");
+							}
+							return false;
+						}
+						targetParam.SetValue(targetObject, pval);
+					}
+					else
+					{
+						Logger.Error($"Cannot convert string representation of value of property `{targetParam.Name}` because it is not implemented yet.");
+					}
+					break;
 			}
 		}
 
@@ -112,13 +141,27 @@ class Program
 	private static void PrintHelp()
 	{
 		StringBuilder helpStrBld = new();
-		helpStrBld.AppendLine($"Usage: {Environment.GetCommandLineArgs()[0]} <file_input> [options]");
+		helpStrBld.AppendLine("Usage:");
+		helpStrBld.AppendLine($"	{Path.GetFileName(Environment.GetCommandLineArgs()[0])} <file_input> [options]");
+		helpStrBld.AppendLine();
 		helpStrBld.AppendLine("Options:");
-		helpStrBld.AppendLine($"	--title=…          Set the target file's title");
-		helpStrBld.AppendLine($"	--author=…         Set the author name of the generated binary waterfall");
-		helpStrBld.AppendLine($"	--format=…         Set the target file's format (autodetected from extension if unset)");
-		helpStrBld.AppendLine($"	--file-listing=…   Set the file list text file path (some parsers require it)");
-		helpStrBld.AppendLine($"	--exporter=…       Set the output type/exporter (SDL window by default)");
+		helpStrBld.AppendLine($"	--help\n		Print this help text and exit");
+
+		foreach (var cliParam in Utils.GetPropertiesWithAttribute<CliParameterAttribute>())
+		{
+			var cliParamAttr = cliParam.GetCustomAttribute<CliParameterAttribute>();
+			helpStrBld.Append('\t');
+			if (cliParamAttr.ShortParameterName.HasValue)
+			{
+				helpStrBld.Append($"-{cliParamAttr.ShortParameterName}, ");
+			}
+			helpStrBld.Append($"--{cliParamAttr.LongParameterName}=<{cliParam.PropertyType.Name}> ".PadRight(cliParamAttr.ShortParameterName.HasValue ? 28 : 32));
+			helpStrBld.AppendLine(cliParamAttr.Name);
+			if (cliParamAttr.Description != null)
+			{
+				helpStrBld.AppendLine($"		{cliParamAttr.Description}");
+			}
+		}
 		helpStrBld.AppendLine();
 
 		helpStrBld.AppendLine("Available parsers/input formats:");

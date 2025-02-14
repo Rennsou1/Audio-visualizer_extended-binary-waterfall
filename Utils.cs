@@ -293,4 +293,16 @@ public static class Utils
 		return asm.GetExportedTypes()
 			.Where(t => t.GetCustomAttribute<T>() != null);
 	}
+
+	public static IEnumerable<PropertyInfo> GetPropertiesWithAttribute<T>(Assembly asm = null) where T : Attribute, new()
+	{
+		asm ??= Assembly.GetExecutingAssembly();
+		foreach (var type in asm.GetExportedTypes())
+		{
+			foreach (var prop in type.GetProperties().Where(p => p.GetCustomAttribute<T>() != null))
+			{
+				yield return prop;
+			}
+		}
+	}
 }

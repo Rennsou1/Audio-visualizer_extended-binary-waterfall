@@ -23,6 +23,13 @@ class Program
 		string semVer = BuildInfo.SemVer ?? "unknown";
 		Logger.Info($"Extended Binary Waterfall {semVer}");
 
+		if (args.Length < 1)
+		{
+			Logger.Error("At least one argument must be specified.");
+			PrintHelp();
+			return;
+		}
+
 		if (!ParseCommandLineArguments(args))
 		{
 			Logger.Fail("Invalid command line arguments. Exiting…");

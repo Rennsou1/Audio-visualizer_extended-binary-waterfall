@@ -81,7 +81,7 @@ class Program
 
 				default:
 					var targetParam = Utils.GetPropertiesWithAttribute<CliParameterAttribute>()
-						.Where(p => p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argKvp[0][2..] || p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argKvp[0][2]).FirstOrDefault();
+						.Where(p => argKvp[0].Length == 2 ? p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argKvp[0][1] : p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argKvp[0][2..]).FirstOrDefault();
 
 					if (targetParam == null)
 					{

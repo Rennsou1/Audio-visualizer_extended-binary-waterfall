@@ -20,6 +20,14 @@ Additional software will be required for certain format parsers:
 
 - `wimlib` for WIM file listing.
 
+### Quick Start
+
+Execute the following command to get information about the arguments that can be used:
+
+```
+Unai.ExtendedBinaryWaterfall --help
+```
+
 ### Examples
 
 #### Example 1

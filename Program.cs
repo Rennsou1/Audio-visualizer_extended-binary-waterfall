@@ -35,7 +35,14 @@ class Program
 			return;
 		}
 
-		_generator.Generate();
+		try
+		{
+			_generator.Generate();
+		}
+		catch (Exception ex)
+		{
+			Logger.Fail($"Unhandled exception while generating binary waterfall: {ex}");
+		}
 	}
 
 	private static bool ParseCommandLineArguments(IEnumerable<string> args = null)

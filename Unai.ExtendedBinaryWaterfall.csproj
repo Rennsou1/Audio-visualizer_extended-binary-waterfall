@@ -20,9 +20,9 @@
 		<PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.2" />
 		<!-- Used by format parsers -->
 		<PackageReference Include="PeNet" Version="4.1.1" />
-		<!-- <PackageReference Include="DiscUtils" Version="0.16.13" /> -->
 		<!-- Used by SdlExportHandler -->
 		<PackageReference Include="SDL-Sharp" Version="2.2.5" />
+		<PackageReference Include="SDL-Sharp-DLL" Version="2.1.4" />
 		<!-- Used by FfmpegExportHandler -->
 		<PackageReference Include="FFmpeg.AutoGen" Version="7.0.0" />
 	</ItemGroup>

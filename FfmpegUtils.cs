@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -25,19 +26,36 @@ public static class FfmpegUtils
 
 	public static string GetFfmpegLibraryPath()
 	{
+		Logger.Debug("Guessing FFmpeg library path…");
+		IEnumerable<string> ret;
+
 		if (Environment.OSVersion.Platform == PlatformID.Win32NT)
 		{
-			var ret = _ffmpegSearchPathsWindows
+			ret = _ffmpegSearchPathsWindows
 				.Where(Directory.Exists)
 				.Where(x => Directory.GetFiles(x, "libavcodec-*.dll").Length > 0);
-			return ret.FirstOrDefault();
 		}
 		else
 		{
-			var ret = _ffmpegSearchPathsLinux
+			ret = _ffmpegSearchPathsLinux
 				.Where(Directory.Exists)
 				.Where(x => File.Exists($"{x}/libavcodec.so"));
-			Logger.Debug($"{ret.Count()} auto-detected library paths.");
+		}
+		
+		Logger.Debug($"{ret.Count()} detected library paths.");
+		if (!ret.Any())
+		{
+			Logger.Error("Cannot determine folder path containing FFmpeg libraries.");
+			if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+			{
+				Logger.Info("Please download the FFmpeg libraries and save them to the following location:");
+				Logger.Info($"	{_ffmpegSearchPathsWindows[0]}");
+				Logger.Info("Note that these libraries start with `libav`.");
+			}
+			return null;
+		}
+		else
+		{
 			return ret.FirstOrDefault();
 		}
 	}

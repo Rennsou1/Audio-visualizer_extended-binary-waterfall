@@ -171,7 +171,7 @@ public class Generator
 		else
 		{
 			Logger.Debug("No exporter requested. Using SDL…");
-			_exporter = new SdlExportHandler();
+			_exporter = new SdlExporter();
 		}
 
 		_exporter.Generator = this;

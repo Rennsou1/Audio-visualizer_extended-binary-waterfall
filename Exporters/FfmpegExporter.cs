@@ -7,7 +7,7 @@ using SixLabors.ImageSharp.PixelFormats;
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 [Exporter("ffmpeg", "FFmpeg Stream", "Use FFmpeg libraries to encode audio and video data and output it in Matroska format.")]
-public class FfmpegExportHandler : IExporter
+public class FfmpegExporter : IExporter
 {
 	private bool _init = false;
 	private bool _quit = false;

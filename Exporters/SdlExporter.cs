@@ -9,7 +9,7 @@ using SixLabors.ImageSharp.PixelFormats;
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
 [Exporter("sdl", "SDL Window", "Show the generated audio and video data in a window.")]
-public class SdlExportHandler : IExporter
+public class SdlExporter : IExporter
 {
 	public Generator Generator { get; set; }
 

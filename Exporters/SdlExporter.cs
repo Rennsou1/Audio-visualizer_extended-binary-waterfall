@@ -22,6 +22,7 @@ public class SdlExporter : IExporter
 	private PSurface _surface;
 	private uint _audioDeviceId;
 
+	private byte[] _framebuffer = null;
 	private Stopwatch _sw = new();
 	private int _frameCount = 0;
 	private double _ts = 0;
@@ -36,14 +37,14 @@ public class SdlExporter : IExporter
 			if (_win.IsNull) throw new Exception("SDL cannot create a window.");
 			_ren = SDL.CreateRenderer(_win, -1, RendererFlags.Accelerated);
 			if (_ren.IsNull) throw new Exception("SDL cannot create a renderer.");
-			SDL.CreateRGBSurface(0, 1920, 1080, 32, 0xff, 0xff00, 0xff0000, 0, out _surface);
+			SDL.CreateRGBSurface(0, Generator.OutputVideoWidth, Generator.OutputVideoHeight, 32, 0xff, 0xff00, 0xff0000, 0, out _surface);
 			if (_surface.IsNull) throw new Exception("SDL cannot create a surface.");
+			_framebuffer = new byte[Generator.OutputVideoWidth * Generator.OutputVideoHeight * 4];
 
 			AudioSpec audioSpec;
 			audioSpec.Frequency = Generator.AudioOutputSampleRate;
 			audioSpec.Format = 0x8120; // 32-bit float LE
 			audioSpec.Channels = 2;
-			Logger.Debug($"SDL audio specs: {audioSpec.Frequency}Hz");
 			_audioDeviceId = SDL.OpenAudioDevice(null, 0, &audioSpec, null, 0);
 			Logger.Debug($"OpenAudioDevice() = {_audioDeviceId}");
 			_ = SDL.PauseAudioDevice(_audioDeviceId, false);
@@ -51,8 +52,6 @@ public class SdlExporter : IExporter
 		_sw.Start();
 		_init = true;
 	}
-	
-	byte[] _framebuffer = new byte[1920 * 1080 * 4];
 
 	public void PushNewFrame(Image videoFrame, float[] audioFrame, double delta)
 	{
@@ -87,7 +86,7 @@ public class SdlExporter : IExporter
 							Finish();
 							return;
 
-						case Scancode.F11: // TODO: how to get back to windowed mode?
+						case Scancode.F11:
 							SDL.SetWindowFullscreen(_win, _isFullscreen ? 0 : WindowFlags.Fullscreen);
 							_isFullscreen = !_isFullscreen;
 							break;

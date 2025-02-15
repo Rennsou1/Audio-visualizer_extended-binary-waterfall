@@ -206,7 +206,6 @@ public class Generator
 		_font32 = _fontFamily.CreateFont(32f, FontStyle.Regular);
 		_font24 = _fontFamily.CreateFont(24f, FontStyle.Regular);
 		_font16 = _fontFamily.CreateFont(16f, FontStyle.Regular);
-		if (_emojiFontFamily == null) _emojiFontFamily = _fontFamily; // can't use ??= op
 
 		_timer.Start();
 
@@ -398,7 +397,7 @@ public class Generator
 					{
 						Origin = new Vector2(subfileX1, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
-						FallbackFontFamilies = _emojiFontFamily != null ? [_emojiFontFamily] : null,
+						FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
 					}, $"{(isMainSubfile ? "▶" : " ")} {Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", Color.White)
 					.DrawText(new RichTextOptions(_font32)
 					{

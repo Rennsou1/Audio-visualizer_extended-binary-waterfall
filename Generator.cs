@@ -194,12 +194,19 @@ public class Generator
 
 		_fontCollection = new();
 		_fontCollection.AddSystemFonts();
-		_fontFamily = _fontCollection.Get("unifont");
+		if (_fontCollection.TryGet("unifont", out _fontFamily))
+		{
+			_fontCollection.TryGet("unifont upper", out _emojiFontFamily);
+		}
+		else
+		{
+			_fontFamily = _fontCollection.Get(Environment.OSVersion.Platform == PlatformID.Win32NT ? "Consolas" : "Source Code Pro");
+		}
 		_font48 = _fontFamily.CreateFont(48f, FontStyle.Regular);
 		_font32 = _fontFamily.CreateFont(32f, FontStyle.Regular);
 		_font24 = _fontFamily.CreateFont(24f, FontStyle.Regular);
 		_font16 = _fontFamily.CreateFont(16f, FontStyle.Regular);
-		_emojiFontFamily = _fontCollection.Get("unifont upper");
+		if (_emojiFontFamily == null) _emojiFontFamily = _fontFamily; // can't use ??= op
 
 		_timer.Start();
 
@@ -391,7 +398,7 @@ public class Generator
 					{
 						Origin = new Vector2(subfileX1, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
-						FallbackFontFamilies = [_emojiFontFamily],
+						FallbackFontFamilies = _emojiFontFamily != null ? [_emojiFontFamily] : null,
 					}, $"{(isMainSubfile ? "▶" : " ")} {Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", Color.White)
 					.DrawText(new RichTextOptions(_font32)
 					{

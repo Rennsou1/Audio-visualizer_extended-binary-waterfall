@@ -9,16 +9,19 @@ This program **generates video and audio** based on an **arbitrary computer file
 
 ### Dependencies
 
-- .NET 9 SDK
-- [Unifont](https://unifoundry.com/unifont/index.html)
-	- Some Linux distros have the option to install this font via their respective package manager, but in Windows a manual download is required.
-	Make sure to download both the default font and the “upper” variant for emoticons.
-- FFmpeg libraries
-	- The above text also applies to this one.
+- Required
+	- .NET 9 SDK
+	- FFmpeg libraries
+		- The above text also applies to this one.
+- Optional
+	- [Unifont](https://unifoundry.com/unifont/index.html)
+		- Some Linux distros have the option to install this font via their respective package manager, but in Windows a manual download is required.
+		Make sure to install both the default font and the “upper” variant for emoticons.
+	- `wimlib` for WIM file listings.
 
-Additional software will be required for certain format parsers:
+### Build
 
-- `wimlib` for WIM file listing.
+Standard `dotnet build`/`dotnet run` commands apply.
 
 ### Quick Start
 
@@ -42,7 +45,7 @@ You can append `> output.mkv` to redirect the standard output to a file instead.
 
 #### Example 2
 
-Read a GameMaker archive file and preview the result in a SDL window:
+Read a GameMaker archive file and preview the result in an SDL window:
 
 ```
 Unai.ExtendedBinaryWaterfall /path/to/data.win

@@ -15,6 +15,7 @@ public class SdlExporter : IExporter
 
 	private bool _init = false;
 	private bool _quit = false;
+	private bool _isFullscreen = false;
 
 	private Window _win;
 	private Renderer _ren;
@@ -77,6 +78,21 @@ public class SdlExporter : IExporter
 				case EventType.Quit:
 					Finish();
 					return;
+
+				case EventType.KeyDown:
+					var scancode = e.Keyboard.Keysym.Scancode;
+					switch (scancode)
+					{
+						case Scancode.Escape:
+							Finish();
+							return;
+
+						case Scancode.F11: // TODO: how to get back to windowed mode?
+							SDL.SetWindowFullscreen(_win, _isFullscreen ? 0 : WindowFlags.Fullscreen);
+							_isFullscreen = !_isFullscreen;
+							break;
+					}
+					break;
 			}
 		}
 

@@ -42,8 +42,7 @@ public class SdlExporter : IExporter
 			audioSpec.Frequency = Generator.AudioOutputSampleRate;
 			audioSpec.Format = 0x8120; // 32-bit float LE
 			audioSpec.Channels = 2;
-			audioSpec.Samples = (ushort)(4 * 2 * audioSpec.Frequency / Generator.OutputFps);
-			Logger.Debug($"SDL audio specs: {audioSpec.Frequency}Hz {audioSpec.Samples} samples");
+			Logger.Debug($"SDL audio specs: {audioSpec.Frequency}Hz");
 			_audioDeviceId = SDL.OpenAudioDevice(null, 0, &audioSpec, null, 0);
 			Logger.Debug($"OpenAudioDevice() = {_audioDeviceId}");
 			_ = SDL.PauseAudioDevice(_audioDeviceId, false);
@@ -116,7 +115,7 @@ public class SdlExporter : IExporter
 			{
 				fixed (float* audioBufPtr = audioFrame)
 				{
-					var ret = SDL.QueueAudio(_audioDeviceId, (byte*)audioBufPtr, audioFrame.Length);
+					var ret = SDL.QueueAudio(_audioDeviceId, (byte*)audioBufPtr, audioFrame.Length * sizeof(float));
 					if (ret != 0) Logger.Error($"Cannot queue audio buffer (code {ret}): {SDL.GetError()}");
 				}
 			}

@@ -48,8 +48,8 @@ public class ZipParser : IParser
 
 		CentralDirectoryOffset = eocdCdirStart;
 
-		yield return new("End of Central Directory", EocdOffset, 22 + eocdCommentSize);
-		yield return new("Central Directory", eocdCdirStart, eocdCdirSize);
+		yield return new("End of Central Directory", EocdOffset, 22 + eocdCommentSize) { IconString = "🔶" };
+		yield return new("Central Directory", eocdCdirStart, eocdCdirSize) { IconString = "🔶" };
 
 		// Central Directory
 		br.BaseStream.Position = CentralDirectoryOffset;

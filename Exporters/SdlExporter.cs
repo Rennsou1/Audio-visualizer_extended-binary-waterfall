@@ -124,7 +124,7 @@ public class SdlExporter : IExporter
 
 		var audioQueue = SDL.GetQueuedAudioSize(_audioDeviceId);
 
-		if (audioQueue < 24000)
+		if (audioQueue < audioFrame.Length)
 		{
 			unsafe
 			{

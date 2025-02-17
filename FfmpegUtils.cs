@@ -53,6 +53,7 @@ public static class FfmpegUtils
 			Logger.Debug("Search via predefined paths failed. Trying PATH environment variable…");
 			ret = Environment.GetEnvironmentVariable("PATH")
 				.Split(';')
+				.Where(Directory.Exists)
 				.Where(p => Directory.GetFiles(p, "avcodec*.dll").Length > 0);
 
 			if (ret.Any())

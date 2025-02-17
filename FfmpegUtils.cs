@@ -33,7 +33,7 @@ public static class FfmpegUtils
 		{
 			ret = _ffmpegSearchPathsWindows
 				.Where(Directory.Exists)
-				.Where(x => Directory.GetFiles(x, "libavcodec-*.dll").Length > 0);
+				.Where(x => Directory.GetFiles(x, "*avcodec-*.dll").Length > 0);
 		}
 		else
 		{
@@ -50,7 +50,7 @@ public static class FfmpegUtils
 			{
 				Logger.Info("Please download the FFmpeg libraries and save them to the following location:");
 				Logger.Info($"	{_ffmpegSearchPathsWindows[0]}");
-				Logger.Info("Note that these libraries start with `libav`.");
+				Logger.Info("Note that these libraries may start with either `libav` or just `av` (e.g: `avcodec-61.dll`).");
 			}
 			return null;
 		}

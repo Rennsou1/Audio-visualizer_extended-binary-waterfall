@@ -43,21 +43,35 @@ public static class FfmpegUtils
 		}
 		
 		Logger.Debug($"{ret.Count()} detected library paths.");
-		if (!ret.Any())
-		{
-			Logger.Error("Cannot determine folder path containing FFmpeg libraries.");
-			if (Environment.OSVersion.Platform == PlatformID.Win32NT)
-			{
-				Logger.Info("Please download the FFmpeg libraries and save them to the following location:");
-				Logger.Info($"	{_ffmpegSearchPathsWindows[0]}");
-				Logger.Info("Note that these libraries may start with either `libav` or just `av` (e.g: `avcodec-61.dll`).");
-			}
-			return null;
-		}
-		else
+		if (ret.Any())
 		{
 			return ret.FirstOrDefault();
 		}
+
+		if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+		{
+			Logger.Debug("Search via predefined paths failed. Trying PATH environment variable…");
+			ret = Environment.GetEnvironmentVariable("PATH")
+				.Split(';')
+				.Where(p => Directory.GetFiles(p, "avcodec*.dll").Length > 0);
+
+			if (ret.Any())
+			{
+				return ret.FirstOrDefault();
+			}
+		}
+
+		Logger.Error("Cannot determine folder path containing FFmpeg libraries.");
+		if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+		{
+			Logger.Info("Please enter the following command to install FFmpeg libraries:");
+			Logger.Info("	winget install \"FFmpeg (Shared)\"");
+			Logger.Info("Once installed, restart the command line.");
+			Logger.Info("Alternatively, you can download the FFmpeg libraries and save them to the following location:");
+			Logger.Info($"	{_ffmpegSearchPathsWindows[0]}");
+			Logger.Info("Note that these libraries may start with either `libav` or just `av` (e.g: `avcodec-61.dll`).");
+		}
+		return null;
 	}
 
 	public unsafe static void LogIfAvError(int errorCode, string message)

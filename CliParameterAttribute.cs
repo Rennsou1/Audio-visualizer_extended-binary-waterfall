@@ -2,10 +2,11 @@ using System;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
+[AttributeUsage(AttributeTargets.Property)]
 public class CliParameterAttribute : Attribute
 {
 	public string LongParameterName { get; set; } = null;
-	public Nullable<char> ShortParameterName { get; set; } = null;
+	public char? ShortParameterName { get; set; } = null;
 	public string Name { get; set; } = null;
 	public string Description { get; set; } = null;
 

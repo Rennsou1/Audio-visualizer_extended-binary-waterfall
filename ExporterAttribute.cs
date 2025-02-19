@@ -2,6 +2,7 @@ using System;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
+[AttributeUsage(AttributeTargets.Class)]
 public class ExporterAttribute(string id, string name = null, string description = null) : Attribute
 {
 	public string Id { get; set; } = id;

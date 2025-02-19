@@ -323,6 +323,14 @@ public class Generator
 
 	#endregion
 
+	internal void UpdateValues()
+	{
+		if (_frameContent.Width != OutputVideoWidth || _frameContent.Height != OutputVideoHeight)
+		{
+			_frameContent = new(OutputVideoWidth, OutputVideoHeight);
+		}
+	}
+
 	public void Generate()
 	{
 		_timer.Start();

@@ -25,6 +25,7 @@ public class SdlExporter : IExporter
 	private readonly Stopwatch _sw = new();
 	private int _frameCount = 0;
 	private double _ts = 0;
+	private bool _updateBuffers = false;
 
 	public void InitializeSdl()
 	{
@@ -71,31 +72,6 @@ public class SdlExporter : IExporter
 			InitializeSdl();
 		}
 
-		while (SDL.PollEvent(out Event e) == 1)
-		{
-			switch (e.Type)
-			{
-				case EventType.Quit:
-					Generator._exitRequested = true;
-					return;
-
-				case EventType.KeyDown:
-					var scancode = e.Keyboard.Keysym.Scancode;
-					switch (scancode)
-					{
-						case Scancode.Escape:
-							Generator._exitRequested = true;
-							return;
-
-						case Scancode.F11:
-							_ = SDL.SetWindowFullscreen(_win, _isFullscreen ? 0 : WindowFlags.Fullscreen);
-							_isFullscreen = !_isFullscreen;
-							break;
-					}
-					break;
-			}
-		}
-
 		unsafe
 		{
 			SDL.RenderClear(_ren);
@@ -103,7 +79,7 @@ public class SdlExporter : IExporter
 			videoFrame.CopyPixelDataTo(_framebuffer);
 			SDL.SetRenderDrawColor(_ren, 0, 32, 0, 255);
 			Marshal.Copy(_framebuffer, 0, (nint)((Surface*)_surface)->Pixels, _framebuffer.Length);
-				
+			
 			var tex = SDL.CreateTextureFromSurface(_ren, _surface);
 			if (tex.IsNull)
 			{
@@ -134,6 +110,44 @@ public class SdlExporter : IExporter
 					var ret = SDL.QueueAudio(_audioDeviceId, (byte*)audioBufPtr, audioFrame.Length * sizeof(float));
 					if (ret != 0) Logger.Error($"Cannot queue audio buffer (code {ret}): {SDL.GetError()}");
 				}
+			}
+		}
+
+		while (SDL.PollEvent(out Event e) == 1)
+		{
+			switch (e.Type)
+			{
+				case EventType.Quit:
+					Generator._exitRequested = true;
+					return;
+
+				case EventType.KeyDown:
+					var scancode = e.Keyboard.Keysym.Scancode;
+					switch (scancode)
+					{
+						case Scancode.Escape:
+							Generator._exitRequested = true;
+							return;
+
+						case Scancode.F11:
+							_ = SDL.SetWindowFullscreen(_win, _isFullscreen ? 0 : WindowFlags.Fullscreen);
+							_isFullscreen = !_isFullscreen;
+							break;
+					}
+					break;
+
+				case EventType.WindowEvent:
+					SDL.GetWindowSize(_win, out int width, out int height);
+					if (width != Generator.OutputVideoWidth || height != Generator.OutputVideoHeight)
+					{
+						Generator.OutputVideoWidth = width;
+						Generator.OutputVideoHeight = height;
+						_framebuffer = new byte[Generator.OutputVideoWidth * Generator.OutputVideoHeight * 4];
+						SDL.FreeSurface(_surface);
+						SDL.CreateRGBSurface(0, Generator.OutputVideoWidth, Generator.OutputVideoHeight, 32, 0xff, 0xff00, 0xff0000, 0, out _surface);
+						Generator.UpdateValues();
+					}
+					break;
 			}
 		}
 

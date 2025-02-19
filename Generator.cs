@@ -51,6 +51,8 @@ public class Generator
 	public string ExporterId { get; set; } = null;
 	[CliParameter("Input Bytes per Second", "input-bps")]
 	public int InputBytesPerSecond { get; set; } = 48000 * 2 * 2;
+	[CliParameter("Font Name", "font", "Set the font name to render the on-screen text")]
+	public string FontName { get; set; } = null;
 	public int InputBytesPerFrame => InputBytesPerSecond / OutputFps;
 
 	// Video parameters.
@@ -192,16 +194,34 @@ public class Generator
 		_inputAudioBuffer = new float[AudioInputSamplesPerFrame];
 		_outputAudioBuffer = new float[AudioOutputSamplesPerFrame];
 
+		Logger.Info("Loading font…");
+		Logger.Debug($"Requested font: '{FontName}'.");
+
 		_fontCollection = new();
 		_fontCollection.AddSystemFonts();
-		if (_fontCollection.TryGet("unifont", out _fontFamily))
+		if (FontName != null)
 		{
-			_fontCollection.TryGet("unifont upper", out _emojiFontFamily);
+			// Try getting the font by the font name specified by the user
+			if (!_fontCollection.TryGet(FontName, out _fontFamily))
+			{
+				Logger.Error($"Cannot find font '{FontName}'.");
+			}
 		}
-		else
+
+		if (_fontFamily.Name == null)
 		{
-			_fontFamily = _fontCollection.Get(Environment.OSVersion.Platform == PlatformID.Win32NT ? "Consolas" : "Source Code Pro");
+			if (_fontCollection.TryGet("unifont", out _fontFamily))
+			{
+				_fontCollection.TryGet("unifont upper", out _emojiFontFamily);
+			}
+			else
+			{
+				_fontFamily = _fontCollection.Get(Environment.OSVersion.Platform == PlatformID.Win32NT ? "Consolas" : "Source Code Pro");
+			}
 		}
+		
+		Logger.Debug($"Selected font is {_fontFamily}.");
+
 		_font48 = _fontFamily.CreateFont(48f, FontStyle.Regular);
 		_font32 = _fontFamily.CreateFont(32f, FontStyle.Regular);
 		_font24 = _fontFamily.CreateFont(24f, FontStyle.Regular);

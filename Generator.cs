@@ -77,8 +77,11 @@ public class Generator
 	public int AudioInputSampleRate => (InputBytesPerSecond / AudioInputSampleFormat.GetByteSize()) / AudioInputChannelCount;
 	public int AudioInputBytesPerFrame => InputBytesPerFrame;
 
-	public AudioSampleFormat AudioOutputSampleFormat => AudioSampleFormat.Float32;
-	public int AudioOutputChannelCount => 2;
+	[CliParameter("Output Sample Format", "output-sample-format")]
+	public AudioSampleFormat AudioOutputSampleFormat { get; set; } = AudioSampleFormat.Float32;
+	[CliParameter("Output Audio Channel Count", "output-channel-count")]
+	public int AudioOutputChannelCount { get; set; } = 2;
+	[CliParameter("Output Sample Rate", "output-sample-rate")]
 	public int AudioOutputSampleRate { get; set; } = 48000;
 	public int AudioOutputSamplesPerFrame => AudioOutputSampleRate * AudioOutputChannelCount / OutputFps;
 	public int AudioOutputBytesPerFrame => AudioOutputSampleFormat.GetByteSize() * AudioOutputSamplesPerFrame;

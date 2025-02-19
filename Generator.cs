@@ -471,37 +471,40 @@ public class Generator
 				subfileWindowIndex = .2f * subfileWindowIndex + .8f * currentSubfile.key;
 			}
 
-			// 1. Clear frame
+			// Do render.
 
-			_frameContent.Mutate(ctx => ctx.Clear(new Rgba32(16, 16, 16, 255)));
-
-			// 2. Draw subfile listing
-
-			int subfileX1 = OutputVideoWidth / 2;
-			int subfileX2 = OutputVideoWidth - 32;
-
-			int firstSubfileIndex = (int)(subfileWindowIndex - 7);
-			int lastSubfileIndex = (int)Math.Ceiling(subfileWindowIndex + 7);
-
-			float subfileH = 48;
-			float subfileY = (OutputVideoHeight / 2) - (subfileWindowIndex - firstSubfileIndex) * subfileH;
-
-			for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
+			_frameContent.Mutate(ctx =>
 			{
-				int i = sfi - (currentSubfile?.key ?? 0);
+				// 1. Clear frame
 
-				if (sfi < 0 || sfi >= _subfiles.Count)
+				ctx.Clear(new Rgba32(16, 16, 16, 255));
+
+				// 2. Draw subfile listing
+
+				int subfileX1 = OutputVideoWidth / 2;
+				int subfileX2 = OutputVideoWidth - 32;
+
+				int firstSubfileIndex = (int)(subfileWindowIndex - 7);
+				int lastSubfileIndex = (int)Math.Ceiling(subfileWindowIndex + 7);
+
+				float subfileH = 48;
+				float subfileY = (OutputVideoHeight / 2) - (subfileWindowIndex - firstSubfileIndex) * subfileH;
+
+				for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
 				{
-					subfileY += subfileH;
-					continue;
-				}
+					int i = sfi - (currentSubfile?.key ?? 0);
 
-				var subfile = _subfiles[sfi];
+					if (sfi < 0 || sfi >= _subfiles.Count)
+					{
+						subfileY += subfileH;
+						continue;
+					}
 
-				bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
+					var subfile = _subfiles[sfi];
 
-				_frameContent.Mutate(ictx => ictx
-					.DrawText(new RichTextOptions(_font32)
+					bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
+
+					ctx.DrawText(new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX1, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
@@ -512,45 +515,39 @@ public class Generator
 						Origin = new Vector2(subfileX2, subfileY),
 						HorizontalAlignment = HorizontalAlignment.Right,
 						VerticalAlignment = VerticalAlignment.Center,
-					}, Utils.ToByteSizeString(subfile.Length), Color.DimGray)
-				);
+					}, Utils.ToByteSizeString(subfile.Length), Color.DimGray);
 
-				if (isMainSubfile)
-				{
-					float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
+					if (isMainSubfile)
+					{
+						float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
 
-					_frameContent.Mutate(ictx => ictx
-						.DrawText(new(_font16)
+						ctx.DrawText(new(_font16)
 						{
 							Origin = new PointF(subfileX1 + 48, subfileY + 20),
 							HorizontalAlignment = HorizontalAlignment.Center,
 							VerticalAlignment = VerticalAlignment.Center,
 						}, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", Color.White)
-						.DrawProgressBar(percentOfSubfile, subfileX1 + 80, subfileX2, subfileY + 20)
-					);
+						.DrawProgressBar(percentOfSubfile, subfileX1 + 80, subfileX2, subfileY + 20);
+					}
+
+					subfileY += subfileH;
 				}
 
-				subfileY += subfileH;
-			}
+				// 3. Draw binary waterfall viewport
 
-			// 3. Draw binary waterfall viewport
-
-			_frameContent.Mutate(ctx => ctx
-				.DrawImage(_viewportFramebuf, new Point(_videoFrameX1, _videoFrameY1), 1f)
+				ctx.DrawImage(_viewportFramebuf, new Point(_videoFrameX1, _videoFrameY1), 1f)
 				.DrawText(new RichTextOptions(_font32)
 				{
 					Origin = new Vector2(32, (OutputVideoHeight / 2) + (playHeadRelPos * (WaterfallScaledHeight / WaterfallHeight))),
 					VerticalAlignment = VerticalAlignment.Center,
-				}, "▶", Color.White)
-			);
+				}, "▶", Color.White);
 
-			// 4. Draw top-bottom gradients
+				// 4. Draw top-bottom gradients
 
-			float shadowY1 = (OutputVideoHeight / 2) - subfileH * 8.5f;
-			float shadowY2 = (OutputVideoHeight / 2) + subfileH * 6.5f;
+				float shadowY1 = (OutputVideoHeight / 2) - subfileH * 8.5f;
+				float shadowY2 = (OutputVideoHeight / 2) + subfileH * 6.5f;
 
-			_frameContent.Mutate(ctx => ctx
-				.Fill(
+				ctx.Fill(
 					new LinearGradientBrush(
 						new PointF(0, shadowY1),
 						new PointF(0, shadowY1 + subfileH * 2),
@@ -558,7 +555,8 @@ public class Generator
 						new(0.5f, Color.FromRgba(16, 16, 16, 255)),
 						new(1, Color.FromRgba(16, 16, 16, 0))
 					),
-					new RectangleF(0, shadowY1, OutputVideoWidth, subfileH * 2))
+					new RectangleF(0, shadowY1, OutputVideoWidth, subfileH * 2)
+				)
 				.Fill(
 					new LinearGradientBrush(
 						new PointF(0, shadowY2),
@@ -567,23 +565,17 @@ public class Generator
 						new(0, Color.FromRgba(16, 16, 16, 0)),
 						new(0.5f, Color.FromRgba(16, 16, 16, 255))
 					),
-					new RectangleF(0, shadowY2, OutputVideoWidth, subfileH * 2))
-			);
-
-			_frameContent.Mutate(ctx => ctx
+					new RectangleF(0, shadowY2, OutputVideoWidth, subfileH * 2)
+				)
 				.DrawText(new RichTextOptions(_font24)
 				{
 					Origin = new Vector2(subfileX1 + 40, 160),
 					VerticalAlignment = VerticalAlignment.Center,
-				}, Utils.TruncateString(currentSubfile?.value?.FileDirectory ?? string.Empty, 72), Color.DimGray)
-			);
+				}, Utils.TruncateString(currentSubfile?.value?.FileDirectory ?? string.Empty, 72), Color.DimGray);
 
-			// 5. Draw Status and General Info
+				// 5. Draw Status and General Info
 
-			_frameContent.Mutate(ctx =>
-			{
-				ctx
-				.DrawText(new RichTextOptions(_font24)
+				ctx.DrawText(new RichTextOptions(_font24)
 				{
 					Origin = new Vector2(32, 32),
 				}, "A/V SETTINGS", Color.DimGray)

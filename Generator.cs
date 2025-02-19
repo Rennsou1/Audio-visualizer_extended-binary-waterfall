@@ -453,6 +453,10 @@ public class Generator
 					_inputAudioBuffer = currentAudioBuffer.Select(x => (x / 128f) - 1f).ToArray();
 					break;
 
+				case AudioSampleFormat.Signed8:
+					_inputAudioBuffer = currentAudioBuffer.Select(x => x / 128f).ToArray();
+					break;
+
 				case AudioSampleFormat.Unsigned16LE:
 					for (int i = 0; i < _inputAudioBuffer.Length; i++)
 					{

@@ -19,27 +19,37 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 public class Generator
 {
+	#region Main Fields
+
 	private FileStream _inputFileStream = null;
 	private Stream _inputAuxFileStream = null;
 	private IParser _parser = null;
 	private IExporter _exporter = null;
 	private readonly Stopwatch _timer = new();
-	
 	private List<SubFile> _subfiles = [];
 
-	// Generator registers
+	#endregion
+
+	#region Generator Registers
+
 	private Image<Rgba32> _frameContent = null;
 	private Image<Rgba32> _viewportFramebuf = null;
 	private float[] _inputAudioBuffer = null;
 	private float[] _outputAudioBuffer = null;
 	private int _videoFrameX1, _videoFrameX2, _videoFrameY1, _videoFrameY2;
 
-	// ImageSharp-specific.
+	#endregion
+
+	#region ImageSharp-specific
+
 	private FontCollection _fontCollection;
 	private FontFamily _fontFamily, _emojiFontFamily;
 	private Font _font16, _font24, _font32, _font48;
+
+	#endregion
 	
-	// User-defined input.
+	#region General Parameters
+
 	public string InputFilePath { get; set; } = null;
 	[CliParameter("Input File Listing File Path", "file-listing", "Set the file path that contains a text-based file listing if the input file format cannot be parsed entirely by this program")]
 	public string InputAuxiliaryFilePath { get; set; } = null;
@@ -51,13 +61,17 @@ public class Generator
 	public string InputFileFormatId { get; set; } = null;
 	[CliParameter("Exporter", "exporter", 'e', "Set the exporter to be used to export the generated binary waterfall")]
 	public string ExporterId { get; set; } = null;
-	[CliParameter("Input Bytes per Second", "input-bps")]
+	[CliParameter("Input Bytes per Second", "input-bps", "Set the amount of bytes that will be read per audio/video second")]
 	public int InputBytesPerSecond { get; set; } = 48000 * 2 * 2;
 	[CliParameter("Font Name", "font", "Set the font name to render the on-screen text")]
 	public string FontName { get; set; } = null;
+
+	#endregion
+
 	public int InputBytesPerFrame => InputBytesPerSecond / OutputFps;
 
-	// Video parameters.
+	#region Video Parameters
+
 	[CliParameter("Output Video Width", "output-width")]
 	public int OutputVideoWidth { get; set; } = 1920;
 	[CliParameter("Output Video Height", "output-height")]
@@ -70,7 +84,10 @@ public class Generator
 	public int WaterfallHeight { get; set; } = 256;
 	public int WaterfallFrameLength => WaterfallWidth * WaterfallHeight * 4;
 
-	// Audio parameters.
+	#endregion
+
+	#region Audio Parameters
+
 	[CliParameter("Input Sample Format", "sample-format")]
 	public AudioSampleFormat AudioInputSampleFormat { get; set; } = AudioSampleFormat.Signed16LE;
 	[CliParameter("Input Audio Channel Count", "channel-count")]
@@ -88,12 +105,163 @@ public class Generator
 	public int AudioOutputSamplesPerFrame => AudioOutputSampleRate * AudioOutputChannelCount / OutputFps;
 	public int AudioOutputBytesPerFrame => AudioOutputSampleFormat.GetByteSize() * AudioOutputSamplesPerFrame;
 
-	public void Generate()
+	#endregion
+
+	#region Debug Flags
+
+	public bool LogAllSubfiles { get; set; } = false;
+
+	#endregion
+
+	#region Initialization Methods
+
+	public void Initialize()
 	{
 		Logger.Info("Opening files…");
 		_inputFileStream = File.OpenRead(InputFilePath);
-		if (InputAuxiliaryFilePath != null) _inputAuxFileStream = File.OpenRead(InputAuxiliaryFilePath);
+		if (InputAuxiliaryFilePath != null)
+		{
+			_inputAuxFileStream = File.OpenRead(InputAuxiliaryFilePath);
+		}
 
+		InitializeParser();
+
+		ParseSubfiles();
+
+		InitializeExporter();
+
+		InitializeFonts();
+
+		Logger.Info("Preparing audio/video generation…");
+
+		_videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
+		if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
+		_videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
+		if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
+
+		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
+		_inputAudioBuffer = new float[AudioInputSamplesPerFrame];
+		_outputAudioBuffer = new float[AudioOutputSamplesPerFrame];
+
+		LogGeneratorStatus();
+	}
+
+	[Conditional("DEBUG")]
+	private void LogGeneratorStatus()
+	{
+		Logger.Debug($"Selected parser: {_parser?.GetType().GetCustomAttribute<ParserAttribute>()?.Name ?? "<null>"}");
+		Logger.Debug($"Selected exporter: {_exporter?.GetType().GetCustomAttribute<ExporterAttribute>()?.Name ?? "<null>"}");
+		Logger.Debug($"Selected font: {_fontFamily.Name ?? "<null>"}");
+		Logger.Debug($"Read speed: {InputBytesPerFrame} bytes/frame ({InputBytesPerSecond} bytes/second)");
+		Logger.Debug($"Waterfall duration will be around {TimeSpan.FromSeconds(_inputFileStream.Length / InputBytesPerSecond)}.");
+		Logger.Debug($"Video input:  {WaterfallWidth}×{WaterfallHeight}");
+		Logger.Debug($"Audio input:  {AudioInputBytesPerFrame}bpf {AudioInputSamplesPerFrame}spf → {AudioInputSampleRate}Hz {AudioInputChannelCount}ch {8 * AudioInputSampleFormat.GetByteSize()}-bit");
+		Logger.Debug($"Audio output: {AudioOutputBytesPerFrame}bpf {AudioOutputSamplesPerFrame}spf → {AudioOutputSampleRate}Hz {AudioOutputChannelCount}ch {8 * AudioOutputSampleFormat.GetByteSize()}-bit");
+	}
+
+	private void InitializeFonts()
+	{
+		Logger.Info("Loading fonts…");
+		Logger.Debug($"Requested font: '{FontName}'.");
+
+		if (_fontCollection == null)
+		{
+			_fontCollection = new();
+			_fontCollection.AddSystemFonts();
+		}
+
+		if (FontName != null)
+		{
+			// Try getting the font by the font name specified by the user
+			if (!_fontCollection.TryGet(FontName, out _fontFamily))
+			{
+				Logger.Error($"Cannot find font '{FontName}'.");
+			}
+		}
+
+		if (_fontFamily.Name == null)
+		{
+			if (_fontCollection.TryGet("unifont", out _fontFamily))
+			{
+				_fontCollection.TryGet("unifont upper", out _emojiFontFamily);
+			}
+			else
+			{
+				_fontFamily = _fontCollection.Get(Environment.OSVersion.Platform == PlatformID.Win32NT ? "Consolas" : "Source Code Pro");
+			}
+		}
+
+		_font48 = _fontFamily.CreateFont(48f, FontStyle.Regular);
+		_font32 = _fontFamily.CreateFont(32f, FontStyle.Regular);
+		_font24 = _fontFamily.CreateFont(24f, FontStyle.Regular);
+		_font16 = _fontFamily.CreateFont(16f, FontStyle.Regular);
+	}
+
+	private void InitializeExporter()
+	{
+		Logger.Info("Setting up exporter…");
+		Logger.Debug($"Requested exporter: '{ExporterId}'.");
+
+		if (ExporterId != null)
+		{
+			var availableExporters = Utils.GetTypesWithAttribute<ExporterAttribute>();
+			foreach (var exporterKvp in availableExporters)
+			{
+				var exporterAttr = exporterKvp.Key;
+				if (exporterAttr.Id != ExporterId)
+				{
+					continue;
+				}
+				_exporter = (IExporter)Activator.CreateInstance(exporterKvp.Value);
+			}
+			if (_exporter == null)
+			{
+				Logger.Fail($"Unknown exporter ID: '{ExporterId}'.");
+				return;
+			}
+		}
+		else
+		{
+			Logger.Debug("No exporter requested. Using SDL…");
+			_exporter = new SdlExporter();
+		}
+
+		_exporter.Generator = this;
+	}
+
+	private void ParseSubfiles()
+	{
+		IEnumerable<SubFile> subFiles = null;
+
+		if (_parser != null)
+		{
+			Logger.Info("Parsing subfiles…");
+
+			_parser.InputStream = _inputFileStream;
+			_parser.AuxiliaryInputStream = _inputAuxFileStream;
+			subFiles = _parser.GetSubFiles();
+
+			_subfiles =
+			[
+				.. subFiles
+				.OrderBy(sf => sf.StartOffset)
+				.Select(sf => Utils.ParseSubfile(_inputFileStream, sf))
+			];
+		}
+
+		Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
+
+		if (LogAllSubfiles)
+		{
+			foreach (var sf in _subfiles)
+			{
+				Logger.Debug($"\t{sf.IconString} '{sf.Path}' {sf.StartOffset:X8}–{sf.EndOffset}");
+			}
+		}
+	}
+
+	private void InitializeParser()
+	{
 		Logger.Info("Setting up parser…");
 		var availableParsers = Utils.GetTypesWithAttribute<ParserAttribute>();
 
@@ -134,102 +302,12 @@ public class Generator
 				Logger.Warning($"Unknown input format. Skipping subfile listing.");
 			}
 		}
-		Logger.Debug($"Selected parser: {_parser?.GetType().GetCustomAttribute<ParserAttribute>()?.Name ?? "<null>"}");
+	}
 
-		if (_parser != null)
-		{
-			Logger.Info("Parsing subfiles…");
+	#endregion
 
-			_parser.InputStream = _inputFileStream;
-			_parser.AuxiliaryInputStream = _inputAuxFileStream;
-			_subfiles = _parser.GetSubFiles().ToList();
-		}
-
-		_subfiles = [.. _subfiles
-			.OrderBy(sf => sf.StartOffset)
-			.Select(sf => Utils.ParseSubfile(_inputFileStream, sf))];
-
-		Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
-
-		Logger.Info("Setting up exporter…");
-		Logger.Debug($"Requested exporter: '{ExporterId}'.");
-
-		if (ExporterId != null)
-		{
-			var availableExporters = Utils.GetTypesWithAttribute<ExporterAttribute>();
-			foreach (var exporterKvp in availableExporters)
-			{
-				var exporterAttr = exporterKvp.Key;
-				if (exporterAttr.Id != ExporterId)
-				{
-					continue;
-				}
-				_exporter = (IExporter)Activator.CreateInstance(exporterKvp.Value);
-				Logger.Debug($"Exporter {exporterAttr.Name} selected.");
-			}
-			if (_exporter == null)
-			{
-				Logger.Fail($"Unknown exporter ID: '{ExporterId}'.");
-				return;
-			}
-		}
-		else
-		{
-			Logger.Debug("No exporter requested. Using SDL…");
-			_exporter = new SdlExporter();
-		}
-
-		_exporter.Generator = this;
-
-		Logger.Info("Preparing audio/video generation…");
-
-		_videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
-		if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
-		_videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
-		if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
-
-		Logger.Debug($"Speed: {InputBytesPerFrame} b/f ({InputBytesPerSecond} b/s)");
-		Logger.Debug($"Waterfall duration will be {TimeSpan.FromSeconds(_inputFileStream.Length / (InputBytesPerSecond))}.");
-		Logger.Debug($"Audio input:  {AudioInputBytesPerFrame}bpf {AudioInputSamplesPerFrame}spf → {AudioInputSampleRate}Hz {AudioInputChannelCount}ch {8 * AudioInputSampleFormat.GetByteSize()}-bit");
-		Logger.Debug($"Audio output: {AudioOutputBytesPerFrame}bpf {AudioOutputSamplesPerFrame}spf → {AudioOutputSampleRate}Hz {AudioOutputChannelCount}ch {8 * AudioOutputSampleFormat.GetByteSize()}-bit");
-
-		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
-		_inputAudioBuffer = new float[AudioInputSamplesPerFrame];
-		_outputAudioBuffer = new float[AudioOutputSamplesPerFrame];
-
-		Logger.Info("Loading font…");
-		Logger.Debug($"Requested font: '{FontName}'.");
-
-		_fontCollection = new();
-		_fontCollection.AddSystemFonts();
-		if (FontName != null)
-		{
-			// Try getting the font by the font name specified by the user
-			if (!_fontCollection.TryGet(FontName, out _fontFamily))
-			{
-				Logger.Error($"Cannot find font '{FontName}'.");
-			}
-		}
-
-		if (_fontFamily.Name == null)
-		{
-			if (_fontCollection.TryGet("unifont", out _fontFamily))
-			{
-				_fontCollection.TryGet("unifont upper", out _emojiFontFamily);
-			}
-			else
-			{
-				_fontFamily = _fontCollection.Get(Environment.OSVersion.Platform == PlatformID.Win32NT ? "Consolas" : "Source Code Pro");
-			}
-		}
-		
-		Logger.Debug($"Selected font is {_fontFamily}.");
-
-		_font48 = _fontFamily.CreateFont(48f, FontStyle.Regular);
-		_font32 = _fontFamily.CreateFont(32f, FontStyle.Regular);
-		_font24 = _fontFamily.CreateFont(24f, FontStyle.Regular);
-		_font16 = _fontFamily.CreateFont(16f, FontStyle.Regular);
-
+	public void Generate()
+	{
 		_timer.Start();
 
 		// 1. Intro
@@ -245,7 +323,7 @@ public class Generator
 	{
 		Logger.Info("Generating introduction…");
 
-		var totalFrames = (5 * OutputFps); // 60FPS = 300
+		var totalFrames = 5 * OutputFps; // 60FPS = 300
 
 		for (long frameNumber = 0; frameNumber < totalFrames; frameNumber++)
 		{

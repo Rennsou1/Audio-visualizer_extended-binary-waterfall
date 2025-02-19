@@ -44,6 +44,7 @@ class Program
 
 		try
 		{
+			_generator.Initialize();
 			_generator.Generate();
 		}
 		catch (Exception ex)

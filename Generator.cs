@@ -19,18 +19,20 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 public class Generator
 {
-	private Stream _inputFileStream = null;
+	private FileStream _inputFileStream = null;
 	private Stream _inputAuxFileStream = null;
 	private IParser _parser = null;
 	private IExporter _exporter = null;
-	private Stopwatch _timer = new();
+	private readonly Stopwatch _timer = new();
 	
 	private List<SubFile> _subfiles = [];
 
+	// Generator registers
 	private Image<Rgba32> _frameContent = null;
 	private Image<Rgba32> _viewportFramebuf = null;
 	private float[] _inputAudioBuffer = null;
 	private float[] _outputAudioBuffer = null;
+	private int _videoFrameX1, _videoFrameX2, _videoFrameY1, _videoFrameY2;
 
 	// ImageSharp-specific.
 	private FontCollection _fontCollection;
@@ -143,8 +145,6 @@ public class Generator
 			_subfiles = _parser.GetSubFiles().ToList();
 		}
 
-		using var targetFileReader = new BinaryReader(_inputFileStream);
-
 		_subfiles = [.. _subfiles
 			.OrderBy(sf => sf.StartOffset)
 			.Select(sf => Utils.ParseSubfile(_inputFileStream, sf))];
@@ -183,10 +183,10 @@ public class Generator
 
 		Logger.Info("Preparing audio/video generation…");
 
-		int videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
-		int videoFrameX2 = videoFrameX1 + WaterfallScaledWidth;
-		int videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
-		int videoFrameY2 = OutputVideoHeight / 2 + WaterfallScaledHeight / 2;
+		_videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
+		if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
+		_videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
+		if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
 
 		Logger.Debug($"Speed: {InputBytesPerFrame} b/f ({InputBytesPerSecond} b/s)");
 		Logger.Debug($"Waterfall duration will be {TimeSpan.FromSeconds(_inputFileStream.Length / (InputBytesPerSecond))}.");
@@ -238,7 +238,7 @@ public class Generator
 
 		// 2. Main Video
 
-		GenerateMainVideo(targetFileReader, videoFrameX1, videoFrameY1);
+		GenerateMainVideo();
 	}
 
 	private void GenerateIntro()
@@ -270,7 +270,7 @@ public class Generator
 		}
 	}
 
-	private void GenerateMainVideo(BinaryReader targetFileReader, int videoFrameX1, int videoFrameY1)
+	private void GenerateMainVideo()
 	{
 		Logger.Info("Generating binary waterfall…");
 
@@ -280,6 +280,8 @@ public class Generator
 		float subfileWindowIndex = 0f;
 		long currentOffset = 0;
 		int playHeadRelPos = 0;
+
+		using var targetFileReader = new BinaryReader(_inputFileStream);
 
 		while (currentOffset < _inputFileStream.Length)
 		{
@@ -347,7 +349,6 @@ public class Generator
 					{
 						var srcIdx = i * 2;
 						var srcSample = BinaryPrimitives.ReadUInt16LittleEndian(currentAudioBuffer.AsSpan(srcIdx, 2));
-						// if (i == 0) Console.Error.WriteLine($"{srcIdx}/{currentAudioBuffer.Length} → {i}/{_inputAudioBuffer.Length} ({srcSample:X4})");
 						_inputAudioBuffer[i] = (srcSample / 32768f) - 1f;
 					}
 					break;
@@ -357,7 +358,6 @@ public class Generator
 					{
 						var srcIdx = i * 2;
 						var srcSample = BinaryPrimitives.ReadInt16LittleEndian(currentAudioBuffer.AsSpan(srcIdx, 2));
-						// if (i % 16 == 0) Console.Error.WriteLine($"{srcIdx}/{currentAudioBuffer.Length} → {i}/{_inputAudioBuffer.Length} ({srcSample})");
 						_inputAudioBuffer[i] = srcSample / 32768f;
 					}
 					break;
@@ -379,11 +379,11 @@ public class Generator
 				.Select((sf, i) => new { key = i, value = sf })
 				.Where(kvp => kvp.value.Intersects(currentOffset - (InputBytesPerFrame / 2), currentOffset + (InputBytesPerFrame / 2)))
 				.ToList();
-			var mainSubfile = subfilesInFrame.LastOrDefault();
+			var currentSubfile = subfilesInFrame.LastOrDefault();
 
-			if (mainSubfile != null)
+			if (currentSubfile != null)
 			{
-				subfileWindowIndex = .2f * subfileWindowIndex + .8f * mainSubfile.key;
+				subfileWindowIndex = .2f * subfileWindowIndex + .8f * currentSubfile.key;
 			}
 
 			// 1. Clear frame
@@ -403,7 +403,7 @@ public class Generator
 
 			for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
 			{
-				int i = sfi - (mainSubfile?.key ?? 0);
+				int i = sfi - (currentSubfile?.key ?? 0);
 
 				if (sfi < 0 || sfi >= _subfiles.Count)
 				{
@@ -413,7 +413,7 @@ public class Generator
 
 				var subfile = _subfiles[sfi];
 
-				bool isMainSubfile = sfi == (mainSubfile?.key ?? -1);
+				bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
 
 				_frameContent.Mutate(ictx => ictx
 					.DrawText(new RichTextOptions(_font32)
@@ -451,7 +451,7 @@ public class Generator
 			// 3. Draw binary waterfall viewport
 
 			_frameContent.Mutate(ctx => ctx
-				.DrawImage(_viewportFramebuf, new Point(videoFrameX1, videoFrameY1), 1f)
+				.DrawImage(_viewportFramebuf, new Point(_videoFrameX1, _videoFrameY1), 1f)
 				.DrawText(new RichTextOptions(_font32)
 				{
 					Origin = new Vector2(32, (OutputVideoHeight / 2) + (playHeadRelPos * (WaterfallScaledHeight / WaterfallHeight))),
@@ -490,7 +490,7 @@ public class Generator
 				{
 					Origin = new Vector2(subfileX1 + 40, 160),
 					VerticalAlignment = VerticalAlignment.Center,
-				}, Utils.TruncateString(mainSubfile?.value?.FileDirectory ?? string.Empty, 72), Color.DimGray)
+				}, Utils.TruncateString(currentSubfile?.value?.FileDirectory ?? string.Empty, 72), Color.DimGray)
 			);
 
 			// 5. Draw Status and General Info
@@ -552,18 +552,18 @@ public class Generator
 					}, Title, Color.White);
 				}
 
-				if (mainSubfile?.value?.Icon != null)
+				if (currentSubfile?.value?.Icon != null)
 				{
-					ctx.DrawImage(mainSubfile.value.Icon, new Point(OutputVideoWidth / 2, OutputVideoHeight - 128 - 32), 1f);
+					ctx.DrawImage(currentSubfile.value.Icon, new Point(OutputVideoWidth / 2, OutputVideoHeight - 128 - 32), 1f);
 				}
 
-				if (mainSubfile?.value?.Description != null)
+				if (currentSubfile?.value?.Description != null)
 				{
 					ctx.DrawText(new(_font32)
 					{
 						Origin = new Vector2(OutputVideoWidth / 2 + 128 + 32, OutputVideoHeight - 32),
 						VerticalAlignment = VerticalAlignment.Bottom,
-					}, mainSubfile.value.Description, Color.White);
+					}, currentSubfile.value.Description, Color.White);
 				}
 			});
 

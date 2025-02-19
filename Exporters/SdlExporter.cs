@@ -25,7 +25,8 @@ public class SdlExporter : IExporter
 	private readonly Stopwatch _sw = new();
 	private int _frameCount = 0;
 	private double _ts = 0;
-	private bool _updateBuffers = false;
+
+	public bool AdaptiveFramebufferSize { get; set; } = false;
 
 	public void InitializeSdl()
 	{
@@ -138,14 +139,17 @@ public class SdlExporter : IExporter
 
 				case EventType.WindowEvent:
 					SDL.GetWindowSize(_win, out int width, out int height);
-					if (width != Generator.OutputVideoWidth || height != Generator.OutputVideoHeight)
+					if (AdaptiveFramebufferSize)
 					{
-						Generator.OutputVideoWidth = width;
-						Generator.OutputVideoHeight = height;
-						_framebuffer = new byte[Generator.OutputVideoWidth * Generator.OutputVideoHeight * 4];
-						SDL.FreeSurface(_surface);
-						SDL.CreateRGBSurface(0, Generator.OutputVideoWidth, Generator.OutputVideoHeight, 32, 0xff, 0xff00, 0xff0000, 0, out _surface);
-						Generator.UpdateValues();
+						if (width != Generator.OutputVideoWidth || height != Generator.OutputVideoHeight)
+						{
+							Generator.OutputVideoWidth = width;
+							Generator.OutputVideoHeight = height;
+							_framebuffer = new byte[Generator.OutputVideoWidth * Generator.OutputVideoHeight * 4];
+							SDL.FreeSurface(_surface);
+							SDL.CreateRGBSurface(0, Generator.OutputVideoWidth, Generator.OutputVideoHeight, 32, 0xff, 0xff00, 0xff0000, 0, out _surface);
+							Generator.UpdateValues();
+						}
 					}
 					break;
 			}

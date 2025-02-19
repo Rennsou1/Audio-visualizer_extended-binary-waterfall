@@ -339,7 +339,7 @@ public class Generator
 			switch (AudioInputSampleFormat)
 			{
 				case AudioSampleFormat.Unsigned8:
-					_inputAudioBuffer = currentAudioBuffer.Select(x => (x / 256f) - 1f).ToArray();
+					_inputAudioBuffer = currentAudioBuffer.Select(x => (x / 128f) - 1f).ToArray();
 					break;
 
 				case AudioSampleFormat.Unsigned16LE:

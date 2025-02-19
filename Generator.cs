@@ -7,6 +7,7 @@ using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using SixLabors.Fonts;
+using SixLabors.Fonts.Tables.AdvancedTypographic;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.ImageSharp.PixelFormats;
@@ -46,6 +47,14 @@ public class Generator
 	private FontCollection _fontCollection;
 	private FontFamily _fontFamily, _emojiFontFamily;
 	private Font _font16, _font24, _font32, _font48;
+	private readonly DrawingOptions _drawOpts = new()
+	{
+		GraphicsOptions = new()
+		{
+			Antialias = true,
+			AntialiasSubpixelDepth = 0, // coalesced value
+		}
+	};
 
 	#endregion
 	
@@ -143,6 +152,13 @@ public class Generator
 		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
 		_inputAudioBuffer = new float[AudioInputSamplesPerFrame];
 		_outputAudioBuffer = new float[AudioOutputSamplesPerFrame];
+		if (_drawOpts.GraphicsOptions.Antialias)
+		{
+			if (_drawOpts.GraphicsOptions.AntialiasSubpixelDepth < 0)
+			{
+				_drawOpts.GraphicsOptions.AntialiasSubpixelDepth = 1;
+			}
+		}
 
 		LogGeneratorStatus();
 	}
@@ -504,29 +520,29 @@ public class Generator
 
 					bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
 
-					ctx.DrawText(new RichTextOptions(_font32)
+					ctx.DrawText(_drawOpts, new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX1, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
 						FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
-					}, $"{(isMainSubfile ? "▶" : " ")} {Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", Color.White)
-					.DrawText(new RichTextOptions(_font32)
+					}, $"{(isMainSubfile ? "▶" : " ")} {Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", new SolidBrush(Color.White), null)
+					.DrawText(_drawOpts, new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX2, subfileY),
 						HorizontalAlignment = HorizontalAlignment.Right,
 						VerticalAlignment = VerticalAlignment.Center,
-					}, Utils.ToByteSizeString(subfile.Length), Color.DimGray);
+					}, Utils.ToByteSizeString(subfile.Length), new SolidBrush(Color.DimGray), null);
 
 					if (isMainSubfile)
 					{
 						float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
 
-						ctx.DrawText(new(_font16)
+						ctx.DrawText(_drawOpts, new RichTextOptions(_font16)
 						{
 							Origin = new PointF(subfileX1 + 48, subfileY + 20),
 							HorizontalAlignment = HorizontalAlignment.Center,
 							VerticalAlignment = VerticalAlignment.Center,
-						}, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", Color.White)
+						}, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", new SolidBrush(Color.White), null)
 						.DrawProgressBar(percentOfSubfile, subfileX1 + 80, subfileX2, subfileY + 20);
 					}
 

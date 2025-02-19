@@ -288,11 +288,12 @@ public static class Utils
 		return ret;
 	}
 
-	public static IEnumerable<Type> GetTypesWithAttribute<T>(Assembly asm = null) where T : Attribute, new()
+	public static IDictionary<T, Type> GetTypesWithAttribute<T>(Assembly asm = null) where T : Attribute, new()
 	{
 		asm ??= Assembly.GetExecutingAssembly();
 		return asm.GetExportedTypes()
-			.Where(t => t.GetCustomAttribute<T>() != null);
+			.Where(t => t.GetCustomAttribute<T>() != null)
+			.ToDictionary(t => t.GetCustomAttribute<T>());
 	}
 
 	public static IEnumerable<PropertyInfo> GetPropertiesWithAttribute<T>(Assembly asm = null) where T : Attribute, new()

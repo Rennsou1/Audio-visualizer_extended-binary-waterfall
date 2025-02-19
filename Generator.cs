@@ -100,14 +100,14 @@ public class Generator
 		if (InputFileFormatId != null)
 		{
 			Logger.Debug($"Requested parser: '{InputFileFormatId}'.");
-			foreach (var parser in availableParsers)
+			foreach (var parserKvp in availableParsers)
 			{
-				var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
+				var parserAttr = parserKvp.Key;
 				if (parserAttr.Id != InputFileFormatId)
 				{
 					continue;
 				}
-				_parser = (IParser)Activator.CreateInstance(parser);
+				_parser = (IParser)Activator.CreateInstance(parserKvp.Value);
 			}
 			if (_parser == null)
 			{
@@ -119,13 +119,13 @@ public class Generator
 			Logger.Info("Guessing input format from file extension…");
 			var inputFileExt = Path.GetExtension(InputFilePath).ToLower();
 
-			foreach (var parser in availableParsers)
+			foreach (var parserKvp in availableParsers)
 			{
-				var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
+				var parserAttr = parserKvp.Key;
 				if (parserAttr.FileExtensions.Contains(inputFileExt))
 				{
 					Logger.Debug($"Parser '{parserAttr.Id}' recognizes '{inputFileExt}' as a valid file extension.");
-					_parser = (IParser)Activator.CreateInstance(parser);
+					_parser = (IParser)Activator.CreateInstance(parserKvp.Value);
 					break;
 				}
 			}
@@ -157,14 +157,14 @@ public class Generator
 		if (ExporterId != null)
 		{
 			var availableExporters = Utils.GetTypesWithAttribute<ExporterAttribute>();
-			foreach (var exporter in availableExporters)
+			foreach (var exporterKvp in availableExporters)
 			{
-				var exporterAttr = exporter.GetCustomAttribute<ExporterAttribute>();
+				var exporterAttr = exporterKvp.Key;
 				if (exporterAttr.Id != ExporterId)
 				{
 					continue;
 				}
-				_exporter = (IExporter)Activator.CreateInstance(exporter);
+				_exporter = (IExporter)Activator.CreateInstance(exporterKvp.Value);
 				Logger.Debug($"Exporter {exporterAttr.Name} selected.");
 			}
 			if (_exporter == null)

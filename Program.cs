@@ -162,17 +162,17 @@ class Program
 		helpStrBld.AppendLine();
 
 		helpStrBld.AppendLine("Available parsers/input formats:");
-		foreach (var parser in Utils.GetTypesWithAttribute<ParserAttribute>())
+		foreach (var parserKvp in Utils.GetTypesWithAttribute<ParserAttribute>())
 		{
-			var parserAttr = parser.GetCustomAttribute<ParserAttribute>();
+			var parserAttr = parserKvp.Key;
 			helpStrBld.AppendLine($"	{parserAttr.Id.PadRight(16)} {parserAttr.Name}");
 		}
 		helpStrBld.AppendLine();
 
 		helpStrBld.AppendLine("Available exporters:");
-		foreach (var exporter in Utils.GetTypesWithAttribute<ExporterAttribute>())
+		foreach (var exporterKvp in Utils.GetTypesWithAttribute<ExporterAttribute>())
 		{
-			var exporterAttr = exporter.GetCustomAttribute<ExporterAttribute>();
+			var exporterAttr = exporterKvp.Key;
 			helpStrBld.AppendLine($"	{exporterAttr.Id.PadRight(16)} {exporterAttr.Name} – {exporterAttr.Description}");
 		}
 

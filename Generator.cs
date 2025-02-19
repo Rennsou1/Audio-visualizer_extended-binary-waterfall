@@ -63,7 +63,7 @@ public class Generator
 	[CliParameter("Exporter", "exporter", 'e', "Set the exporter to be used to export the generated binary waterfall")]
 	public string ExporterId { get; set; } = null;
 	[CliParameter("Input Bytes per Second", "input-bps", "Set the amount of bytes that will be read per audio/video second")]
-	public int InputBytesPerSecond { get; set; } = 48000 * 2 * 2;
+	public int InputBytesPerSecond { get; set; } = 48000 * 2;
 	[CliParameter("Font Name", "font", "Set the font name to render the on-screen text")]
 	public string FontName { get; set; } = null;
 
@@ -90,7 +90,7 @@ public class Generator
 	#region Audio Parameters
 
 	[CliParameter("Input Sample Format", "sample-format")]
-	public AudioSampleFormat AudioInputSampleFormat { get; set; } = AudioSampleFormat.Signed16LE;
+	public AudioSampleFormat AudioInputSampleFormat { get; set; } = AudioSampleFormat.Unsigned8;
 	[CliParameter("Input Audio Channel Count", "channel-count")]
 	public int AudioInputChannelCount { get; set; } = 2;
 	public int AudioInputSamplesPerFrame => (InputBytesPerFrame / AudioInputSampleFormat.GetByteSize());

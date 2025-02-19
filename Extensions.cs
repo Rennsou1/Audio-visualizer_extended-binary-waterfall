@@ -27,4 +27,28 @@ public static class Extensions
 		textEncoding ??= Encoding.ASCII;
 		return textEncoding.GetString(br.ReadBytes(length));
 	}
+
+	public static string ReadCString(this BinaryReader br)
+	{
+		StringBuilder sb = new();
+
+		byte b;
+		while ((b = br.ReadByte()) != 0)
+		{
+			sb.Append((char)b);
+		}
+
+		return sb.ToString();
+	}
+
+	public static BinaryReader SkipCString(this BinaryReader br, int count = 1)
+	{
+		int skipCount = 0;
+		while (skipCount < count)
+		{
+			Console.Error.WriteLine($"{skipCount}/{count} {Utils.GetBufferHexString(br, 16)}");
+			if (br.ReadByte() == 0) skipCount++;
+		}
+		return br;
+	}
 }

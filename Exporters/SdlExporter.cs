@@ -32,7 +32,14 @@ public class SdlExporter : IExporter
 		unsafe
 		{
 			_ = SDL.Init(SdlInitFlags.Video | SdlInitFlags.Audio);
-			_win = SDL.CreateWindow("Extended Binary Waterfall", SDL.WINDOWPOS_UNDEFINED, SDL.WINDOWPOS_UNDEFINED, 1920, 1080, WindowFlags.Shown | WindowFlags.Resizable);
+			_win = SDL.CreateWindow(
+				"Extended Binary Waterfall",
+				SDL.WINDOWPOS_UNDEFINED,
+				SDL.WINDOWPOS_UNDEFINED,
+				(int)(Generator.OutputVideoWidth * .75f),
+				(int)(Generator.OutputVideoHeight * .75f),
+				WindowFlags.Shown | WindowFlags.Resizable
+			);
 			if (_win.IsNull) throw new Exception("SDL cannot create a window.");
 			_ren = SDL.CreateRenderer(_win, -1, RendererFlags.Accelerated);
 			if (_ren.IsNull) throw new Exception("SDL cannot create a renderer.");

@@ -452,8 +452,8 @@ public class Generator
 			}
 
 			_outputAudioBuffer = _inputAudioBuffer
-				.ToPlanar(2)
-				.Select(chData => chData.ToList().LinearResample(AudioOutputSamplesPerFrame / 2).ToList())
+				.ToPlanar(AudioInputChannelCount)
+				.Select(chData => chData.ToList().LinearResample(AudioOutputSamplesPerFrame / AudioInputChannelCount).ToList())
 				.ToArray()
 				.ToPacked()
 				.ToArray();

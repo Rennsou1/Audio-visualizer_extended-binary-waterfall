@@ -244,7 +244,6 @@ public static class Utils
 			int currentChannel = i;
 			ret[i] = input.Where((_, sampleIndex) =>
 			{
-				// Console.Error.WriteLine($"{sampleIndex} → {sampleIndex / channelCount} {currentChannel} → {_}");
 				return sampleIndex % channelCount == currentChannel;
 			});
 		}
@@ -275,16 +274,18 @@ public static class Utils
 		return (int)(input / boundary) * boundary;
 	}
 
-	public static void PrintHex(BinaryReader br, int count = 4)
+	public static string GetBufferHexString(BinaryReader br, int count = 4)
 	{
 		var ofs = br.BaseStream.Position;
 
 		var buf = br.ReadBytes(count);
 		var bufHex = string.Join(' ', buf.Select(x => x.ToString("X2")));
 		var bufAscii = string.Join("", buf.Select(x => char.IsBetween((char)x, ' ', '\x7f') ? (char)x : '.'));
-		Console.Error.WriteLine($"[{br.BaseStream.Position:X12}] {bufHex} {bufAscii}");
+		string ret = $"[{br.BaseStream.Position:X12}] {bufHex} {bufAscii}";
 
 		br.BaseStream.Position = ofs;
+
+		return ret;
 	}
 
 	public static IEnumerable<Type> GetTypesWithAttribute<T>(Assembly asm = null) where T : Attribute, new()

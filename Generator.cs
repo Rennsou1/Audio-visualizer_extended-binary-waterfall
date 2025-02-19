@@ -37,6 +37,7 @@ public class Generator
 	private float[] _inputAudioBuffer = null;
 	private float[] _outputAudioBuffer = null;
 	private int _videoFrameX1, _videoFrameX2, _videoFrameY1, _videoFrameY2;
+	internal bool _exitRequested = false;
 
 	#endregion
 
@@ -313,6 +314,7 @@ public class Generator
 		// 1. Intro
 
 		GenerateIntro();
+		if (_exitRequested) return;
 
 		// 2. Main Video
 
@@ -345,6 +347,11 @@ public class Generator
 
 			_exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
+
+			if (_exitRequested)
+			{
+				break;
+			}
 		}
 	}
 
@@ -649,6 +656,11 @@ public class Generator
 			_timer.Restart();
 
 			currentOffset += InputBytesPerFrame;
+
+			if (_exitRequested)
+			{
+				break;
+			}
 		}
 
 		_exporter.Finish();

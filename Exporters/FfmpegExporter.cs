@@ -10,7 +10,6 @@ namespace Unai.ExtendedBinaryWaterfall.Exporters;
 public class FfmpegExporter : IExporter
 {
 	private bool _init = false;
-	private bool _quit = false;
 
 	private unsafe AVFormatContext* _fmtCtx;
 
@@ -257,7 +256,7 @@ public class FfmpegExporter : IExporter
 
 			ret = ffmpeg.av_interleaved_write_frame(_fmtCtx, packet);
 			FfmpegUtils.LogIfAvError(ret, "cannot write packet");
-			if (ret == -32) _quit = true;
+			if (ret == -32) Generator._exitRequested = true;
 		}
 	}
 
@@ -271,11 +270,6 @@ public class FfmpegExporter : IExporter
 		if (!_init)
 		{
 			InitializeFfmpeg();
-		}
-
-		if (_quit)
-		{
-			return;
 		}
 
 		var ret = ffmpeg.av_frame_make_writable(_videoAvFrame);

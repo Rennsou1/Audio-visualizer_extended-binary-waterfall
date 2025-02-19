@@ -14,7 +14,6 @@ public class SdlExporter : IExporter
 	public Generator Generator { get; set; }
 
 	private bool _init = false;
-	private bool _quit = false;
 	private bool _isFullscreen = false;
 
 	private Window _win;
@@ -23,7 +22,7 @@ public class SdlExporter : IExporter
 	private uint _audioDeviceId;
 
 	private byte[] _framebuffer = null;
-	private Stopwatch _sw = new();
+	private readonly Stopwatch _sw = new();
 	private int _frameCount = 0;
 	private double _ts = 0;
 
@@ -65,17 +64,12 @@ public class SdlExporter : IExporter
 			InitializeSdl();
 		}
 
-		if (_quit)
-		{
-			return;
-		}
-
 		while (SDL.PollEvent(out Event e) == 1)
 		{
 			switch (e.Type)
 			{
 				case EventType.Quit:
-					Finish();
+					Generator._exitRequested = true;
 					return;
 
 				case EventType.KeyDown:
@@ -83,11 +77,11 @@ public class SdlExporter : IExporter
 					switch (scancode)
 					{
 						case Scancode.Escape:
-							Finish();
+							Generator._exitRequested = true;
 							return;
 
 						case Scancode.F11:
-							SDL.SetWindowFullscreen(_win, _isFullscreen ? 0 : WindowFlags.Fullscreen);
+							_ = SDL.SetWindowFullscreen(_win, _isFullscreen ? 0 : WindowFlags.Fullscreen);
 							_isFullscreen = !_isFullscreen;
 							break;
 					}

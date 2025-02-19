@@ -125,6 +125,10 @@ class Program
 						}
 						targetParam.SetValue(targetObject, pval);
 					}
+					else if (targetParam.PropertyType == typeof(bool))
+					{
+						targetParam.SetValue(targetObject, bool.Parse(argKvp[1]));
+					}
 					else
 					{
 						Logger.Error($"Cannot convert string representation of value of property `{targetParam.Name}` because it is not implemented yet.");

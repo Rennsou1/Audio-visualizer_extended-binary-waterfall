@@ -7,7 +7,6 @@ using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using SixLabors.Fonts;
-using SixLabors.Fonts.Tables.AdvancedTypographic;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.ImageSharp.PixelFormats;
@@ -75,6 +74,8 @@ public class Generator
 	public int InputBytesPerSecond { get; set; } = 48000 * 2;
 	[CliParameter("Font Name", "font", "Set the font name to render the on-screen text")]
 	public string FontName { get; set; } = null;
+	[CliParameter("Font Antialiasing", "font-antialiasing")]
+	public bool FontAntialiasing { get => _drawOpts.GraphicsOptions.Antialias; set => _drawOpts.GraphicsOptions.Antialias = value; }
 
 	#endregion
 

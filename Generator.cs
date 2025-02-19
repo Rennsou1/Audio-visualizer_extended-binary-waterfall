@@ -256,7 +256,7 @@ public class Generator
 		{
 			foreach (var sf in _subfiles)
 			{
-				Logger.Debug($"\t{sf.IconString} '{sf.Path}' {sf.StartOffset:X8}–{sf.EndOffset:X8}");
+				Logger.Debug($"\t{sf.IconString ?? "–"} '{sf.Path}' {sf.StartOffset:X8}–{sf.EndOffset:X8}");
 			}
 		}
 	}

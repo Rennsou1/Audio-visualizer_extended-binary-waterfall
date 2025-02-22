@@ -35,7 +35,7 @@ Use `run.sh` to quickly (build if necessary, then) run the program.
 
 Alternatively, standard `dotnet build`/`dotnet run` commands apply:
 
-Use `dotnet build` from the repository's path, then execute `dotnet run --project Unai.ExtendedBinaryWaterfall` to run the program.
+Use `dotnet build` from the repository's path, then execute `dotnet run --project Unai.ExtendedBinaryWaterfall.Cli` to run the program.
 
 ### Quick Start
 
@@ -44,7 +44,7 @@ The following commands will assume your command line working directory is locate
 Execute this command to get information about the arguments that can be used:
 
 ```sh
-Unai.ExtendedBinaryWaterfall --help
+Unai.ExtendedBinaryWaterfall.Cli --help
 ```
 
 When using `run.sh`, the command can be simplified to:
@@ -60,7 +60,7 @@ When using `run.sh`, the command can be simplified to:
 Read an ISO file and output the result to the standard output as an MKV video (requires FFmpeg):
 
 ```sh
-Unai.ExtendedBinaryWaterfall /path/to/file.iso --exporter=ffmpeg
+Unai.ExtendedBinaryWaterfall.Cli /path/to/file.iso --exporter=ffmpeg
 ```
 
 You can append `> output.mkv` to redirect the standard output to a file instead.
@@ -70,7 +70,7 @@ You can append `> output.mkv` to redirect the standard output to a file instead.
 Read a GameMaker archive file and preview the result in an SDL window:
 
 ```sh
-Unai.ExtendedBinaryWaterfall /path/to/data.win
+Unai.ExtendedBinaryWaterfall.Cli /path/to/data.win
 ```
 
 SDL is the default exporter if none is specified.

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>exe</OutputType>
+		<TargetFramework>net9.0</TargetFramework>
+		<AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+		<DisableDiagnosticTracing>true</DisableDiagnosticTracing>
+		
+		<MinVerTagPrefix>v</MinVerTagPrefix>
+		<MinVerDefaultPreReleaseIdentifiers>dev</MinVerDefaultPreReleaseIdentifiers>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="../Unai.ExtendedBinaryWaterfall/Unai.ExtendedBinaryWaterfall.csproj" />
+	</ItemGroup>
+
+</Project>

@@ -7,7 +7,7 @@ using System.Reflection;
 using System.Text;
 using Unai.ExtendedBinaryWaterfall.Parsers;
 
-namespace Unai.ExtendedBinaryWaterfall;
+namespace Unai.ExtendedBinaryWaterfall.Cli;
 
 class Program
 {

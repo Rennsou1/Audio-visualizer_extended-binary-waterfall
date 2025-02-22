@@ -1,2 +1,2 @@
 #!/bin/env bash
-dotnet run --project Unai.ExtendedBinaryWaterfall -- $*
+dotnet run --project Unai.ExtendedBinaryWaterfall.Cli -- $*

@@ -77,6 +77,8 @@ class Program
 			switch (argKvp[0])
 			{
 				case "--help":
+				case "-h":
+				case "-?":
 					_helpMode = true;
 					break;
 
@@ -147,7 +149,7 @@ class Program
 		helpStrBld.AppendLine($"	{Path.GetFileName(Environment.GetCommandLineArgs()[0])} <file_input> [options]");
 		helpStrBld.AppendLine();
 		helpStrBld.AppendLine("Options:");
-		helpStrBld.AppendLine($"	--help\n		Print this help text and exit");
+		helpStrBld.AppendLine($"	-h, -?, --help\n		Print this help text and exit");
 
 		foreach (var cliParam in Utils.GetPropertiesWithAttribute<CliParameterAttribute>())
 		{

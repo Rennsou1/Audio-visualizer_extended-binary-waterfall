@@ -13,7 +13,7 @@ class Program
 {
 	static bool _helpMode = false;
 
-	static Generator _generator = new();
+	static readonly Generator _generator = new();
 
 	static void Main(string[] args)
 	{

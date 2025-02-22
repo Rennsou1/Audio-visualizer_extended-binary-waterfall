@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.5.002.0
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Unai.ExtendedBinaryWaterfall", "Unai.ExtendedBinaryWaterfall.csproj", "{A62F55CB-160E-49D6-BD67-E09A97E13736}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Unai.ExtendedBinaryWaterfall", "Unai.ExtendedBinaryWaterfall/Unai.ExtendedBinaryWaterfall.csproj", "{A62F55CB-160E-49D6-BD67-E09A97E13736}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

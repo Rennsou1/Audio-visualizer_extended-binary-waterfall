@@ -14,7 +14,8 @@ public static class Logger
 
 	private static void Print(string message, LogLevel logLevel, StackFrame sf)
 	{
-		var source = sf?.GetMethod()?.DeclaringType?.Name ?? "?";
+		var callingMethod = sf?.GetMethod();
+		var source = callingMethod != null ? $"{callingMethod.DeclaringType?.Name} {callingMethod.Name}" : "?";
 		var logLevelAnsiColor = logLevel switch
 		{
 			LogLevel.Fail => "\x1b[31m",

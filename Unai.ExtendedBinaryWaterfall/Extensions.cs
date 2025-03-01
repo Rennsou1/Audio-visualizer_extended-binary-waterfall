@@ -74,7 +74,7 @@ public static class Extensions
 
 			// Avoiding an `ArgumentNullException` from `TextOptions..ctor`. Blame this line of code:
 			// https://github.com/SixLabors/Fonts/blob/d74f3fae7250cf3a76f43780abea6e15ec40b75e/src/SixLabors.Fonts/TextOptions.cs#L32C66-L32C86
-			textOptions.FallbackFontFamilies = [];
+			textOptions.FallbackFontFamilies ??= [];
 
 			var newTextOpts = new RichTextOptions(textOptions)
 			{

@@ -83,8 +83,9 @@ public static class Extensions
 				VerticalAlignment = VerticalAlignment.Top,
 			};
 
-			var imgBounds = TextMeasurer.MeasureSize(text, newTextOpts);
-			cachedTextRender = new Image<Rgba32>((int)Math.Ceiling(imgBounds.Width + 4), (int)Math.Ceiling(imgBounds.Height * 1.25f));
+			var imgBounds = TextMeasurer.MeasureBounds(text, newTextOpts);
+			Logger.Trace($"  Measured raster bounds: {imgBounds}");
+			cachedTextRender = new Image<Rgba32>((int)Math.Ceiling(imgBounds.Width + imgBounds.X), (int)Math.Ceiling(imgBounds.Height + imgBounds.Y));
 			cachedTextRender.Mutate(ctx2 => ctx2.DrawText(drawingOptions, newTextOpts, text, brush, pen));
 
 			_textRenderCache.Add(hash, cachedTextRender);

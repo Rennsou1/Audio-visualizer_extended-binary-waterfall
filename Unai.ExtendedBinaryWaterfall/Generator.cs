@@ -533,12 +533,17 @@ public class Generator
 
 					bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
 
-					ctx.DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
+					ctx.DrawText(_drawOpts, new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX1, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
+					}, isMainSubfile ? "▶" : " ", new SolidBrush(Color.White), null)
+					.DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
+					{
+						Origin = new Vector2(subfileX1 + 48, subfileY),
+						VerticalAlignment = VerticalAlignment.Center,
 						FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
-					}, $"{(isMainSubfile ? "▶" : " ")} {Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", new SolidBrush(Color.White), null)
+					}, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", new SolidBrush(Color.White), null)
 					.DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX2, subfileY),

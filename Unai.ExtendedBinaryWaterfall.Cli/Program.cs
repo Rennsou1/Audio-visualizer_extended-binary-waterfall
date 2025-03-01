@@ -20,8 +20,7 @@ class Program
 		// Make decimals use "." instead of other characters.
 		CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
 
-		string semVer = BuildInfo.SemVer ?? "unknown";
-		Logger.Info($"Extended Binary Waterfall {semVer}");
+		Logger.Info($"{BuildInfo.ApplicationName} {BuildInfo.SemVer ?? "unknown"}");
 
 		if (args.Length < 1)
 		{

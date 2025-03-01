@@ -6,6 +6,8 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 public static class BuildInfo
 {
+	public static string ApplicationName { get; } = "Extended Binary Waterfall";
+
 	public static string FullSemVer { get; private set; } = null;
 	public static string SemVer { get; private set; } = null;
 	public static string GitCommit { get; private set; } = null;

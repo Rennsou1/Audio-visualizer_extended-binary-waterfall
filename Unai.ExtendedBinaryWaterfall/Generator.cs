@@ -533,13 +533,13 @@ public class Generator
 
 					bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
 
-					ctx.DrawText(_drawOpts, new RichTextOptions(_font32)
+					ctx.DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX1, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
 						FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
 					}, $"{(isMainSubfile ? "▶" : " ")} {Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", new SolidBrush(Color.White), null)
-					.DrawText(_drawOpts, new RichTextOptions(_font32)
+					.DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
 					{
 						Origin = new Vector2(subfileX2, subfileY),
 						HorizontalAlignment = HorizontalAlignment.Right,
@@ -596,7 +596,7 @@ public class Generator
 					),
 					new RectangleF(0, shadowY2, OutputVideoWidth, subfileH * 2)
 				)
-				.DrawText(new RichTextOptions(_font24)
+				.DrawTextAndCache(new RichTextOptions(_font24)
 				{
 					Origin = new Vector2(subfileX1 + 40, 160),
 					VerticalAlignment = VerticalAlignment.Center,
@@ -604,7 +604,7 @@ public class Generator
 
 				// 5. Draw Status and General Info
 
-				ctx.DrawText(new RichTextOptions(_font24)
+				ctx.DrawTextAndCache(new RichTextOptions(_font24)
 				{
 					Origin = new Vector2(32, 32),
 				}, "A/V SETTINGS", Color.DimGray)
@@ -612,7 +612,7 @@ public class Generator
 				{
 					Origin = new Vector2(32, 32 + 24),
 				}, avSettingsString, Color.White)
-				.DrawText(new RichTextOptions(_font24)
+				.DrawTextAndCache(new RichTextOptions(_font24)
 				{
 					Origin = new Vector2(OutputVideoWidth - 32, 32),
 					HorizontalAlignment = HorizontalAlignment.Right,
@@ -623,7 +623,7 @@ public class Generator
 					HorizontalAlignment = HorizontalAlignment.Right,
 					TextAlignment = TextAlignment.End,
 				}, $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", Color.White)
-				.DrawText(new RichTextOptions(_font24)
+				.DrawTextAndCache(new RichTextOptions(_font24)
 				{
 					Origin = new Vector2(OutputVideoWidth - 256, 32),
 					HorizontalAlignment = HorizontalAlignment.Right,
@@ -636,7 +636,7 @@ public class Generator
 
 				if (Author != null)
 				{
-					ctx.DrawText(new(_font32)
+					ctx.DrawTextAndCache(new(_font32)
 					{
 						Origin = new Vector2(OutputVideoWidth / 2, 32 + 24),
 						VerticalAlignment = VerticalAlignment.Center,
@@ -646,12 +646,12 @@ public class Generator
 
 				if (Title != null)
 				{
-					ctx.DrawText(new RichTextOptions(_font24)
+					ctx.DrawTextAndCache(new RichTextOptions(_font24)
 					{
 						Origin = new Vector2(32, OutputVideoHeight - 64 - (Title.Contains('\n') ? 32 : 0)),
 						VerticalAlignment = VerticalAlignment.Bottom,
 					}, "TARGET", Color.DimGray)
-					.DrawText(new(_font32)
+					.DrawTextAndCache(new(_font32)
 					{
 						Origin = new Vector2(32, OutputVideoHeight - 32),
 						VerticalAlignment = VerticalAlignment.Bottom,

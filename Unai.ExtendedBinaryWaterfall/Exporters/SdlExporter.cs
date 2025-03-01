@@ -73,6 +73,8 @@ public class SdlExporter : IExporter
 			InitializeSdl();
 		}
 
+		// Handle Video
+
 		unsafe
 		{
 			SDL.RenderClear(_ren);
@@ -97,8 +99,15 @@ public class SdlExporter : IExporter
 		_ts = _sw.Elapsed.TotalSeconds;
 		var wcFrameCount = (int)(_ts * Generator.OutputFps);
 		var framediff = _frameCount - wcFrameCount; // positive = too fast
+		var deltaFps = 1 / delta;
+		var renderSpeedRatio = Generator.OutputFps / deltaFps;
 
-		if (framediff > 1) SDL.Delay((uint)(((1 / (float)Generator.OutputFps) - delta) * 1000));
+		if (framediff > 1)
+		{
+			SDL.Delay((uint)(((1 / (float)Generator.OutputFps) - delta) * 1000));
+		}
+
+		// Handle Audio
 
 		var audioQueue = SDL.GetQueuedAudioSize(_audioDeviceId);
 
@@ -113,6 +122,8 @@ public class SdlExporter : IExporter
 				}
 			}
 		}
+
+		// Handle Window Events
 
 		while (SDL.PollEvent(out Event e) == 1)
 		{
@@ -155,7 +166,12 @@ public class SdlExporter : IExporter
 			}
 		}
 
-		Console.Error.Write($"frame={_frameCount,6} wcframe={wcFrameCount,6} diff={framediff,6} — {(int)(1 / delta)} fps aqueue={audioQueue}\x1b[K\x1b[G");
+		if (renderSpeedRatio < 1)
+		{
+			Logger.Warning($"Render too slow! Generator is rendering at {renderSpeedRatio:N2}× speed.");
+		}
+
+		Console.Error.Write($"frame={_frameCount,6} wcframe={wcFrameCount,6} diff={framediff,6} — {(int)deltaFps} fps aqueue={audioQueue}\x1b[K\x1b[G");
 	}
 
 	public void Finish()

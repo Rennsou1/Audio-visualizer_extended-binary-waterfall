@@ -244,7 +244,11 @@ public class FfmpegExporter : IExporter
 			}
 			else if (ret < 0)
 			{
-				FfmpegUtils.LogIfAvError(ret, "cannot encode");
+				// if frame is null, `EOF` code is expected, don't treat it as an error.
+				if (frame != null)
+				{
+					FfmpegUtils.LogIfAvError(ret, "cannot encode");
+				}
 				break;
 			}
 

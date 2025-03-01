@@ -100,7 +100,7 @@ public class SdlExporter : IExporter
 		var wcFrameCount = (int)(_ts * Generator.OutputFps);
 		var framediff = _frameCount - wcFrameCount; // positive = too fast
 		var deltaFps = 1 / delta;
-		var renderSpeedRatio = Generator.OutputFps / deltaFps;
+		var renderSpeedRatio = deltaFps / Generator.OutputFps;
 
 		if (framediff > 1)
 		{

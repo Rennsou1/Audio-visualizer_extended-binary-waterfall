@@ -28,7 +28,7 @@ public class Generator
 	private readonly Stopwatch _timer = new();
 	private List<SubFile> _subfiles = [];
 
-	public Dictionary<string, string> ExporterCliArguments { get; } = [];
+	public Dictionary<string, string> AdditionalCliArguments { get; } = [];
 
 	#endregion
 
@@ -248,10 +248,10 @@ public class Generator
 
 		_exporter.Generator = this;
 
-		if (ExporterCliArguments.Count > 0)
+		if (AdditionalCliArguments.Count > 0)
 		{
 			Logger.Info($"Setting exporter properties from command line arguments…");
-			foreach (var argKvp in ExporterCliArguments)
+			foreach (var argKvp in AdditionalCliArguments)
 			{
 				var targetProp = Utils.GetPropertyFromCliArgument(argKvp.Key);
 

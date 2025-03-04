@@ -31,6 +31,8 @@ public class FfmpegExporter : IExporter
 	private int _frameNum = 0;
 
 	public Generator Generator { get; set; }
+	
+	[CliParameter("FFmpeg Log Level", "ffloglevel")]
 	public int LogLevel { get; set; } = ffmpeg.AV_LOG_INFO;
 	[CliParameter("Output Video File Path", "output", 'o')]
 	public string OutputPath { get; set; } = null;

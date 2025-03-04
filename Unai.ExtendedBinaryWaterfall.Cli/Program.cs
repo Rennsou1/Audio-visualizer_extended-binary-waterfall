@@ -80,8 +80,6 @@ class Program
 				continue;
 			}
 
-			// var targetParam = Utils.GetPropertiesWithAttribute<CliParameterAttribute>()
-			// 	.Where(p => argKvp[0].Length == 2 ? p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argKvp[0][1] : p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argKvp[0][2..]).FirstOrDefault();
 			var targetParam = Utils.GetPropertyFromCliArgument(argKvp[0]);
 
 			if (targetParam == null)
@@ -91,24 +89,21 @@ class Program
 			}
 
 			// Can't do a `switch` statement here. :(
-			object targetObject = null;
 			if (targetParam.DeclaringType == typeof(Generator))
 			{
-				targetObject = _generator;
+				if (!CliParameterAttribute.SetPropertyFromCliArgument(targetParam, _generator, argKvp[1]))
+				{
+					return false;
+				}
 			}
 			else if (targetParam.DeclaringType.GetInterfaces().Contains(typeof(IExporter)))
 			{
-				_generator.ExporterCliArguments.Add(argKvp[0], argKvp[1]);
+				_generator.AdditionalCliArguments.Add(argKvp[0], argKvp[1]);
 				continue;
 			}
 			else
 			{
 				Logger.Error($"Cannot set property `{targetParam.Name}` because the instance of its declaring type is unknown.");
-				return false;
-			}
-
-			if (!CliParameterAttribute.SetPropertyFromCliArgument(targetParam, targetObject, argKvp[1]))
-			{
 				return false;
 			}
 		}

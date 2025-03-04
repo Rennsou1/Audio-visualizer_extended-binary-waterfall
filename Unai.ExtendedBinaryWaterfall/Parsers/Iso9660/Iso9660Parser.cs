@@ -1,25 +1,10 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace Unai.ExtendedBinaryWaterfall.Parsers.Iso9660;
-
-class IsoPathTableEntry
-{
-	public string Name;
-	public int Lba;
-	public int ParentIndex;
-}
-
-class IsoDirectoryEntry
-{
-	public string Name;
-	public int DataLba;
-	public int DataLength;
-	public byte Flags;
-
-	public bool IsDirectory => (Flags & 0b10) != 0;
-}
 
 [Parser("iso9660", "ISO 9660 Disc File System", [ ".iso" ])]
 public class Iso9660Parser : IParser
@@ -27,10 +12,11 @@ public class Iso9660Parser : IParser
 	public Stream InputStream { get; set; }
 	public Stream AuxiliaryInputStream { get; set; }
 
-	private static IsoDirectoryEntry ParseIsoDirectoryEntry(BinaryReader br)
+	private static IsoDirectoryEntry ParseIsoDirectoryEntry(BinaryReader br, Encoding encoding = null)
 	{
+		encoding ??= Encoding.ASCII;
+
 		var dentLoc = br.BaseStream.Position;
-		// Console.Error.WriteLine($"{dentLoc:X8}");
 
 		var dentLen = br.ReadByte();
 		if (dentLen == 0) return null;
@@ -43,16 +29,17 @@ public class Iso9660Parser : IParser
 		var dentInterGapSize = br.ReadByte();
 		var dentVolSeqNum = br.ReadInt16(); br.BaseStream.Position += 2;
 		var dentNameLen = br.ReadByte();
-		var dentName = Encoding.ASCII.GetString(br.ReadBytes(dentNameLen));
-		// Console.Error.WriteLine($"{dentNameLen} '{dentName}'");
+		var dentName = encoding.GetString(br.ReadBytes(dentNameLen));
+		// Console.Error.WriteLine($"{dentLoc:X8} {dentNameLen} '{dentName}'");
+
 		if (dentNameLen % 2 == 0) br.BaseStream.Position++;
 
-		return new() { Name = dentName, DataLba = dentLba, DataLength = dentDataLen, Flags = dentFlags };
+		return new() { Name = dentName, DataLba = dentLba, DataLength = dentDataLen, Flags = dentFlags, TextEncoding = encoding };
 	}
 
 	private static IEnumerable<SubFile> TraverseIsoDirectoryEntry(BinaryReader br, IsoDirectoryEntry dir, string parentPath = "", int recursiveCount = 0)
 	{
-		Logger.Debug($"Traversing ISO directory /{parentPath}");
+		Logger.Debug($"Traversing ISO directory {(string.IsNullOrEmpty(parentPath) ? "/" : parentPath)}");
 		if (recursiveCount > 16)
 		{
 			yield break;
@@ -60,10 +47,10 @@ public class Iso9660Parser : IParser
 		br.BaseStream.Position = dir.DataLba * 2048;
 		while (br.BaseStream.Position < dir.DataLba * 2048 + dir.DataLength)
 		{
-			var dent = ParseIsoDirectoryEntry(br);
+			var dent = ParseIsoDirectoryEntry(br, dir.TextEncoding);
 			if (dent == null) continue; // we're probably in a zero-filled sector limit gap and we need to seek further.
 
-			if (dent.Name != "\x00" && dent.Name != "\x01")
+			if (dent.Name.Length > 1 && (dent.Name[0] != 0 && dent.Name[0] != 1))
 			{
 				yield return new(parentPath + "/" + dent.Name, dent.DataLba * 2048, dent.DataLength) { IsDirectory = dent.IsDirectory };
 				if (dent.IsDirectory)
@@ -87,7 +74,7 @@ public class Iso9660Parser : IParser
 
 		int pathTableOfs = 0;
 		int pathTableSize = 0;
-		IsoDirectoryEntry rootDir = null;
+		List<IsoDirectoryEntry> rootDirs = [];
 
 		for (int i = 0; i < 16; i++)
 		{
@@ -102,11 +89,15 @@ public class Iso9660Parser : IParser
 			switch (volDesType)
 			{
 				case 1:
+				case 2:
+					bool usesJoliet = false;
+
 					br.BaseStream.Position = volDesOfs + 8;
 					var pvdSystemId = Encoding.ASCII.GetString(br.ReadBytes(32));
 					var pvdVolId = Encoding.ASCII.GetString(br.ReadBytes(32));
 					br.BaseStream.Position += 8;
-					var pvdVolNumLogicalBlocks = br.ReadInt32(); br.BaseStream.Position += 4 + 32;
+					var pvdVolNumLogicalBlocks = br.ReadInt32(); br.BaseStream.Position += 4;
+					var pvdEscapeSeqs = br.ReadBytes(32);
 					var pvdVolSeqSize = br.ReadInt16(); br.BaseStream.Position += 2;
 					var pvdVolSeqIdx = br.ReadInt16(); br.BaseStream.Position += 2;
 					br.BaseStream.Position = volDesOfs + 128;
@@ -114,8 +105,15 @@ public class Iso9660Parser : IParser
 					var pvdPathTableSize = br.ReadInt32(); br.BaseStream.Position += 4;
 					var pvdPathTableLeLba = br.ReadInt32();
 					var pvdPathTableOptLeLba = br.ReadInt32();
+
+					// FIXME: Only takes into account UCS-2 Level 3 escape sequence.
+					if (pvdEscapeSeqs[0] == 0x25 && pvdEscapeSeqs[1] == 0x2f && pvdEscapeSeqs[2] == 0x45)
+					{
+						usesJoliet = true;
+					}
+
 					br.BaseStream.Position = volDesOfs + 156;
-					rootDir = ParseIsoDirectoryEntry(br);
+					rootDirs.Add(ParseIsoDirectoryEntry(br, usesJoliet ? Encoding.BigEndianUnicode : Encoding.ASCII));
 
 					pathTableOfs = pvdPathTableLeLba * 2048;
 					pathTableSize = pvdPathTableSize;
@@ -154,13 +152,28 @@ public class Iso9660Parser : IParser
 			pathTableEntries.Add(new() { Name = pteDirName, Lba = pteLba, ParentIndex = pteParentRecIdx });
 		}
 
-		yield return new("/", rootDir.DataLba * 2048, rootDir.DataLength) { IsDirectory = true };
-
-		br.BaseStream.Position = rootDir.DataLba * 2048;
-		
-		foreach (var dir in TraverseIsoDirectoryEntry(br, rootDir))
+		foreach (var rootDir in rootDirs)
 		{
-			yield return dir;
+			yield return new("/", rootDir.DataLba * 2048, rootDir.DataLength) { IsDirectory = true };
+		}
+
+		// We're interested in long file names, which are stored in the SVD's root directory as per the Joliet specification.
+		// For a complete parsing of the ISO file, we need both the legacy (ISO 9660) and Joliet directory entries for output.
+		// File entries collide between hierarchies and only the Joliet ones will be yielded.
+		
+		for (int rootDirIdx = 0; rootDirIdx < rootDirs.Count; rootDirIdx++)
+		{
+			var rootDir = rootDirs[rootDirIdx];
+
+			br.BaseStream.Position = rootDir.DataLba * 2048;
+			
+			foreach (var dir in TraverseIsoDirectoryEntry(br, rootDir))
+			{
+				if (dir.IsDirectory || rootDirIdx == rootDirs.Count - 1)
+				{
+					yield return dir;
+				}
+			}
 		}
 	}
 }

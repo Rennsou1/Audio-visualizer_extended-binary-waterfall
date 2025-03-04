@@ -73,6 +73,13 @@ public static class Utils
 			".com" or
 			".scr"
 				=> "🗔",
+			".cab" or
+			".7z" or
+			".rar" or
+			".tar" or
+			".tar.gz" or
+			".zip"
+				=> "📦️",
 			".cur" or
 			".ani"
 				=> "🖰",

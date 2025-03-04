@@ -120,20 +120,25 @@ class Program
 		helpStrBld.AppendLine("Options:");
 		helpStrBld.AppendLine($"	-h, -?, --help\n		Print this help text and exit");
 
-		foreach (var cliParam in Utils.GetPropertiesWithAttribute<CliParameterAttribute>())
+		void AppendCommandLineArgument(PropertyInfo prop, int indentation = 1)
 		{
-			var cliParamAttr = cliParam.GetCustomAttribute<CliParameterAttribute>();
-			helpStrBld.Append('\t');
+			var cliParamAttr = prop.GetCustomAttribute<CliParameterAttribute>();
+			helpStrBld.Append(new string('\t', indentation));
 			if (cliParamAttr.ShortParameterName.HasValue)
 			{
 				helpStrBld.Append($"-{cliParamAttr.ShortParameterName}, ");
 			}
-			helpStrBld.Append($"--{cliParamAttr.LongParameterName}=<{cliParam.PropertyType.Name}> ".PadRight(cliParamAttr.ShortParameterName.HasValue ? 28 : 32));
+			helpStrBld.Append($"--{cliParamAttr.LongParameterName}=<{prop.PropertyType.Name}> ".PadRight(cliParamAttr.ShortParameterName.HasValue ? 28 : 32));
 			helpStrBld.AppendLine(cliParamAttr.Name);
 			if (cliParamAttr.Description != null)
 			{
 				helpStrBld.AppendLine($"		{cliParamAttr.Description}");
 			}
+		}
+
+		foreach (var prop in Utils.GetPropertiesWithAttribute<CliParameterAttribute>(typeof(Generator)))
+		{
+			AppendCommandLineArgument(prop);
 		}
 		helpStrBld.AppendLine();
 
@@ -150,6 +155,16 @@ class Program
 		{
 			var exporterAttr = exporterKvp.Key;
 			helpStrBld.AppendLine($"	{exporterAttr.Id.PadRight(16)} {exporterAttr.Name} – {exporterAttr.Description}");
+
+			var cliParams = Utils.GetPropertiesWithAttribute<CliParameterAttribute>(exporterKvp.Value).ToList();
+			if (cliParams.Count > 0)
+			{
+				helpStrBld.AppendLine($"		Options:");
+				foreach (var cliParam in cliParams)
+				{
+					AppendCommandLineArgument(cliParam, 3);
+				}
+			}
 		}
 
 		Console.Error.WriteLine(helpStrBld);

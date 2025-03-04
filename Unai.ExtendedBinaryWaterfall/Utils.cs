@@ -308,6 +308,11 @@ public static class Utils
 		}
 	}
 
+	public static IEnumerable<PropertyInfo> GetPropertiesWithAttribute<T>(Type t) where T : Attribute, new()
+	{
+		return t.GetProperties().Where(p => p.GetCustomAttribute<T>() != null);
+	}
+
 	public static PropertyInfo GetPropertyFromCliArgument(string argName)
 	{
 		return GetPropertiesWithAttribute<CliParameterAttribute>()

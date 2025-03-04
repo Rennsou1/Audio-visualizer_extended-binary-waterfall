@@ -4,7 +4,7 @@ using System.Text;
 
 namespace Unai.ExtendedBinaryWaterfall.Parsers.Elf;
 
-[Parser("elf", "Executable and Linkable Format (ELF)", [ ".elf", ".out", ".so" ])]
+[Parser("elf", "Executable and Linkable Format (ELF)", [ ".elf", ".out", ".o", ".so", ".ko", ".mod", ".prx" ])]
 public class ElfParser : IParser
 {
 	public Stream InputStream { get; set; }

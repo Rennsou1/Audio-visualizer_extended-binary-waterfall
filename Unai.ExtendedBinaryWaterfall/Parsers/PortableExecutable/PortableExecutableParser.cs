@@ -23,7 +23,7 @@ public enum PeDataDirectory
 	ClrRuntimeHeader,
 }
 
-[Parser("pe", "Portable Executable", [ ".exe", ".dll", ".sys", ".scr" ])]
+[Parser("pe", "Portable Executable", [ ".exe", ".dll", ".mui", ".sys", ".scr", ".cpl", ".ocx", ".ax", ".fon", ".efi" ])]
 public class PortableExecutableParser : IParser
 {
 	public Stream InputStream { get; set; }

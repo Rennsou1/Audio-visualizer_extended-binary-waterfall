@@ -4,7 +4,7 @@ using System.Text;
 
 namespace Unai.ExtendedBinaryWaterfall.Parsers.Zip;
 
-[Parser("zip", "ZIP Archive", [ ".zip", ".jar", ".war", ".docx", ".odt" ])]
+[Parser("zip", "ZIP Archive", [ ".zip", ".apk", ".msix", ".epub", ".jar", ".war", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".pk3", ".pk4" ])]
 public class ZipParser : IParser
 {
 	public Stream InputStream { get; set; }

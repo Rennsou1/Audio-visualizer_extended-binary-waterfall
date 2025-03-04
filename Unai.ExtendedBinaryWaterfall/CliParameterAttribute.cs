@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
@@ -26,4 +27,40 @@ public class CliParameterAttribute : Attribute
 	}
 
 	public CliParameterAttribute() {}
+
+	public static bool SetPropertyFromCliArgument(PropertyInfo targetProp, object targetObject, string value)
+	{
+		if (targetProp.PropertyType == typeof(string))
+		{
+			targetProp.SetValue(targetObject, value);
+		}
+		else if (targetProp.PropertyType == typeof(int))
+		{
+			targetProp.SetValue(targetObject, int.Parse(value));
+		}
+		else if (targetProp.PropertyType.IsEnum)
+		{
+			var ok = Enum.TryParse(targetProp.PropertyType, value, true, out var pval);
+			if (!ok)
+			{
+				Logger.Error($"Cannot parse value '{value}' to enumeration '{targetProp.PropertyType.Name}'.");
+				Logger.Info("Valid values:");
+				foreach (var enumVal in Enum.GetValues(targetProp.PropertyType))
+				{
+					Logger.Info($"	{enumVal}");
+				}
+				return false;
+			}
+			targetProp.SetValue(targetObject, pval);
+		}
+		else if (targetProp.PropertyType == typeof(bool))
+		{
+			targetProp.SetValue(targetObject, bool.Parse(value));
+		}
+		else
+		{
+			Logger.Error($"Cannot convert string representation of value of property `{targetProp.Name}` because it is not implemented yet.");
+		}
+		return true;
+	}
 }

@@ -28,6 +28,8 @@ public class Generator
 	private readonly Stopwatch _timer = new();
 	private List<SubFile> _subfiles = [];
 
+	public Dictionary<string, string> ExporterCliArguments { get; } = [];
+
 	#endregion
 
 	#region Generator Registers
@@ -245,6 +247,20 @@ public class Generator
 		}
 
 		_exporter.Generator = this;
+
+		if (ExporterCliArguments.Count > 0)
+		{
+			Logger.Info($"Setting exporter properties from command line arguments…");
+			foreach (var argKvp in ExporterCliArguments)
+			{
+				var targetProp = Utils.GetPropertyFromCliArgument(argKvp.Key);
+
+				if (targetProp.DeclaringType.GetInterfaces().Contains(typeof(IExporter)))
+				{
+					CliParameterAttribute.SetPropertyFromCliArgument(targetProp, _exporter, argKvp.Value);
+				}
+			}
+		}
 	}
 
 	private void ParseSubfiles()

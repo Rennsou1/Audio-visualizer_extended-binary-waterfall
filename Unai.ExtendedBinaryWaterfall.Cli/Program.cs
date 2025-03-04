@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using Unai.ExtendedBinaryWaterfall.Exporters;
 using Unai.ExtendedBinaryWaterfall.Parsers;
 
 namespace Unai.ExtendedBinaryWaterfall.Cli;
@@ -73,68 +74,42 @@ class Program
 
 			var argKvp = arg.Split('=');
 
-			switch (argKvp[0])
+			if (argKvp[0] == "--help" || argKvp[0] == "-h" || argKvp[0] == "-?")
 			{
-				case "--help":
-				case "-h":
-				case "-?":
-					_helpMode = true;
-					break;
+				_helpMode = true;
+				continue;
+			}
 
-				default:
-					var targetParam = Utils.GetPropertiesWithAttribute<CliParameterAttribute>()
-						.Where(p => argKvp[0].Length == 2 ? p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argKvp[0][1] : p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argKvp[0][2..]).FirstOrDefault();
+			// var targetParam = Utils.GetPropertiesWithAttribute<CliParameterAttribute>()
+			// 	.Where(p => argKvp[0].Length == 2 ? p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argKvp[0][1] : p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argKvp[0][2..]).FirstOrDefault();
+			var targetParam = Utils.GetPropertyFromCliArgument(argKvp[0]);
 
-					if (targetParam == null)
-					{
-						Logger.Error($"Unknown argument: `{argKvp[0]}`.");
-						return false;
-					}
+			if (targetParam == null)
+			{
+				Logger.Error($"Unknown argument: `{argKvp[0]}`.");
+				return false;
+			}
 
-					// Can't do a `switch` statement here. :(
-					object targetObject = null;
-					if (targetParam.DeclaringType == typeof(Generator))
-					{
-						targetObject = _generator;
-					}
-					else
-					{
-						Logger.Error($"Cannot set property `{targetParam.Name}` because the instance of its declaring type is unknown.");
-						return false;
-					}
+			// Can't do a `switch` statement here. :(
+			object targetObject = null;
+			if (targetParam.DeclaringType == typeof(Generator))
+			{
+				targetObject = _generator;
+			}
+			else if (targetParam.DeclaringType.GetInterfaces().Contains(typeof(IExporter)))
+			{
+				_generator.ExporterCliArguments.Add(argKvp[0], argKvp[1]);
+				continue;
+			}
+			else
+			{
+				Logger.Error($"Cannot set property `{targetParam.Name}` because the instance of its declaring type is unknown.");
+				return false;
+			}
 
-					if (targetParam.PropertyType == typeof(string))
-					{
-						targetParam.SetValue(targetObject, argKvp[1]);
-					}
-					else if (targetParam.PropertyType == typeof(int))
-					{
-						targetParam.SetValue(targetObject, int.Parse(argKvp[1]));
-					}
-					else if (targetParam.PropertyType.IsEnum)
-					{
-						var ok = Enum.TryParse(targetParam.PropertyType, argKvp[1], true, out var pval);
-						if (!ok)
-						{
-							Logger.Error($"Cannot parse value '{argKvp[1]}' to enumeration '{targetParam.PropertyType.Name}'.");
-							Logger.Info("Valid values:");
-							foreach (var enumVal in Enum.GetValues(targetParam.PropertyType))
-							{
-								Logger.Info($"	{enumVal}");
-							}
-							return false;
-						}
-						targetParam.SetValue(targetObject, pval);
-					}
-					else if (targetParam.PropertyType == typeof(bool))
-					{
-						targetParam.SetValue(targetObject, bool.Parse(argKvp[1]));
-					}
-					else
-					{
-						Logger.Error($"Cannot convert string representation of value of property `{targetParam.Name}` because it is not implemented yet.");
-					}
-					break;
+			if (!CliParameterAttribute.SetPropertyFromCliArgument(targetParam, targetObject, argKvp[1]))
+			{
+				return false;
 			}
 		}
 

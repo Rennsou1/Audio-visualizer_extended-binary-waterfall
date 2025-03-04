@@ -307,4 +307,10 @@ public static class Utils
 			}
 		}
 	}
+
+	public static PropertyInfo GetPropertyFromCliArgument(string argName)
+	{
+		return GetPropertiesWithAttribute<CliParameterAttribute>()
+			.Where(p => argName.Length == 2 ? p.GetCustomAttribute<CliParameterAttribute>().ShortParameterName == argName[1] : p.GetCustomAttribute<CliParameterAttribute>().LongParameterName == argName[2..]).FirstOrDefault();
+	}
 }

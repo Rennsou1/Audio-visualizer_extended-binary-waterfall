@@ -23,42 +23,59 @@ public static class Utils
 
 		return extension.ToLower() switch
 		{
-			".png" => "🖼",
-			".jpg" => "🖼",
-			".bmp" => "🖼",
-			".ico" => "🖼",
-			".tif" => "🖼",
-			".sys" => "⚙️",
-			".dll" => "⚙️",
-			".cpl" => "⚙️",
-			".msc" => "⚙️",
-			".ax" => "⚙️",
-			".txt" => "🖹",
-			".ini" => "🖹",
-			".inf" => "🖹",
-			".htm" => "🖹",
-			".xml" => "🖹",
-			".sql" => "🖹",
-			".log" => "🖹",
-			".wav" => "🎵",
-			".mp3" => "🎵",
-			".wma" => "🎵",
-			".mid" => "🎵",
-			".avi" => "🎞️",
-			".wmv" => "🎞️",
-			".mp4" => "🎞️",
-			".mpg" => "🎞️",
-			".ufont" => "🗛",
-			".ttf" => "🗛",
-			".ttc" => "🗛",
-			".fon" => "🗛",
-			".chm" => "🕮",
-			".bat" => "🗔",
-			".exe" => "🗔",
-			".com" => "🗔",
-			".scr" => "🗔",
-			".cur" => "🖰",
-			".ani" => "🖰",
+			".png" or
+			".jpg" or ".jpeg" or ".jpe" or
+			".bmp" or ".dib" or
+			".ico" or
+			".gif" or
+			".heic" or
+			".webp" or
+			".dng" or
+			".tif" or ".tiff"
+				=> "🖼",
+			".sys" or
+			".dll" or
+			".cpl" or
+			".msc" or
+			".ax"
+				=> "⚙️",
+			".txt" or
+			".ini" or
+			".inf" or
+			".htm" or ".html" or
+			".xml" or
+			".sql" or
+			".log"
+				=> "🖹",
+			".wav" or
+			".mp3" or ".mp2" or ".mp1" or
+			".wma" or
+			".mid" or ".midi"
+				=> "🎵",
+			".avi" or
+			".wmv" or
+			".mp4" or
+			".3gp" or ".3gpp" or
+			".mov" or
+			".mkv" or
+			".mpg" or ".mpeg" or ".vob"
+				=> "🎞️",
+			".ufont" or
+			".ttf" or
+			".ttc" or
+			".fon"
+				=> "🗛",
+			".chm" or
+			".epub"
+				=> "🕮",
+			".bat" or
+			".exe" or
+			".com" or
+			".scr"
+				=> "🗔",
+			".cur" or
+			".ani"
+				=> "🖰",
 			_ => "🗋",
 		};
 	}

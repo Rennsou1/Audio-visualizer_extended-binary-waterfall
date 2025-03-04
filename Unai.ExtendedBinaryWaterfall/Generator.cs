@@ -556,7 +556,7 @@ public class Generator
 					}, isMainSubfile ? "▶" : " ", new SolidBrush(Color.White), null)
 					.DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
 					{
-						Origin = new Vector2(subfileX1 + 48, subfileY),
+						Origin = new Vector2(subfileX1 + 32, subfileY),
 						VerticalAlignment = VerticalAlignment.Center,
 						FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
 					}, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(subfile.FileName, 40)}", new SolidBrush(Color.White), null)

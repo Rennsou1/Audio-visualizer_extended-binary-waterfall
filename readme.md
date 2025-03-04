@@ -7,9 +7,7 @@ This program **generates video and audio** based on an **arbitrary computer file
 > This program is still in development.
 > Some code is still untested, and errors are expected to happen when running this software.
 
-## Usage
-
-### Dependencies
+## Dependencies
 
 - Required
 	- .NET 9 SDK
@@ -30,7 +28,7 @@ This program **generates video and audio** based on an **arbitrary computer file
 	- [`wimlib`](https://wimlib.net/) for WIM file listings.
 	- `minidump` Python module for Windows Minidump memory region parsing.
 
-### Build and Run
+## Build and Run
 
 Use `run.sh` to quickly (build if necessary, then) run the program.
 
@@ -38,9 +36,12 @@ Alternatively, standard `dotnet build`/`dotnet run` commands apply:
 
 Use `dotnet build` from the repository's path, then execute `dotnet run --project Unai.ExtendedBinaryWaterfall.Cli` to run the program.
 
+## Usage
+
 ### Quick Start
 
 The following commands will assume your command line working directory is located at the resulting binaries from the build process.
+If you're on Windows, the executable will be suffixed with `.exe`.
 
 Execute this command to get information about the arguments that can be used:
 
@@ -58,13 +59,11 @@ When using `run.sh`, the command can be simplified to:
 
 #### Example 1
 
-Read an ISO file and output the result to the standard output as an MKV video (requires FFmpeg):
+Read an ISO file and save the result to a video file called `result.mkv` (requires FFmpeg):
 
 ```sh
-Unai.ExtendedBinaryWaterfall.Cli /path/to/file.iso --exporter=ffmpeg
+Unai.ExtendedBinaryWaterfall.Cli /path/to/file.iso --exporter=ffmpeg --output=result.mkv
 ```
-
-You can append `> output.mkv` to redirect the standard output to a file instead.
 
 #### Example 2
 
@@ -75,3 +74,17 @@ Unai.ExtendedBinaryWaterfall.Cli /path/to/data.win
 ```
 
 SDL is the default exporter if none is specified.
+
+#### Example 3
+
+Read an `.exe` file and preview the FFmpeg encoding result with standard output redirection:
+
+```sh
+Unai.ExtendedBinaryWaterfall.Cli "C:\Windows\system32\shell32.dll" --exporter=ffmpeg | ffplay -f matroska -
+```
+
+When no `-o`/`--output` argument is specified, EBW will default to the standard output.
+
+> [!WARNING]
+> Some command line interfaces like PowerShell will require a proper standard I/O encoding suitable for binary streams.
+> Otherwise you will end up with “corrupted” files.

@@ -93,7 +93,9 @@ public class Generator
 	public int OutputFps { get; set; } = 60;
 	public int WaterfallScaledWidth { get; set; } = 768;
 	public int WaterfallScaledHeight { get; set; } = 768;
+	[CliParameter("Input Video Width", "input-width")]
 	public int WaterfallWidth { get; set; } = 256;
+	[CliParameter("Input Video Height", "input-height")]
 	public int WaterfallHeight { get; set; } = 256;
 	public int WaterfallFrameLength => WaterfallWidth * WaterfallHeight * 4;
 

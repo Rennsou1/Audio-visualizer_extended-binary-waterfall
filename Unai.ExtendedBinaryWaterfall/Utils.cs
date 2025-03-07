@@ -202,24 +202,11 @@ public static class Utils
 										foreach (var bestIcon in bestIconGi.AssociatedIcons(peFile))
 										{
 											byte[] iconData = bestIcon.AsIco(); // returns either headless BMP or PNG
-											if (iconData != null)
-											{
-												if (iconData[0] == 0x89 && iconData[1] == 0x50) // PNG
-												{
-													sf.Icon = Image.Load(iconData);
-												}
-												else
-												{
-													var iconParser = new WindowsIconParser();
-													iconParser.Load(iconData);
+											sf.Icon = GetImageFromWindowsIconData(iconData);
 
-													sf.Icon = Image.Load(iconParser.Entries.First().GetBitmap());
-												}
-
-												if (sf.Icon != null) break;
-											}
+											if (sf.Icon != null) break;
 										}
-										
+
 										if (sf.Icon != null) break;
 									}
 
@@ -233,13 +220,15 @@ public static class Utils
 						}
 					}
 
-					// if (sf.Icon == null)
-					// {
-					// 	foreach (var icon in peFile.Icons())
-					// 	{
-					// 		sf.Icon = Image.Load(icon);
-					// 	}
-					// }
+					if (sf.Icon == null)
+					{
+						foreach (var icon in peFile.Icons())
+						{
+							sf.Icon = GetImageFromWindowsIconData(icon);
+											
+							if (sf.Icon != null) break;
+						}
+					}
 				}
 				catch (Exception ex)
 				{
@@ -265,6 +254,21 @@ public static class Utils
 		sf.Icon?.Mutate(ctx => ctx.Resize(0, 128));
 
 		return sf;
+	}
+
+	private static Image GetImageFromWindowsIconData(byte[] iconData)
+	{
+		ArgumentNullException.ThrowIfNull(iconData);
+		
+		if (iconData[0] == 0x89 && iconData[1] == 0x50) // PNG
+		{
+			return Image.Load(iconData);
+		}
+		
+		var iconParser = new WindowsIconParser();
+		iconParser.Load(iconData);
+
+		return Image.Load(iconParser.Entries.First().GetBitmap());
 	}
 
 	internal static IEnumerable<float> NearestNeighborResample(this IList<float> input, int newSampleCount = 48000)

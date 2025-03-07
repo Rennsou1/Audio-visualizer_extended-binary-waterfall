@@ -32,10 +32,16 @@ public class FfmpegExporter : IExporter
 
 	public Generator Generator { get; set; }
 	
+	#region User-defined properties
+
 	[CliParameter("FFmpeg Log Level", "ffloglevel")]
 	public int LogLevel { get; set; } = ffmpeg.AV_LOG_INFO;
 	[CliParameter("Output Video File Path", "output", 'o')]
 	public string OutputPath { get; set; } = null;
+	[CliParameter("Output Video Bitrate", "output-bitrate")]
+	public uint OutputVideoBitRate { get; set; } = 9_000_000;
+
+	#endregion
 
 	public void InitializeFfmpeg()
 	{
@@ -88,7 +94,7 @@ public class FfmpegExporter : IExporter
 			_videoCtx->time_base.den = videoFps.num;
 			_videoCtx->framerate.num = videoFps.num;
 			_videoCtx->framerate.den = videoFps.den;
-			_videoCtx->bit_rate = 6_000_000;
+			_videoCtx->bit_rate = OutputVideoBitRate;
 			// _videoCtx->thread_count = Environment.ProcessorCount / 2;
 			// Console.Error.WriteLine($"using {_videoCtx->thread_count} threads");
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)

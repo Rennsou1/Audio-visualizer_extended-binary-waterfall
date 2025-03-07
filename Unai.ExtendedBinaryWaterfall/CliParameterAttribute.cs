@@ -32,7 +32,7 @@ public class CliParameterAttribute : Attribute
 	{
 		if (targetProp.PropertyType == typeof(string))
 		{
-			targetProp.SetValue(targetObject, value);
+			targetProp.SetValue(targetObject, value.Replace("\\n", "\n"));
 		}
 		else if (targetProp.PropertyType == typeof(int))
 		{

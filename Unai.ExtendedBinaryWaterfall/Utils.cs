@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Processing;
+using Unai.ExtendedBinaryWaterfall.Parsers.WindowsIcon;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
@@ -174,7 +176,7 @@ public static class Utils
 
 		switch (ext)
 		{
-			case ".exe" or ".dll" or ".sys" or ".scr":
+			case ".exe" or ".dll" or ".sys" or ".scr" or ".ocx" or ".ax" or ".cpl" or ".mui":
 				Logger.Debug($"Parsing PE executable from subfile '{sf.Path}'…");
 				try
 				{
@@ -187,30 +189,57 @@ public static class Utils
 					{
 						foreach (var stringEntry in peFile.Resources.VsVersionInfo.StringFileInfo.StringTable)
 						{
-							sf.Description = $"{stringEntry.OriginalFilename}\n{stringEntry.ProductName}\n{stringEntry.FileDescription}\n{stringEntry.ProductVersion}";
+							sf.Description = $"{stringEntry.OriginalFilename}\n{stringEntry.ProductName}\n{stringEntry.ProductVersion}\n{stringEntry.FileDescription}";
 						}
 						if (peFile.Resources.GroupIconDirectories != null)
 						{
-							foreach (var giDir in peFile.Resources.GroupIconDirectories)
+							try
 							{
-								var bestIconGi = giDir.DirectoryEntries.OrderByDescending(gi => gi.WBitCount).FirstOrDefault();
-								var bestIcon = bestIconGi.AssociatedIcons(peFile).FirstOrDefault();
-								if (bestIcon != null)
+								foreach (var giDir in peFile.Resources.GroupIconDirectories)
 								{
-									sf.Icon = Image.Load(bestIcon.AsIco());
+									foreach (var bestIconGi in giDir.DirectoryEntries.OrderByDescending(gi => gi.WBitCount).OrderByDescending(gi => gi.BWidth))
+									{
+										foreach (var bestIcon in bestIconGi.AssociatedIcons(peFile))
+										{
+											byte[] iconData = bestIcon.AsIco(); // returns either headless BMP or PNG
+											if (iconData != null)
+											{
+												if (iconData[0] == 0x89 && iconData[1] == 0x50) // PNG
+												{
+													sf.Icon = Image.Load(iconData);
+												}
+												else
+												{
+													var iconParser = new WindowsIconParser();
+													iconParser.Load(iconData);
+
+													sf.Icon = Image.Load(iconParser.Entries.First().GetBitmap());
+												}
+
+												if (sf.Icon != null) break;
+											}
+										}
+										
+										if (sf.Icon != null) break;
+									}
+
+									if (sf.Icon != null) break;
 								}
+							}
+							catch (Exception ex)
+							{
+								Logger.Error($"Cannot set subfile icon from an icon group: {ex.Message}");
 							}
 						}
 					}
 
-					if (sf.Icon != null)
-					{
-						var firstIcon = peFile.Icons().FirstOrDefault();
-						if (firstIcon != null)
-						{
-							sf.Icon = Image.Load(firstIcon);
-						}
-					}
+					// if (sf.Icon == null)
+					// {
+					// 	foreach (var icon in peFile.Icons())
+					// 	{
+					// 		sf.Icon = Image.Load(icon);
+					// 	}
+					// }
 				}
 				catch (Exception ex)
 				{

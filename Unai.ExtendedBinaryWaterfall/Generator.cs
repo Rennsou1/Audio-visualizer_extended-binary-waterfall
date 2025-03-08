@@ -151,12 +151,7 @@ public class Generator
 
 		Logger.Info("Preparing audio/video generation…");
 
-		_videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
-		if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
-		_videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
-		if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
-
-		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
+		UpdateValues();
 		_inputAudioBuffer = new(AudioInputSamplesPerFramePerChannel, AudioInputChannelCount);
 		_outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
 		if (_drawOpts.GraphicsOptions.Antialias)
@@ -346,9 +341,18 @@ public class Generator
 
 	internal void UpdateValues()
 	{
-		if (_frameContent.Width != OutputVideoWidth || _frameContent.Height != OutputVideoHeight)
+		if (_frameContent == null || _frameContent.Width != OutputVideoWidth || _frameContent.Height != OutputVideoHeight)
 		{
 			_frameContent = new(OutputVideoWidth, OutputVideoHeight);
+			var pixelCount = OutputVideoWidth * OutputVideoHeight;
+
+			WaterfallScaledWidth = (int)(WaterfallWidth * (pixelCount / 691200f));
+			WaterfallScaledHeight = (int)(WaterfallHeight * (pixelCount / 691200f));
+
+			_videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
+			if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
+			_videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
+			if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
 		}
 	}
 

@@ -132,7 +132,7 @@ class Program
 			helpStrBld.AppendLine(cliParamAttr.Name);
 			if (cliParamAttr.Description != null)
 			{
-				helpStrBld.AppendLine($"		{cliParamAttr.Description}");
+				helpStrBld.AppendLine($"{new string('\t', indentation + 1)}{cliParamAttr.Description}");
 			}
 		}
 
@@ -164,6 +164,7 @@ class Program
 				{
 					AppendCommandLineArgument(cliParam, 3);
 				}
+				helpStrBld.AppendLine();
 			}
 		}
 

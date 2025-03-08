@@ -26,6 +26,7 @@ public class SdlExporter : IExporter
 	private int _frameCount = 0;
 	private double _ts = 0;
 
+	[CliParameter("Adaptive Output Video Resolution", "sdl:adaptive-video-resolution", "Change generator parameters based on window size")]
 	public bool AdaptiveFramebufferSize { get; set; } = false;
 
 	public void InitializeSdl()
@@ -61,12 +62,12 @@ public class SdlExporter : IExporter
 		_init = true;
 	}
 
-	public void PushNewFrame(Image videoFrame, float[] audioFrame, double delta)
+	public void PushNewFrame(Image videoFrame, AudioBuffer audioFrame, double delta)
 	{
 		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
 	}
 
-	public void PushNewFrame(Image<Rgba32> videoFrame, float[] audioFrame, double delta)
+	public void PushNewFrame(Image<Rgba32> videoFrame, AudioBuffer audioFrame, double delta)
 	{
 		if (!_init)
 		{
@@ -111,13 +112,13 @@ public class SdlExporter : IExporter
 
 		var audioQueue = SDL.GetQueuedAudioSize(_audioDeviceId);
 
-		if (audioQueue < audioFrame.Length)
+		if (audioQueue < audioFrame.TotalSampleCount)
 		{
 			unsafe
 			{
-				fixed (float* audioBufPtr = audioFrame)
+				fixed (float* audioBufPtr = audioFrame.ToArray())
 				{
-					var ret = SDL.QueueAudio(_audioDeviceId, (byte*)audioBufPtr, audioFrame.Length * sizeof(float));
+					var ret = SDL.QueueAudio(_audioDeviceId, (byte*)audioBufPtr, audioFrame.TotalSampleCount * sizeof(float));
 					if (ret != 0) Logger.Error($"Cannot queue audio buffer (code {ret}): {SDL.GetError()}");
 				}
 			}

@@ -36,8 +36,8 @@ public class Generator
 
 	private Image<Rgba32> _frameContent = null;
 	private Image<Rgba32> _viewportFramebuf = null;
-	private float[] _inputAudioBuffer = null;
-	private float[] _outputAudioBuffer = null;
+	private AudioBuffer _inputAudioBuffer = null;
+	private AudioBuffer _outputAudioBuffer = null;
 	private int _videoFrameX1, _videoFrameX2, _videoFrameY1, _videoFrameY2;
 	internal bool _exitRequested = false;
 
@@ -107,7 +107,8 @@ public class Generator
 	public AudioSampleFormat AudioInputSampleFormat { get; set; } = AudioSampleFormat.Unsigned8;
 	[CliParameter("Input Audio Channel Count", "channel-count")]
 	public int AudioInputChannelCount { get; set; } = 2;
-	public int AudioInputSamplesPerFrame => (InputBytesPerFrame / AudioInputSampleFormat.GetByteSize());
+	public int AudioInputSamplesPerFrame => InputBytesPerFrame / AudioInputSampleFormat.GetByteSize();
+	public int AudioInputSamplesPerFramePerChannel => AudioInputSamplesPerFrame / AudioInputChannelCount;
 	public int AudioInputSampleRate => (InputBytesPerSecond / AudioInputSampleFormat.GetByteSize()) / AudioInputChannelCount;
 	public int AudioInputBytesPerFrame => InputBytesPerFrame;
 
@@ -117,7 +118,8 @@ public class Generator
 	public int AudioOutputChannelCount { get; set; } = 2;
 	[CliParameter("Output Sample Rate", "output-sample-rate")]
 	public int AudioOutputSampleRate { get; set; } = 48000;
-	public int AudioOutputSamplesPerFrame => AudioOutputSampleRate * AudioOutputChannelCount / OutputFps;
+	public int AudioOutputSamplesPerFrame => AudioOutputSampleRate / OutputFps;
+	public int AudioOutputSamplesPerFramePerChannel => AudioOutputSamplesPerFrame / AudioOutputChannelCount;
 	public int AudioOutputBytesPerFrame => AudioOutputSampleFormat.GetByteSize() * AudioOutputSamplesPerFrame;
 
 	#endregion
@@ -155,8 +157,8 @@ public class Generator
 		if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
 
 		_frameContent = new(OutputVideoWidth, OutputVideoHeight);
-		_inputAudioBuffer = new float[AudioInputSamplesPerFrame];
-		_outputAudioBuffer = new float[AudioOutputSamplesPerFrame];
+		_inputAudioBuffer = new(AudioInputSamplesPerFramePerChannel, AudioInputChannelCount);
+		_outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
 		if (_drawOpts.GraphicsOptions.Antialias)
 		{
 			if (_drawOpts.GraphicsOptions.AntialiasSubpixelDepth < 0)
@@ -466,44 +468,10 @@ public class Generator
 
 			// Get audio data.
 
-			switch (AudioInputSampleFormat)
-			{
-				case AudioSampleFormat.Unsigned8:
-					_inputAudioBuffer = currentAudioBuffer.Select(x => (x / 128f) - 1f).ToArray();
-					break;
-
-				case AudioSampleFormat.Signed8:
-					_inputAudioBuffer = currentAudioBuffer.Select(x => x / 128f).ToArray();
-					break;
-
-				case AudioSampleFormat.Unsigned16LE:
-					for (int i = 0; i < _inputAudioBuffer.Length; i++)
-					{
-						var srcIdx = i * 2;
-						var srcSample = BinaryPrimitives.ReadUInt16LittleEndian(currentAudioBuffer.AsSpan(srcIdx, 2));
-						_inputAudioBuffer[i] = (srcSample / 32768f) - 1f;
-					}
-					break;
-
-				case AudioSampleFormat.Signed16LE:
-					for (int i = 0; i < _inputAudioBuffer.Length; i++)
-					{
-						var srcIdx = i * 2;
-						var srcSample = BinaryPrimitives.ReadInt16LittleEndian(currentAudioBuffer.AsSpan(srcIdx, 2));
-						_inputAudioBuffer[i] = srcSample / 32768f;
-					}
-					break;
-
-				default:
-					throw new InvalidOperationException("Audio sample format not implemented yet.");
-			}
-
-			_outputAudioBuffer = _inputAudioBuffer
-				.ToPlanar(AudioInputChannelCount)
-				.Select(chData => chData.ToList().LinearResample(AudioOutputSamplesPerFrame / AudioInputChannelCount).ToList())
-				.ToArray()
-				.ToPacked()
-				.ToArray();
+			_inputAudioBuffer.LoadFromByteArray(currentAudioBuffer, AudioInputSampleFormat);
+			_outputAudioBuffer = new AudioBuffer(_inputAudioBuffer)
+				.Resample(AudioOutputSamplesPerFrame)
+				.RemixChannels(AudioOutputChannelCount);
 
 			// Compute registers.
 

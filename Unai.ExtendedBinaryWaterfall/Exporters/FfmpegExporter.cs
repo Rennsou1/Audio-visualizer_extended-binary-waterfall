@@ -274,12 +274,12 @@ public class FfmpegExporter : IExporter
 		}
 	}
 
-	public void PushNewFrame(Image videoFrame, float[] audioFrame, double delta)
+	public void PushNewFrame(Image videoFrame, AudioBuffer audioFrame, double delta)
 	{
 		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
 	}
 
-	public unsafe void PushNewFrame(Image<Rgba32> videoFrame, float[] audioFrame, double delta)
+	public unsafe void PushNewFrame(Image<Rgba32> videoFrame, AudioBuffer audioFrame, double delta)
 	{
 		if (!_init)
 		{
@@ -338,7 +338,7 @@ public class FfmpegExporter : IExporter
 		_videoAvFrame->duration = 1;
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
 
-		_audioQueue.Push(audioFrame);
+		_audioQueue.Push(audioFrame.ToArray());
 
 		if (_frameNum % 10 == 0)
 		{

@@ -264,6 +264,10 @@ public class Generator
 				{
 					CliParameterAttribute.SetPropertyFromCliArgument(targetProp, _exporter, argKvp.Value);
 				}
+				else
+				{
+					Logger.Error($"Unrecognized CLI argument name: '{argKvp.Key}'.");
+				}
 			}
 		}
 	}

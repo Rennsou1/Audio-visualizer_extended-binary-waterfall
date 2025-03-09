@@ -32,6 +32,12 @@ public class Generator
 
 	#endregion
 
+	#region Events
+
+	public event Action OnFinish;
+
+	#endregion
+
 	#region Generator Registers
 
 	private Image<Rgba32> _frameContent = null;
@@ -363,11 +369,17 @@ public class Generator
 		// 1. Intro
 
 		GenerateIntro();
-		if (_exitRequested) return;
+		if (_exitRequested)
+		{
+			OnFinish.Invoke();
+			return;
+		}
 
 		// 2. Main Video
 
 		GenerateMainVideo();
+
+		OnFinish.Invoke();
 	}
 
 	private void GenerateIntro()

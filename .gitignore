@@ -3,3 +3,4 @@
 *.bup
 *.mkv
 .vscode/**
+*.glade~

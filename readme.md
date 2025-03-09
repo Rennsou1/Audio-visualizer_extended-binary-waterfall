@@ -1,7 +1,7 @@
 # Extended Binary Waterfall
 ![GitHub Tag](https://img.shields.io/github/v/tag/unai-d/extended-binary-waterfall?style=flat-square&label=latest%20tag)
 
-This program **generates video and audio** based on an **arbitrary computer file** (resulting in what's sometimes known as a **binary waterfall**), but in the process, it also includes a **detailed walktrough** of the **fragments, chunks or subfiles** that the target file may have.
+This program **reads arbitrary computer files** as **raw audio and video streams**, resulting in what's sometimes known as a **binary waterfall**. The “extended” part of it is the inclusion of a **detailed walktrough** of the **fragments, chunks or subfiles** that the target file may have.
 
 > [!WARNING]
 > This program is still in development.

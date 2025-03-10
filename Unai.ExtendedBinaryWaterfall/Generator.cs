@@ -20,14 +20,13 @@ public class Generator
 {
 	#region Main Fields
 
-	public FileStream _inputFileStream = null;
-	private Stream _inputAuxFileStream = null;
-	private IParser _parser = null;
-	public IExporter _exporter = null;
+	public FileStream InputFileStream { get; set; }
+	public Stream InputAuxiliaryFileStream { get; set; }
+	public IParser Parser { get; set; }
+	public IExporter Exporter { get; set; }
 	private readonly Stopwatch _timer = new();
 	private List<SubFile> _subfiles = [];
 
-	public FileStream InputFileStream => _inputFileStream;
 	public Dictionary<string, string> AdditionalCliArguments { get; } = [];
 
 	#endregion
@@ -141,11 +140,18 @@ public class Generator
 
 	public void Initialize()
 	{
-		Logger.Info("Opening files…");
-		_inputFileStream = File.OpenRead(InputFilePath);
-		if (InputAuxiliaryFilePath != null)
+		if (InputFileStream == null)
 		{
-			_inputAuxFileStream = File.OpenRead(InputAuxiliaryFilePath);
+			Logger.Info("Opening files…");
+			InputFileStream = File.OpenRead(InputFilePath);
+		}
+
+		if (InputAuxiliaryFileStream != null)
+		{
+			if (InputAuxiliaryFilePath != null)
+			{
+				InputAuxiliaryFileStream = File.OpenRead(InputAuxiliaryFilePath);
+			}
 		}
 
 		InitializeParser();
@@ -159,6 +165,7 @@ public class Generator
 		Logger.Info("Preparing audio/video generation…");
 
 		UpdateValues();
+
 		_inputAudioBuffer = new(AudioInputSamplesPerFramePerChannel, AudioInputChannelCount);
 		_outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
 		if (_drawOpts.GraphicsOptions.Antialias)
@@ -175,11 +182,11 @@ public class Generator
 	[Conditional("DEBUG")]
 	private void LogGeneratorStatus()
 	{
-		Logger.Debug($"Selected parser: {_parser?.GetType().GetCustomAttribute<ParserAttribute>()?.Name ?? "<null>"}");
-		Logger.Debug($"Selected exporter: {_exporter?.GetType().GetCustomAttribute<ExporterAttribute>()?.Name ?? "<null>"}");
+		Logger.Debug($"Selected parser: {Parser?.GetType().GetCustomAttribute<ParserAttribute>()?.Name ?? "<null>"}");
+		Logger.Debug($"Selected exporter: {Exporter?.GetType().GetCustomAttribute<ExporterAttribute>()?.Name ?? "<null>"}");
 		Logger.Debug($"Selected font: {_fontFamily.Name ?? "<null>"}");
 		Logger.Debug($"Read speed: {InputBytesPerFrame} bytes/frame ({InputBytesPerSecond} bytes/second)");
-		Logger.Debug($"Waterfall duration will be around {TimeSpan.FromSeconds(_inputFileStream.Length / InputBytesPerSecond)}.");
+		Logger.Debug($"Waterfall duration will be around {TimeSpan.FromSeconds(InputFileStream.Length / InputBytesPerSecond)}.");
 		Logger.Debug($"Video input:  {WaterfallWidth}×{WaterfallHeight}");
 		Logger.Debug($"Audio input:  {AudioInputBytesPerFrame}bpf {AudioInputSamplesPerFrame}spf → {AudioInputSampleRate}Hz {AudioInputChannelCount}ch {8 * AudioInputSampleFormat.GetByteSize()}-bit");
 		Logger.Debug($"Audio output: {AudioOutputBytesPerFrame}bpf {AudioOutputSamplesPerFrame}spf → {AudioOutputSampleRate}Hz {AudioOutputChannelCount}ch {8 * AudioOutputSampleFormat.GetByteSize()}-bit");
@@ -238,9 +245,9 @@ public class Generator
 				{
 					continue;
 				}
-				_exporter = (IExporter)Activator.CreateInstance(exporterKvp.Value);
+				Exporter = (IExporter)Activator.CreateInstance(exporterKvp.Value);
 			}
-			if (_exporter == null)
+			if (Exporter == null)
 			{
 				Logger.Fail($"Unknown exporter ID: '{ExporterId}'.");
 				return;
@@ -249,10 +256,10 @@ public class Generator
 		else
 		{
 			Logger.Debug("No exporter requested. Using SDL…");
-			_exporter = new SdlExporter();
+			Exporter = new SdlExporter();
 		}
 
-		_exporter.Generator = this;
+		Exporter.Generator = this;
 
 		if (AdditionalCliArguments.Count > 0)
 		{
@@ -263,7 +270,7 @@ public class Generator
 
 				if (targetProp.DeclaringType.GetInterfaces().Contains(typeof(IExporter)))
 				{
-					CliParameterAttribute.SetPropertyFromCliArgument(targetProp, _exporter, argKvp.Value);
+					CliParameterAttribute.SetPropertyFromCliArgument(targetProp, Exporter, argKvp.Value);
 				}
 				else
 				{
@@ -277,19 +284,19 @@ public class Generator
 	{
 		IEnumerable<SubFile> subFiles = null;
 
-		if (_parser != null)
+		if (Parser != null)
 		{
 			Logger.Info("Parsing subfiles…");
 
-			_parser.InputStream = _inputFileStream;
-			_parser.AuxiliaryInputStream = _inputAuxFileStream;
-			subFiles = _parser.GetSubFiles();
+			Parser.InputStream = InputFileStream;
+			Parser.AuxiliaryInputStream = InputAuxiliaryFileStream;
+			subFiles = Parser.GetSubFiles();
 
 			_subfiles =
 			[
 				.. subFiles
 				.OrderBy(sf => sf.StartOffset)
-				.Select(sf => Utils.ParseSubfile(_inputFileStream, sf))
+				.Select(sf => Utils.ParseSubfile(InputFileStream, sf))
 			];
 		}
 
@@ -319,9 +326,9 @@ public class Generator
 				{
 					continue;
 				}
-				_parser = (IParser)Activator.CreateInstance(parserKvp.Value);
+				Parser = (IParser)Activator.CreateInstance(parserKvp.Value);
 			}
-			if (_parser == null)
+			if (Parser == null)
 			{
 				Logger.Warning($"Unknown parser ID: '{InputFileFormatId}'. Skipping subfile listing.");
 			}
@@ -337,11 +344,11 @@ public class Generator
 				if (parserAttr.FileExtensions.Contains(inputFileExt))
 				{
 					Logger.Debug($"Parser '{parserAttr.Id}' recognizes '{inputFileExt}' as a valid file extension.");
-					_parser = (IParser)Activator.CreateInstance(parserKvp.Value);
+					Parser = (IParser)Activator.CreateInstance(parserKvp.Value);
 					break;
 				}
 			}
-			if (_parser == null)
+			if (Parser == null)
 			{
 				Logger.Warning($"Unknown input format. Skipping subfile listing.");
 			}
@@ -411,7 +418,7 @@ public class Generator
 				}, $"Starting in {(totalFrames - frameNumber) / (float)OutputFps:N1} seconds…", Color.White)
 				.DrawProgressBar(frameNumber / (float)totalFrames, (int)(OutputVideoWidth * 0.3), (int)(OutputVideoWidth * 0.7), OutputVideoHeight - 64));
 
-			_exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
+			Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
 
 			OnProgress?.Invoke(frameNumber / (float)totalFrames);
@@ -434,9 +441,9 @@ public class Generator
 		long currentOffset = 0;
 		int playHeadRelPos = 0;
 
-		using var targetFileReader = new BinaryReader(_inputFileStream);
+		using var targetFileReader = new BinaryReader(InputFileStream);
 
-		while (currentOffset < _inputFileStream.Length)
+		while (currentOffset < InputFileStream.Length)
 		{
 			// Get video buffer.
 
@@ -447,14 +454,14 @@ public class Generator
 				playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallWidth * 4));
 				frameStartByteOffset = 0;
 			}
-			else if (frameStartByteOffset + WaterfallFrameLength >= _inputFileStream.Length)
+			else if (frameStartByteOffset + WaterfallFrameLength >= InputFileStream.Length)
 			{
-				playHeadRelPos = (int)((_inputFileStream.Length - (frameStartByteOffset + WaterfallFrameLength)) / (WaterfallWidth * 4));
-				frameStartByteOffset = _inputFileStream.Length - WaterfallFrameLength;
+				playHeadRelPos = (int)((InputFileStream.Length - (frameStartByteOffset + WaterfallFrameLength)) / (WaterfallWidth * 4));
+				frameStartByteOffset = InputFileStream.Length - WaterfallFrameLength;
 			}
 			var frameEndByteOffset = frameStartByteOffset + WaterfallFrameLength;
 
-			_inputFileStream.Position = frameStartByteOffset;
+			InputFileStream.Position = frameStartByteOffset;
 			var currentVideoBuffer = targetFileReader.ReadBytes(WaterfallFrameLength);
 
 			// Get audio buffer.
@@ -464,13 +471,13 @@ public class Generator
 			{
 				audioFrameStartByteOffset = 0;
 			}
-			else if (audioFrameStartByteOffset + InputBytesPerFrame >= _inputFileStream.Length)
+			else if (audioFrameStartByteOffset + InputBytesPerFrame >= InputFileStream.Length)
 			{
-				audioFrameStartByteOffset = _inputFileStream.Length - InputBytesPerFrame;
+				audioFrameStartByteOffset = InputFileStream.Length - InputBytesPerFrame;
 			}
 			var audioFrameEndByteOffset = audioFrameStartByteOffset + InputBytesPerFrame;
 
-			_inputFileStream.Position = audioFrameStartByteOffset;
+			InputFileStream.Position = audioFrameStartByteOffset;
 			var currentAudioBuffer = targetFileReader.ReadBytes(InputBytesPerFrame);
 
 			// Get video data.
@@ -687,12 +694,12 @@ public class Generator
 				}
 			});
 
-			_exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
+			Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
 
 			currentOffset += InputBytesPerFrame;
 
-			OnProgress?.Invoke(currentOffset / (float)_inputFileStream.Length);
+			OnProgress?.Invoke(currentOffset / (float)InputFileStream.Length);
 
 			if (_exitRequested)
 			{
@@ -700,6 +707,6 @@ public class Generator
 			}
 		}
 
-		_exporter.Finish();
+		Exporter.Finish();
 	}
 }

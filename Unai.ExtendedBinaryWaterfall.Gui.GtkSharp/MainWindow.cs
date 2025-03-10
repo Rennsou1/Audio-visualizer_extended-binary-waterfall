@@ -101,7 +101,7 @@ public class MainWindow : Window
 			_generator.Initialize();
 			_generator.Generate();
 			// This should not be necessary, but here we are…
-			((SdlExporter)_generator._exporter).Finish();
+			((SdlExporter)_generator.Exporter).Finish();
 		});
 	}
 

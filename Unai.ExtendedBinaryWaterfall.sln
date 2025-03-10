@@ -1,26 +1,60 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.5.002.0
+VisualStudioVersion = 17.5.2.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Unai.ExtendedBinaryWaterfall", "Unai.ExtendedBinaryWaterfall\Unai.ExtendedBinaryWaterfall.csproj", "{A62F55CB-160E-49D6-BD67-E09A97E13736}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Unai.ExtendedBinaryWaterfall.Cli", "Unai.ExtendedBinaryWaterfall.Cli\Unai.ExtendedBinaryWaterfall.Cli.csproj", "{EFD64170-682A-4AD8-9BA9-69CF27171D7B}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Unai.ExtendedBinaryWaterfall.Gui.GtkSharp", "Unai.ExtendedBinaryWaterfall.Gui.GtkSharp\Unai.ExtendedBinaryWaterfall.Gui.GtkSharp.csproj", "{11C19031-12AF-48DD-8DD8-5F7338178C5A}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
 		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Debug|x64.Build.0 = Debug|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Debug|x86.Build.0 = Debug|Any CPU
 		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Release|x64.ActiveCfg = Release|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Release|x64.Build.0 = Release|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Release|x86.ActiveCfg = Release|Any CPU
+		{A62F55CB-160E-49D6-BD67-E09A97E13736}.Release|x86.Build.0 = Release|Any CPU
 		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Debug|x64.Build.0 = Debug|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Debug|x86.Build.0 = Debug|Any CPU
 		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Release|x64.ActiveCfg = Release|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Release|x64.Build.0 = Release|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Release|x86.ActiveCfg = Release|Any CPU
+		{EFD64170-682A-4AD8-9BA9-69CF27171D7B}.Release|x86.Build.0 = Release|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Debug|x64.Build.0 = Debug|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Debug|x86.Build.0 = Debug|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Release|x64.ActiveCfg = Release|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Release|x64.Build.0 = Release|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Release|x86.ActiveCfg = Release|Any CPU
+		{11C19031-12AF-48DD-8DD8-5F7338178C5A}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

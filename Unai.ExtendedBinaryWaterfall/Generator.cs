@@ -1,5 +1,4 @@
 using System;
-using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -21,13 +20,14 @@ public class Generator
 {
 	#region Main Fields
 
-	private FileStream _inputFileStream = null;
+	public FileStream _inputFileStream = null;
 	private Stream _inputAuxFileStream = null;
 	private IParser _parser = null;
-	private IExporter _exporter = null;
+	public IExporter _exporter = null;
 	private readonly Stopwatch _timer = new();
 	private List<SubFile> _subfiles = [];
 
+	public FileStream InputFileStream => _inputFileStream;
 	public Dictionary<string, string> AdditionalCliArguments { get; } = [];
 
 	#endregion
@@ -35,6 +35,7 @@ public class Generator
 	#region Events
 
 	public event Action OnFinish;
+	public event Action<float> OnProgress;
 
 	#endregion
 
@@ -375,7 +376,7 @@ public class Generator
 		GenerateIntro();
 		if (_exitRequested)
 		{
-			OnFinish.Invoke();
+			OnFinish?.Invoke();
 			return;
 		}
 
@@ -383,7 +384,7 @@ public class Generator
 
 		GenerateMainVideo();
 
-		OnFinish.Invoke();
+		OnFinish?.Invoke();
 	}
 
 	private void GenerateIntro()
@@ -412,6 +413,8 @@ public class Generator
 
 			_exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
 			_timer.Restart();
+
+			OnProgress?.Invoke(frameNumber / (float)totalFrames);
 
 			if (_exitRequested)
 			{
@@ -688,6 +691,8 @@ public class Generator
 			_timer.Restart();
 
 			currentOffset += InputBytesPerFrame;
+
+			OnProgress?.Invoke(currentOffset / (float)_inputFileStream.Length);
 
 			if (_exitRequested)
 			{

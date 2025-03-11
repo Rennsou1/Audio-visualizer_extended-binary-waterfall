@@ -136,13 +136,25 @@ public class MainWindow : Window
 		_generator.AdditionalCliArguments["-o"] = outputFilePath;
 		
 		_genTaskFinished = false;
-		_generator.OnFinish += () => Program._renderDialog.Hide();
+		// _generator.OnFinish += () => Program._renderDialog.Hide();
 		_generator.OnProgress += (p) => _genProgress = p;
 		_genTask = Task.Run(() =>
 		{
 			_generator.Initialize();
 			_generator.Generate();
 			_genTaskFinished = true;
+		});
+		_genTask.ContinueWith(t =>
+		{
+			if (t.IsFaulted)
+			{
+				Program.ShowUnhandledExceptionMessageBox(t.Exception);
+				foreach (var innerEx in t.Exception.InnerExceptions)
+				{
+					Program.ShowUnhandledExceptionMessageBox(innerEx);
+				}
+			}
+			Program._renderDialog.Hide();
 		});
 
 		Program._renderDialog = new();

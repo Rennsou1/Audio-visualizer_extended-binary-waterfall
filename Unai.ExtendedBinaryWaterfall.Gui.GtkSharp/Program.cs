@@ -1,4 +1,5 @@
-using System;
+﻿using System;
+using System.Globalization;
 using Gtk;
 
 namespace Unai.ExtendedBinaryWaterfall.Gui.GtkSharp;
@@ -7,6 +8,7 @@ static class Program
 {
 	internal static Application _gtkApp = null;
 	internal static Window _mainWin = null;
+	internal static RenderDialog _renderDialog = null;
 	
 	[STAThread]
 	static void Main(string[] args)

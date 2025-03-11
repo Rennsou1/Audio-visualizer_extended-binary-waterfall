@@ -28,7 +28,7 @@ public class MainWindow : Window
 
 	private static Generator _generator = null;
 	private static Task _genTask = null;
-	private static Dialog _genStatusDialog = null;
+	// private static RenderDialog _genStatusDialog = null;
 	private static bool _genTaskFinished = false;
 	private static float _genProgress = 0f;
 
@@ -128,7 +128,7 @@ public class MainWindow : Window
 		_generator.AdditionalCliArguments["-o"] = outputFilePath;
 		
 		_genTaskFinished = false;
-		_generator.OnFinish += () => _genStatusDialog.Hide();
+		_generator.OnFinish += () => Program._renderDialog.Hide();
 		_generator.OnProgress += (p) => _genProgress = p;
 		_genTask = Task.Run(() =>
 		{
@@ -137,25 +137,13 @@ public class MainWindow : Window
 			_genTaskFinished = true;
 		});
 
-		_genStatusDialog = new Dialog("Render Status", this, DialogFlags.Modal);
-		var statusLabel = new Label("Rendering waterfall…")
-		{
-			Margin = 16,
-		};
-		var statusPBar = new ProgressBar()
-		{
-			Fraction = 0f,
-			Hexpand = true,
-			Margin = 16,
-			HeightRequest = 16,
-		};
-		_genStatusDialog.ContentArea.Add(statusLabel);
-		_genStatusDialog.ContentArea.Add(statusPBar);
-		_genStatusDialog.ShowAll();
+		Program._renderDialog = new();
+		Program._renderDialog.Show();
 
 		GLib.Idle.Add(new(() => 
 		{
-			statusPBar.Fraction = _genProgress;
+			Program._renderDialog._uiStatusProgBar.Fraction = _genProgress;
+			Program._renderDialog._uiStatusProgBar.Text = $"{_genProgress * 100:N2} %";
 			return !_genTaskFinished;
 		}));
 	}

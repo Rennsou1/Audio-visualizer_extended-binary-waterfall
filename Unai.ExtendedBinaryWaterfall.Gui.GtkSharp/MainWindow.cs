@@ -81,7 +81,7 @@ public class MainWindow : Window
 				MessageType.Warning,
 				ButtonsType.Ok,
 				false,
-				"Cannot detect file format.\n\nYou can manually specify a parser if you know the actual file format.\n\nAlternatively, you can use the “unknown format” parser and supply a custom CSV file with the desired subfile listing at the “Custom Subfile Listing File” option.");
+				"Cannot detect file format.\n\nYou can manually specify a parser if you know the actual file format.\n\nAlternatively, you can use the “unknown format” parser and supply a custom CSV file with the desired subfile listing at the “Custom Subfile Listing File” option.\n\nAs a last resort, you can use the parser mentioned above without any subfile listing at all.");
 			msgBox.Run();
 			msgBox.Destroy();
 			_uiParserComboBox.SetActiveId(_nullParserId);

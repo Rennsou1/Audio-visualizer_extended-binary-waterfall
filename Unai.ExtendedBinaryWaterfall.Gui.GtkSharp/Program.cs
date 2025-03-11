@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using Gtk;
 
 namespace Unai.ExtendedBinaryWaterfall.Gui.GtkSharp;
@@ -11,6 +11,9 @@ static class Program
 	[STAThread]
 	static void Main(string[] args)
 	{
+		// Make decimals use "." instead of other characters.
+		CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+		
 		GLib.ExceptionManager.UnhandledException += ShowUnhandledExceptionMessageBox;
 		GLib.Global.ApplicationName = BuildInfo.ApplicationName;
 

@@ -32,7 +32,7 @@
     <property name="can-focus">False</property>
     <property name="title" translatable="yes">Extended Binary Waterfall</property>
     <property name="default-width">480</property>
-    <property name="default-height">240</property>
+    <property name="default-height">220</property>
     <child>
       <object class="GtkBox">
         <property name="visible">True</property>
@@ -66,7 +66,7 @@
               <object class="GtkLabel">
                 <property name="visible">True</property>
                 <property name="can-focus">False</property>
-                <property name="label" translatable="yes">Input format / Parser</property>
+                <property name="label" translatable="yes">Input Format / Parser</property>
               </object>
               <packing>
                 <property name="left-attach">0</property>
@@ -90,7 +90,7 @@
               <object class="GtkLabel">
                 <property name="visible">True</property>
                 <property name="can-focus">False</property>
-                <property name="label" translatable="yes">Custom subfile listing file</property>
+                <property name="label" translatable="yes">Custom Subfile Listing File</property>
               </object>
               <packing>
                 <property name="left-attach">0</property>
@@ -100,9 +100,10 @@
             <child>
               <object class="GtkFileChooserButton" id="_uiAuxInputFileChooser">
                 <property name="visible">True</property>
-                <property name="sensitive">False</property>
+                <property name="sensitive">True</property>
                 <property name="can-focus">False</property>
                 <property name="title" translatable="yes">Custom Subfile Listing File</property>
+                <signal name="file-set" handler="UpdateBasedOnAuxiliaryInputFile" swapped="no"/>
               </object>
               <packing>
                 <property name="left-attach">1</property>
@@ -143,7 +144,7 @@
               <object class="GtkLabel">
                 <property name="visible">True</property>
                 <property name="can-focus">False</property>
-                <property name="label" translatable="yes">Input file</property>
+                <property name="label" translatable="yes">Input File</property>
               </object>
               <packing>
                 <property name="left-attach">0</property>

@@ -25,10 +25,10 @@ public class MainWindow : Window
 
 	private readonly string _nullParserId = typeof(CustomParser).GetCustomAttribute<ParserAttribute>().Id;
 	private string _inputFilePath = null;
+	private string _inputAuxFilePath = null;
 
 	private static Generator _generator = null;
 	private static Task _genTask = null;
-	// private static RenderDialog _genStatusDialog = null;
 	private static bool _genTaskFinished = false;
 	private static float _genProgress = 0f;
 
@@ -41,6 +41,8 @@ public class MainWindow : Window
 	{
 		builder.Autoconnect(this);
 
+		Title = BuildInfo.ApplicationName;
+
 		foreach (var parser in Utils.GetTypesWithAttribute<ParserAttribute>())
 		{
 			_uiParserListStore.AppendValues(parser.Key.Id, parser.Key.Name);
@@ -50,6 +52,7 @@ public class MainWindow : Window
 		_uiParserComboBox.PackStart(cellRen, true);
 		_uiParserComboBox.AddAttribute(cellRen, "text", 1);
 
+		// This property is not showing on Glade so :/
 		_uiSaveFileDialogFilter.Name = "Matroska Video File (*.mkv)";
 	}
 
@@ -78,7 +81,7 @@ public class MainWindow : Window
 				MessageType.Warning,
 				ButtonsType.Ok,
 				false,
-				"Cannot detect file format.\n\nYou can manually specify a parser if you know the actual file format.\n\nAlternatively, you can use a custom subfile definition CSV file (specified at the auxiliary file chooser).");
+				"Cannot detect file format.\n\nYou can manually specify a parser if you know the actual file format.\n\nAlternatively, you can use the “unknown format” parser and supply a custom CSV file with the desired subfile listing at the “Custom Subfile Listing File” option.");
 			msgBox.Run();
 			msgBox.Destroy();
 			_uiParserComboBox.SetActiveId(_nullParserId);
@@ -89,7 +92,12 @@ public class MainWindow : Window
 
 	private void UpdateBasedOnParser(object sender, EventArgs e)
 	{
-		_uiAuxInputFileChooser.Sensitive = _uiParserComboBox.ActiveId == _nullParserId;
+		// No action required yet.
+	}
+
+	private void UpdateBasedOnAuxiliaryInputFile(object sender, EventArgs e)
+	{
+		_inputAuxFilePath = _uiAuxInputFileChooser.Filename;
 	}
 
 	private void OnWaterfallPreviewClick(object sender, EventArgs e)
@@ -169,7 +177,8 @@ public class MainWindow : Window
 		{
 			ExporterId = exporterId,
 			InputFilePath = _inputFilePath,
-			InputFileFormatId = _uiParserComboBox.ActiveId
+			InputFileFormatId = _uiParserComboBox.ActiveId,
+			InputAuxiliaryFilePath = _inputAuxFilePath,
 		};
 	}
 }

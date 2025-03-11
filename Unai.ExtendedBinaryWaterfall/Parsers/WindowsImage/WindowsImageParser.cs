@@ -7,8 +7,8 @@ namespace Unai.ExtendedBinaryWaterfall.Parsers.WindowsImage;
 [Parser("wim", "Windows Image (WIM)", [ ".wim" ])]
 public class WindowsImageParser : IParser
 {
-	public Stream InputStream { get => throw new System.NotImplementedException(); set => throw new System.NotImplementedException(); }
-	public Stream AuxiliaryInputStream { get => throw new System.NotImplementedException(); set => throw new System.NotImplementedException(); }
+	public Stream InputStream { get; set; }
+	public Stream AuxiliaryInputStream { get; set; }
 
 	public IEnumerable<SubFile> GetSubFiles()
 	{

@@ -77,6 +77,11 @@ public class AudioBuffer
 
 		for (int i = 0; i < floatPcmBuffer.Length; i++)
 		{
+			if (i / ChannelCount >= Samples[0].Length)
+			{
+				Logger.Warning($"PCM sample at index {i} does not fit inside sample buffer at index {i / ChannelCount}.");
+				return this;
+			}
 			Samples[i % ChannelCount][i / ChannelCount] = floatPcmBuffer[i];
 		}
 

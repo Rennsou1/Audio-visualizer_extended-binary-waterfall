@@ -1,5 +1,7 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace Unai.ExtendedBinaryWaterfall.Parsers.Wad;
@@ -7,6 +9,21 @@ namespace Unai.ExtendedBinaryWaterfall.Parsers.Wad;
 [Parser("wad", "Doom Engine's Asset Archive (WAD)", [ ".wad" ])]
 public class WadParser : IParser
 {
+	public static string[] MapLumps =
+	[
+		"THINGS",
+		"LINEDEFS",
+		"SIDEDEFS",
+		"VERTEXES",
+		"SEGS",
+		"SSECTORS",
+		"NODES",
+		"SECTORS",
+		"REJECT",
+		"BLOCKMAP",
+		"BEHAVIOR", // Hexen
+	];
+
 	public Stream InputStream { get; set; }
 	public Stream AuxiliaryInputStream { get; set; }
 
@@ -23,15 +40,38 @@ public class WadParser : IParser
 
 		br.BaseStream.Position = wadDirectoryOff;
 
+		string currentMap = null;
+		bool isPixelData = false; // flat or sprite
+
 		for (int i = 0; i < wadLumpCount; i++)
 		{
-			var wadLumpOff = br.ReadUInt32();
-			var wadLumpSize = br.ReadUInt32();
-			var wadName = br.ReadString(8).TrimEnd('\0');
+			var lumpDataOff = br.ReadUInt32();
+			var lumpDataLen = br.ReadUInt32();
+			var lumpName = br.ReadString(8).TrimEnd('\0');
 
-			if (wadLumpOff != 0)
+			if (lumpDataLen == 0 && ((lumpName[0] == 'E' && lumpName[2] == 'M') || lumpName.StartsWith("MAP")))
 			{
-				yield return new(wadName, wadLumpOff, wadLumpSize);
+				currentMap = lumpName;
+			}
+			else if (!MapLumps.Contains(lumpName))
+			{
+				currentMap = null;
+			}
+			
+			if (lumpName == "S_START" || lumpName == "F_START")
+			{
+				isPixelData = true;
+			}
+			else if (lumpName == "S_END" || lumpName == "F_END")
+			{
+				isPixelData = false;
+			}
+			
+			if (lumpDataOff + lumpDataLen > 0)
+			{
+				var subfile = new SubFile(currentMap != null ? $"{currentMap}/{lumpName}" : lumpName, lumpDataOff, lumpDataLen);
+				if (isPixelData) subfile.IconString = Utils.GetFileTypeEmojiFromExtension(".bmp");
+				yield return subfile;
 			}
 		}
 	}

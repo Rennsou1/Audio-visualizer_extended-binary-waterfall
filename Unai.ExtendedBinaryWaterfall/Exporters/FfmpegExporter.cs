@@ -36,8 +36,8 @@ public class FfmpegExporter : IExporter
 
 	[CliParameter("FFmpeg Log Level", "ffloglevel")]
 	public int LogLevel { get; set; } = ffmpeg.AV_LOG_INFO;
-	[CliParameter("Output Video File Path", "output", 'o')]
-	public string OutputPath { get; set; } = null;
+	// [CliParameter("Output Video File Path", "output", 'o')]
+	// public string OutputPath { get; set; } = null;
 	[CliParameter("Output Video Bitrate", "output-bitrate")]
 	public uint OutputVideoBitRate { get; set; } = 9_000_000;
 
@@ -68,7 +68,7 @@ public class FfmpegExporter : IExporter
 
 			{
 				AVFormatContext* fmtCtx = null;
-				ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, "matroska", OutputPath ?? "/dev/stdout");
+				ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, "matroska", Generator.OutputFilePath ?? "/dev/stdout");
 				if (fmtCtx == null) Console.Error.WriteLine("cannot allocate AVFormatContext");
 				_fmtCtx = fmtCtx;
 			}
@@ -158,7 +158,7 @@ public class FfmpegExporter : IExporter
 			// output file/stream
 			// ==================
 
-			ret = ffmpeg.avio_open(&_fmtCtx->pb, OutputPath ?? "pipe:", OutputPath != null ? ffmpeg.AVIO_FLAG_READ_WRITE : ffmpeg.AVIO_FLAG_WRITE);
+			ret = ffmpeg.avio_open(&_fmtCtx->pb, Generator.OutputFilePath ?? "pipe:", Generator.OutputFilePath != null ? ffmpeg.AVIO_FLAG_READ_WRITE : ffmpeg.AVIO_FLAG_WRITE);
 			FfmpegUtils.LogIfAvError(ret, "cannot open stdout");
 			AVDictionary* fmtOpts;
 			ret = ffmpeg.avformat_write_header(_fmtCtx, &fmtOpts);
@@ -230,7 +230,7 @@ public class FfmpegExporter : IExporter
 			_videoAvPacket = ffmpeg.av_packet_alloc();
 			_audioAvPacket = ffmpeg.av_packet_alloc();
 
-			ffmpeg.av_dump_format(_fmtCtx, 0, OutputPath ?? "pipe:", 1);
+			ffmpeg.av_dump_format(_fmtCtx, 0, Generator.OutputFilePath ?? "pipe:", 1);
 		}
 		_init = true;
 	}

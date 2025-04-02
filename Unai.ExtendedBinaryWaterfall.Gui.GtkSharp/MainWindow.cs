@@ -133,7 +133,7 @@ public class MainWindow : Window
 		}
 
 		PrepareGenerator("ffmpeg");
-		_generator.AdditionalCliArguments["-o"] = outputFilePath;
+		_generator.OutputFilePath = outputFilePath;
 		
 		_genTaskFinished = false;
 		// _generator.OnFinish += () => Program._renderDialog.Hide();

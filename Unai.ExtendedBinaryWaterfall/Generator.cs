@@ -70,6 +70,8 @@ public class Generator
 	public string InputFilePath { get; set; } = null;
 	[CliParameter("Input File Listing File Path", "file-listing", "Set the file path that contains a text-based file listing if the input file format cannot be parsed entirely by this program")]
 	public string InputAuxiliaryFilePath { get; set; } = null;
+	[CliParameter("Output File Path", "output", 'o', "Set the output video file path")]
+	public string OutputFilePath { get; set; } = null;
 	[CliParameter("Title", "title", 't', "Set the title that will be shown during the binary waterfall describing the target file")]
 	public string Title { get; set; } = null;
 	[CliParameter("Author", "author", 'a', "Set the author of the generated binary waterfall")]

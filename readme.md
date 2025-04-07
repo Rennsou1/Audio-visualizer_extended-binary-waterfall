@@ -30,6 +30,9 @@ This program **reads arbitrary computer files** as **raw audio and video streams
 > [!IMPORTANT]
 > When using Unifont, make sure to install the **TTF format** instead of OTF.
 > It seems that Unifont contains OTF CFF2 tables that makes the text rendering library throw an exception.
+>
+> You can **download** the TTF version from an [**unofficial repository**](https://github.com/multitheftauto/unifont) since it doesn't get officially released by Unifoundry as a TTF file anymore.
+>
 > See the relevant SixLabors Fonts [issue](https://github.com/SixLabors/Fonts/issues/331) and [pull request](https://github.com/SixLabors/Fonts/pull/342) for this specific problem.
 
 ## Build and Run

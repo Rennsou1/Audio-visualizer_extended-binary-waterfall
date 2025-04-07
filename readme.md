@@ -24,9 +24,13 @@ This program **reads arbitrary computer files** as **raw audio and video streams
 	- [Unifont](https://unifoundry.com/unifont/index.html)
 		- Some Linux distros have the option to install this font via their respective package manager, but in Windows a manual download is required.
 		- Make sure to install both the default font and the “upper” variant for emoticons.
-		- Make sure to install the OTF format instead of TTF. There's a known issue with this format that crashes the text rendering library.
 	- [`wimlib`](https://wimlib.net/) for WIM file listings.
 	- `minidump` Python module for Windows Minidump memory region parsing.
+
+> [!IMPORTANT]
+> When using Unifont, make sure to install the **TTF format** instead of OTF.
+> It seems that Unifont contains OTF CFF2 tables that makes the text rendering library throw an exception.
+> See the relevant SixLabors Fonts [issue](https://github.com/SixLabors/Fonts/issues/331) and [pull request](https://github.com/SixLabors/Fonts/pull/342) for this specific problem.
 
 ## Build and Run
 
@@ -77,7 +81,7 @@ SDL is the default exporter if none is specified.
 
 #### Example 3
 
-Read an `.exe` file and preview the FFmpeg encoding result with standard output redirection:
+Read a `.dll` file and preview the FFmpeg encoding result with standard output redirection:
 
 ```sh
 Unai.ExtendedBinaryWaterfall.Cli "C:\Windows\system32\shell32.dll" --exporter=ffmpeg | ffplay -f matroska -

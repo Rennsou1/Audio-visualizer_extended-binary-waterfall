@@ -126,8 +126,8 @@ public class Generator
 	public int AudioOutputChannelCount { get; set; } = 2;
 	[CliParameter("Output Sample Rate", "output-sample-rate")]
 	public int AudioOutputSampleRate { get; set; } = 48000;
-	public int AudioOutputSamplesPerFrame => AudioOutputSampleRate / OutputFps;
-	public int AudioOutputSamplesPerFramePerChannel => AudioOutputSamplesPerFrame / AudioOutputChannelCount;
+	public int AudioOutputSamplesPerFramePerChannel => AudioOutputSampleRate / OutputFps;
+	public int AudioOutputSamplesPerFrame => AudioOutputSamplesPerFramePerChannel * AudioOutputChannelCount;
 	public int AudioOutputBytesPerFrame => AudioOutputSampleFormat.GetByteSize() * AudioOutputSamplesPerFrame;
 
 	#endregion
@@ -502,7 +502,7 @@ public class Generator
 
 			_inputAudioBuffer.LoadFromByteArray(currentAudioBuffer, AudioInputSampleFormat);
 			_outputAudioBuffer = new AudioBuffer(_inputAudioBuffer)
-				.Resample(AudioOutputSamplesPerFrame)
+				.Resample(AudioOutputSamplesPerFramePerChannel)
 				.RemixChannels(AudioOutputChannelCount);
 
 			// Compute registers.

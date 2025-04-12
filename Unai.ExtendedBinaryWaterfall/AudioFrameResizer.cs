@@ -21,6 +21,7 @@ public class AudioFrameResizer<T>
 		{
 			var firstHalfSize = BufferLength - _bufOfs;
 			var secondHalfSize = Math.Abs(BufferLength - newBufOfs);
+			Logger.Trace($"Input audio buffer of size {input.Length} will be divided like this: 0–{firstHalfSize} {firstHalfSize}+{firstHalfSize + secondHalfSize}");
 			Array.Copy(input, 0, _outputBuffer, _bufOfs, firstHalfSize);
 			
 			OutputCallback?.Invoke(_outputBuffer);

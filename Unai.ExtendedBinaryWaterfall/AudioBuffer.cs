@@ -110,6 +110,7 @@ public class AudioBuffer
 		for (int dch = 0; dch < newChannelCount; dch++)
 		{
 			var sch = (int)((dch / (float)newChannelCount) * ChannelCount);
+			newSamples[dch] = new float[SampleCount];
 			Array.Copy(newSamples[dch], Samples[sch], SampleCount);
 		}
 

@@ -19,19 +19,32 @@ public class AudioFrameResizer<T>
 		var newBufOfs = _bufOfs + input.Length;
 		if (newBufOfs >= BufferLength)
 		{
-			var firstHalfSize = BufferLength - _bufOfs;
-			var secondHalfSize = Math.Abs(BufferLength - newBufOfs);
-			Logger.Trace($"Input audio buffer of size {input.Length} will be divided like this: 0–{firstHalfSize} {firstHalfSize}+{firstHalfSize + secondHalfSize}");
-			Array.Copy(input, 0, _outputBuffer, _bufOfs, firstHalfSize);
-			
-			OutputCallback?.Invoke(_outputBuffer);
-			
-			Array.Copy(input, firstHalfSize, _outputBuffer, 0, secondHalfSize);
-			_bufOfs = secondHalfSize;
+			int inputOfs = 0;
+			int outputOfs = _bufOfs;
+			while (inputOfs < input.Length)
+			{
+				int subBufSize = BufferLength - outputOfs;
+				if (inputOfs + subBufSize >= input.Length)
+				{
+					subBufSize = input.Length - inputOfs;
+				}
+				Logger.Trace($"Audio buffer rearrangement: {subBufSize} bytes, {inputOfs}–{inputOfs + subBufSize}/{input.Length} → {outputOfs}-{outputOfs + subBufSize}/{BufferLength}");
+				Array.Copy(input, inputOfs, _outputBuffer, outputOfs, subBufSize);
+				inputOfs += subBufSize;
+				outputOfs += subBufSize;
+				outputOfs %= BufferLength;
 
+				if (inputOfs < input.Length)
+				{
+					Logger.Trace($"Sending output buffer…");
+					OutputCallback?.Invoke(_outputBuffer);
+				}
+			}
+
+			_bufOfs = outputOfs;
 			if (_bufOfs > BufferLength)
 			{
-				Logger.Error($"buffer overrun {_bufOfs} > {BufferLength}");
+				Logger.Warning($"Buffer overrun {_bufOfs} > {BufferLength}");
 				_bufOfs %= BufferLength;
 			}
 		}

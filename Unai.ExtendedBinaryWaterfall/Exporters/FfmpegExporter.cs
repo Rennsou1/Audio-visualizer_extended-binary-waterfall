@@ -80,7 +80,7 @@ public class FfmpegExporter : IExporter
 			// encoders
 			// ========
 
-			AVRational videoFps; videoFps.num = 60; videoFps.den = 1;
+			AVRational videoFps; videoFps.num = Generator.OutputFps; videoFps.den = 1;
 
 			var videoEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
 			var audioEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_AAC);

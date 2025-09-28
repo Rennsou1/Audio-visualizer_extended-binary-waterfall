@@ -145,14 +145,17 @@ public class Generator
 		if (InputFileStream == null)
 		{
 			Logger.Info("Opening files…");
+			Logger.Debug($"Opening file '{InputFilePath}'…");
 			InputFileStream = File.OpenRead(InputFilePath);
 		}
 
-		if (InputAuxiliaryFileStream != null)
+		if (InputAuxiliaryFileStream == null)
 		{
 			if (InputAuxiliaryFilePath != null)
 			{
+				Logger.Debug($"Opening file '{InputAuxiliaryFilePath}'…");
 				InputAuxiliaryFileStream = File.OpenRead(InputAuxiliaryFilePath);
+				Logger.Debug($"  Done ({InputAuxiliaryFileStream.Length / 1024} KiB).");
 			}
 		}
 
@@ -292,6 +295,7 @@ public class Generator
 
 			Parser.InputStream = InputFileStream;
 			Parser.AuxiliaryInputStream = InputAuxiliaryFileStream;
+
 			subFiles = Parser.GetSubFiles();
 
 			_subfiles =

@@ -21,7 +21,8 @@ public static class FfmpegUtils
 
 	private static readonly string[] _ffmpegSearchPathsWindows =
 	[
-		"C:\\ffmpeg"
+		"C:\\ffmpeg",
+		"C:\\ffmpeg\\bin"
 	];
 
 	public static string GetFfmpegLibraryPath()
@@ -31,34 +32,72 @@ public static class FfmpegUtils
 
 		if (Environment.OSVersion.Platform == PlatformID.Win32NT)
 		{
+			// 搜索预定义路径
 			ret = _ffmpegSearchPathsWindows
 				.Where(Directory.Exists)
 				.Where(x => Directory.GetFiles(x, "*avcodec-*.dll").Length > 0);
+
+			if (ret.Any())
+			{
+				Logger.Debug($"Found FFmpeg in predefined path: {ret.First()}");
+				return ret.First();
+			}
+
+			// 搜索 WinGet 安装目录
+			Logger.Debug("Searching WinGet packages folder…");
+			var wingetPath = Path.Combine(
+				Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+				"Microsoft", "WinGet", "Packages");
+			
+			if (Directory.Exists(wingetPath))
+			{
+				try
+				{
+					var ffmpegDirs = Directory.GetDirectories(wingetPath, "*FFmpeg*", SearchOption.TopDirectoryOnly);
+					foreach (var ffmpegDir in ffmpegDirs)
+					{
+						// 递归查找包含 avcodec DLL 的目录
+						var dllDirs = Directory.GetFiles(ffmpegDir, "*avcodec*.dll", SearchOption.AllDirectories);
+						if (dllDirs.Length > 0)
+						{
+							var dllDir = Path.GetDirectoryName(dllDirs[0]);
+							Logger.Debug($"Found FFmpeg in WinGet: {dllDir}");
+							return dllDir;
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Logger.Debug($"Error searching WinGet folder: {ex.Message}");
+				}
+			}
+
+			// 搜索 PATH 环境变量
+			Logger.Debug("Search via predefined paths failed. Trying PATH environment variable…");
+			var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
+			ret = pathVar
+				.Split(';')
+				.Where(p => !string.IsNullOrEmpty(p) && Directory.Exists(p))
+				.Where(p => {
+					try { return Directory.GetFiles(p, "avcodec*.dll").Length > 0; }
+					catch { return false; }
+				});
+
+			if (ret.Any())
+			{
+				Logger.Debug($"Found FFmpeg in PATH: {ret.First()}");
+				return ret.First();
+			}
 		}
 		else
 		{
 			ret = _ffmpegSearchPathsLinux
 				.Where(Directory.Exists)
 				.Where(x => File.Exists($"{x}/libavcodec.so"));
-		}
-		
-		Logger.Debug($"{ret.Count()} detected library paths.");
-		if (ret.Any())
-		{
-			return ret.FirstOrDefault();
-		}
-
-		if (Environment.OSVersion.Platform == PlatformID.Win32NT)
-		{
-			Logger.Debug("Search via predefined paths failed. Trying PATH environment variable…");
-			ret = Environment.GetEnvironmentVariable("PATH")
-				.Split(';')
-				.Where(Directory.Exists)
-				.Where(p => Directory.GetFiles(p, "avcodec*.dll").Length > 0);
-
+			
 			if (ret.Any())
 			{
-				return ret.FirstOrDefault();
+				return ret.First();
 			}
 		}
 
@@ -67,10 +106,7 @@ public static class FfmpegUtils
 		{
 			Logger.Info("Please enter the following command to install FFmpeg libraries:");
 			Logger.Info("	winget install \"FFmpeg (Shared)\"");
-			Logger.Info("Once installed, restart the command line.");
-			Logger.Info("Alternatively, you can download the FFmpeg libraries and save them to the following location:");
-			Logger.Info($"	{_ffmpegSearchPathsWindows[0]}");
-			Logger.Info("Note that these libraries may start with either `libav` or just `av` (e.g: `avcodec-61.dll`).");
+			Logger.Info("Once installed, restart the application.");
 		}
 		return null;
 	}

@@ -47,7 +47,18 @@ public class FfmpegExporter : IExporter
 	{
 		unsafe
 		{
-			ffmpeg.RootPath = FfmpegUtils.GetFfmpegLibraryPath();
+			// 获取 FFmpeg 库路径
+			var ffmpegPath = FfmpegUtils.GetFfmpegLibraryPath();
+			if (string.IsNullOrEmpty(ffmpegPath))
+			{
+				throw new InvalidOperationException(
+					"找不到 FFmpeg 库文件！\n\n" +
+					"请安装 FFmpeg：\n" +
+					"1. 运行命令: winget install \"FFmpeg (Shared)\"\n" +
+					"2. 或下载 FFmpeg 并放到 C:\\ffmpeg 目录\n" +
+					"3. 重启应用程序");
+			}
+			ffmpeg.RootPath = ffmpegPath;
 			Logger.Debug($"FFmpeg library path: '{ffmpeg.RootPath}'.");
 			
 			ffmpeg.av_log_set_level(LogLevel);
@@ -297,7 +308,8 @@ public class FfmpegExporter : IExporter
 		// TODO: move to init method
 		if (_swsCtx == null)
 		{
-			_swsCtx = ffmpeg.sws_getContext(videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFramePre->format, videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFrame->format, ffmpeg.SWS_BILINEAR, null, null, null);
+			// SWS_BILINEAR = 2
+			_swsCtx = ffmpeg.sws_getContext(videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFramePre->format, videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFrame->format, 2, null, null, null);
 			if (_swsCtx == null)
 			{
 				Logger.Error("cannot initialize sws context");

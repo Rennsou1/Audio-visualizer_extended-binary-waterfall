@@ -24,7 +24,7 @@
 		<PackageReference Include="SDL-Sharp" Version="2.2.5" />
 		<PackageReference Include="SDL-Sharp-DLL" Version="2.1.4" />
 		<!-- Used by FfmpegExporter -->
-		<PackageReference Include="FFmpeg.AutoGen" Version="7.0.0" />
+		<PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
 		<!-- Used for real audio decoding (mp3/flac/ogg/wav 等) -->
 		<PackageReference Include="CSCore" Version="1.2.1.2" />
 		<PackageReference Include="CSCore.Ogg" Version="1.0.0.1" />

@@ -62,6 +62,340 @@ public class Generator
     // 公共方法：请求停止生成
     public void RequestStop() => _exitRequested = true;
 
+    public byte[] GetCurrentFrameAsBgra()
+    {
+        if (_frameContent == null) return null;
+        
+        try
+        {
+            var width = _frameContent.Width;
+            var height = _frameContent.Height;
+            var data = new byte[width * height * 4];
+            
+            _frameContent.ProcessPixelRows(pa =>
+            {
+                for (int y = 0; y < pa.Height; y++)
+                {
+                    var row = pa.GetRowSpan(y);
+                    for (int x = 0; x < pa.Width; x++)
+                    {
+                        var pixel = row[x];
+                        int idx = (y * width + x) * 4;
+                        // BGRA 格式（WPF 使用）
+                        data[idx + 0] = pixel.B;
+                        data[idx + 1] = pixel.G;
+                        data[idx + 2] = pixel.R;
+                        data[idx + 3] = pixel.A;
+                    }
+                }
+            });
+            
+            return data;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public int CurrentFrameWidth => _frameContent?.Width ?? 0;
+    public int CurrentFrameHeight => _frameContent?.Height ?? 0;
+
+    // 预览模式初始化（不需要导出器）
+    public void InitializeForPreview()
+    {
+        if (InputFileStream == null && !string.IsNullOrEmpty(InputFilePath))
+        {
+            InputFileStream = System.IO.File.OpenRead(InputFilePath);
+        }
+        
+        InitializeParser();
+        ParseSubfiles();
+        InitializeFonts();
+        UpdateValues();
+        
+        // 初始化音频缓冲
+        _inputAudioBuffer = new(AudioInputSamplesPerFramePerChannel, AudioInputChannelCount);
+        _outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
+    }
+
+    // 渲染指定位置的预览帧（progress: 0-1）
+    public void RenderPreviewFrame(float progress)
+    {
+        if (InputFileStream == null) return;
+        
+        progress = Math.Clamp(progress, 0f, 1f);
+        long currentOffset = (long)(InputFileStream.Length * progress);
+        
+        // 对齐到帧边界
+        currentOffset = currentOffset - (currentOffset % (WaterfallWidth * 4));
+        if (currentOffset < 0) currentOffset = 0;
+        if (currentOffset >= InputFileStream.Length) currentOffset = InputFileStream.Length - WaterfallFrameLength;
+        
+        // 计算帧起始偏移
+        long frameStartByteOffset = currentOffset - (WaterfallFrameLength / 2);
+        int playHeadRelPos = 0;
+        
+        if (frameStartByteOffset < 0)
+        {
+            playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallWidth * 4));
+            frameStartByteOffset = 0;
+        }
+        else if (frameStartByteOffset + WaterfallFrameLength >= InputFileStream.Length)
+        {
+            playHeadRelPos = (int)((InputFileStream.Length - (frameStartByteOffset + WaterfallFrameLength)) / (WaterfallWidth * 4));
+            frameStartByteOffset = InputFileStream.Length - WaterfallFrameLength;
+        }
+        
+        // 读取视频字节
+        InputFileStream.Position = frameStartByteOffset;
+        byte[] currentVideoBuffer = new byte[WaterfallFrameLength];
+        InputFileStream.Read(currentVideoBuffer, 0, WaterfallFrameLength);
+        
+        // 创建瀑布视图
+        _viewportFramebuf?.Dispose();
+        _viewportFramebuf = Image.LoadPixelData<Rgba32>(currentVideoBuffer, WaterfallWidth, WaterfallHeight);
+        _viewportFramebuf.ProcessPixelRows(pa =>
+        {
+            for (int y = 0; y < pa.Height; y++)
+            {
+                var row = pa.GetRowSpan(y);
+                for (int x = 0; x < row.Length; x++)
+                {
+                    row[x].A = 255;
+                }
+            }
+        });
+        _viewportFramebuf.Mutate(vctx => vctx
+            .Flip(FlipMode.Vertical)
+            .Resize(WaterfallScaledWidth, WaterfallScaledHeight, new NearestNeighborResampler()));
+        
+        // 查找当前偏移对应的子文件
+        KeyValuePair<int, SubFile>? currentSubfile = null;
+        float subfileWindowIndex = 0f;
+        for (int sfi = 0; sfi < _subfiles.Count; sfi++)
+        {
+            var sf = _subfiles[sfi];
+            if (currentOffset >= sf.StartOffset && currentOffset < sf.StartOffset + sf.Length)
+            {
+                currentSubfile = new(sfi, sf);
+                subfileWindowIndex = sfi;
+                break;
+            }
+        }
+
+        // 绘制预览帧（完整布局）
+        _frameContent.Mutate(ctx =>
+        {
+            ctx.Clear(new Rgba32(16, 16, 16, 255));
+            
+            float s = ResolutionScale;
+            
+            // 布局参数
+            int rightPanelX1 = _videoFrameX2 + (int)(64 * s);
+            int rightPanelX2 = OutputVideoWidth - (int)(32 * s);
+            int subfileX1 = rightPanelX1;
+            int subfileX2 = rightPanelX2;
+            int audioVisX1 = rightPanelX1;
+            int audioVisX2 = rightPanelX2;
+            float subfileH = 48f * s;
+            float shadowY1 = (OutputVideoHeight / 2f) - subfileH * 8.5f;
+            float shadowY2 = (OutputVideoHeight / 2f) + subfileH * 6.5f;
+            
+            // 右侧面板垂直范围
+            float rightPanelTop = shadowY1 + subfileH * 2f + 16f * s;
+            float rightPanelBottom = shadowY2 - 16f * s;
+            float rightPanelHeight = rightPanelBottom - rightPanelTop;
+            float listHeight = rightPanelHeight * 0.20f;
+            float listTop = rightPanelTop;
+            float listBottom = listTop + listHeight;
+            
+            // 绘制瀑布视图
+            ctx.DrawImage(_viewportFramebuf, new Point(_videoFrameX1, _videoFrameY1), 1f);
+            
+            // 播放指示器
+            ctx.DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(32, (OutputVideoHeight / 2f) + (playHeadRelPos * (WaterfallScaledHeight / (float)WaterfallHeight))),
+                VerticalAlignment = VerticalAlignment.Center,
+            }, "▶", Color.White);
+            
+            // 绘制右上歌曲/子文件列表
+            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 3));
+            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 3));
+            float subfileY = listTop + subfileH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileH;
+            
+            for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
+            {
+                if (sfi < 0 || sfi >= _subfiles.Count)
+                {
+                    subfileY += subfileH;
+                    continue;
+                }
+
+                var subfile = _subfiles[sfi];
+                bool isMainSubfile = sfi == (currentSubfile?.Key ?? -1);
+
+                ctx.DrawText(new RichTextOptions(_font32)
+                {
+                    Origin = new Vector2(subfileX1, subfileY),
+                    VerticalAlignment = VerticalAlignment.Center,
+                }, isMainSubfile ? "▶" : " ", Color.White)
+                .DrawText(new RichTextOptions(_font32)
+                {
+                    Origin = new Vector2(subfileX1 + 32, subfileY),
+                    VerticalAlignment = VerticalAlignment.Center,
+                }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}", Color.White)
+                .DrawText(new RichTextOptions(_font32)
+                {
+                    Origin = new Vector2(subfileX2, subfileY),
+                    HorizontalAlignment = HorizontalAlignment.Right,
+                    VerticalAlignment = VerticalAlignment.Center,
+                }, Utils.ToByteSizeString(subfile.Length), Color.DimGray);
+
+                if (isMainSubfile)
+                {
+                    float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
+                    ctx.DrawText(new RichTextOptions(_font16)
+                    {
+                        Origin = new PointF(subfileX1 + 48, subfileY + 20),
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center,
+                    }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", Color.White)
+                    .DrawProgressBar(percentOfSubfile, subfileX1 + 80, subfileX2, subfileY + 20);
+                }
+
+                subfileY += subfileH;
+            }
+            
+            // 音频可视化占位符区域
+            float audioVisTop = listBottom + 16f;
+            float audioVisBottom = rightPanelBottom;
+            if (audioVisBottom > audioVisTop + 16f)
+            {
+                var audioVisRegion = new RectangleF(audioVisX1, audioVisTop, audioVisX2 - audioVisX1, audioVisBottom - audioVisTop);
+                
+                // 绘制占位符边框和文字
+                ctx.Draw(Color.FromRgba(80, 80, 80, 128), 1f, audioVisRegion);
+                ctx.DrawText(new RichTextOptions(_font24)
+                {
+                    Origin = new Vector2(audioVisRegion.X + audioVisRegion.Width / 2, audioVisRegion.Y + audioVisRegion.Height / 2),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
+                }, "🎵 音频可视化\n（导出时显示波形和频谱）", Color.FromRgba(128, 128, 128, 200));
+            }
+            
+            // 顶部/底部渐变遮罩
+            ctx.Fill(
+                new LinearGradientBrush(
+                    new PointF(0, shadowY1),
+                    new PointF(0, shadowY1 + subfileH * 2f),
+                    GradientRepetitionMode.None,
+                    new(0.5f, Color.FromRgba(16, 16, 16, 255)),
+                    new(1, Color.FromRgba(16, 16, 16, 0))
+                ),
+                new RectangleF(0, shadowY1, OutputVideoWidth, subfileH * 2f)
+            )
+            .Fill(
+                new LinearGradientBrush(
+                    new PointF(0, shadowY2),
+                    new PointF(0, shadowY2 + subfileH * 2f),
+                    GradientRepetitionMode.None,
+                    new(0, Color.FromRgba(16, 16, 16, 0)),
+                    new(0.5f, Color.FromRgba(16, 16, 16, 255))
+                ),
+                new RectangleF(0, shadowY2, OutputVideoWidth, subfileH * 2f)
+            );
+            
+            // 专辑/目录抬头文字
+            string albumHeaderText = "";
+            if (currentSubfile?.Value != null)
+            {
+                var sfValue = currentSubfile.Value.Value;
+                if (!string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
+                {
+                    albumHeaderText = sfValue.AlbumTitle;
+                    if (!string.IsNullOrWhiteSpace(sfValue.AlbumArtistName))
+                    {
+                        albumHeaderText += " // " + sfValue.AlbumArtistName;
+                    }
+                }
+                else
+                {
+                    albumHeaderText = sfValue.FileDirectory ?? "";
+                }
+            }
+            
+            ctx.DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(subfileX1 + 40, rightPanelTop - 24f),
+                VerticalAlignment = VerticalAlignment.Center,
+            }, Utils.TruncateString(albumHeaderText, 72), Color.DimGray);
+            
+            // A/V 设置信息
+            string avSettingsString = $"{OutputVideoWidth}×{OutputVideoHeight} @ {OutputFps} fps\n" +
+                $"{AudioOutputSampleRate / 1000}kHz {AudioOutputChannelCount}ch\n" +
+                $"RGBA (32bpp), {WaterfallWidth} px/line";
+            string readSpeedString = $"{InputBytesPerSecond / 1024} KiB/s";
+            
+            ctx.DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(32, 32),
+            }, "A/V SETTINGS", Color.DimGray)
+            .DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(32, 32 + 24),
+            }, avSettingsString, Color.White)
+            .DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(OutputVideoWidth - 32, 32),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, "ABS. OFFSET", Color.DimGray)
+            .DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(OutputVideoWidth - 32, 32 + 24),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                TextAlignment = TextAlignment.End,
+            }, $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", Color.White)
+            .DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(OutputVideoWidth - 256, 32),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, "BITRATE", Color.DimGray)
+            .DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, readSpeedString, Color.White);
+            
+            // 标题
+            if (!string.IsNullOrEmpty(Title))
+            {
+                ctx.DrawText(new RichTextOptions(_font24)
+                {
+                    Origin = new Vector2(32, OutputVideoHeight - 64),
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                }, "TARGET", Color.DimGray)
+                .DrawText(new RichTextOptions(_font32)
+                {
+                    Origin = new Vector2(32, OutputVideoHeight - 32),
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                }, Title, Color.White);
+            }
+            
+            // 作者
+            if (!string.IsNullOrEmpty(Author))
+            {
+                ctx.DrawText(new RichTextOptions(_font32)
+                {
+                    Origin = new Vector2(OutputVideoWidth / 2f, 32 + 24),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                }, Author, Color.White);
+            }
+        });
+    }
+
     #endregion
 
     #region ImageSharp-specific
@@ -83,21 +417,15 @@ public class Generator
     #region General Parameters
 
     public string InputFilePath { get; set; } = null;
-    [CliParameter("Input File Listing File Path", "file-listing", "Set the file path that contains a text-based file listing if the input file format cannot be parsed entirely by this program")]
     public string InputAuxiliaryFilePath { get; set; } = null;
-    [CliParameter("Output File Path", "output", 'o', "Set the output video file path")]
     public string OutputFilePath { get; set; } = null;
-    [CliParameter("Title", "title", 't', "Set the title that will be shown during the binary waterfall describing the target file")]
     public string Title { get; set; } = null;
-    [CliParameter("Author", "author", 'a', "Set the author of the generated binary waterfall")]
     public string Author { get; set; } = null;
-    [CliParameter("Input File Parser", "parser", 'p', "Force a specific parser for the input file")]
     public string InputFileFormatId { get; set; } = null;
-    [CliParameter("Exporter", "exporter", 'e', "Set the exporter to be used to export the generated binary waterfall")]
     public string ExporterId { get; set; } = null;
-    [CliParameter("Input Bytes per Second", "input-bps", "Set the amount of bytes that will be read per audio/video second")]
+    // 硬件加速类型（仅适用于 FFmpeg 导出器）
+    public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
     public int InputBytesPerSecond { get; set; } = 48000 * 2;
-    [CliParameter("Font Name", "font", "Set the font name to render the on-screen text")]
     public string FontName { get; set; } = null;
     [CliParameter("Font Antialiasing", "font-antialiasing")]
     public bool FontAntialiasing { get => _drawOpts.GraphicsOptions.Antialias; set => _drawOpts.GraphicsOptions.Antialias = value; }
@@ -112,6 +440,8 @@ public class Generator
     public int OutputVideoWidth { get; set; } = 1920;
     [CliParameter("Output Video Height", "output-height")]
     public int OutputVideoHeight { get; set; } = 1080;
+    // 分辨率缩放因子（基于 1080p 标准）
+    public float ResolutionScale => OutputVideoHeight / 1080f;
     [CliParameter("Output Framerate", "output-fps")]
     public int OutputFps { get; set; } = 60;
     public int WaterfallScaledWidth { get; set; } = 768;
@@ -150,7 +480,7 @@ public class Generator
     #region Visualizer Parameters
 
     [CliParameter("Waveform line width (pixels)", "waveform-line-width")]
-    public float WaveformLineWidth { get; set; } = 4f; // 波形线条粗细（像素），默认 4
+    public float WaveformLineWidth { get; set; } = 1f; // 波形线条粗细（像素），默认 1
 
     [CliParameter("Waveform window length in milliseconds", "waveform-length-ms")]
     public float WaveformLengthMs { get; set; } = 50f; // 波形显示窗口长度（毫秒），控制时间轴缩放
@@ -163,6 +493,9 @@ public class Generator
 
     [CliParameter("Spectrum smoothing factor", "spectrum-smoothing")]
     public float SpectrumSmoothing { get; set; } = 0.6f; // 频谱平滑系数，范围 0.1~1
+
+    [CliParameter("FFT size for spectrum analysis (power of 2)", "fft-size")]
+    public int FftSize { get; set; } = 4096; // FFT 大小，必须是 2 的幂次方，范围 512~8192
 
     [CliParameter("Intro fade duration in seconds", "intro-fade-duration")]
     public float IntroFadeDuration { get; set; } = 1.0f; // 开头免责声明的淡入淡出时长（秒）
@@ -330,10 +663,12 @@ public class Generator
             }
         }
 
-        _font48 = _fontFamily.CreateFont(48f, FontStyle.Regular);
-        _font32 = _fontFamily.CreateFont(32f, FontStyle.Regular);
-        _font24 = _fontFamily.CreateFont(24f, FontStyle.Regular);
-        _font16 = _fontFamily.CreateFont(16f, FontStyle.Regular);
+        // 根据分辨率缩放字体大小
+        float scale = ResolutionScale;
+        _font48 = _fontFamily.CreateFont(48f * scale, FontStyle.Regular);
+        _font32 = _fontFamily.CreateFont(32f * scale, FontStyle.Regular);
+        _font24 = _fontFamily.CreateFont(24f * scale, FontStyle.Regular);
+        _font16 = _fontFamily.CreateFont(16f * scale, FontStyle.Regular);
     }
 
     private void InitializeExporter()
@@ -366,6 +701,13 @@ public class Generator
         }
 
         Exporter.Generator = this;
+
+        // 如果是 FFmpeg 导出器，应用硬件加速设置
+        if (Exporter is FfmpegExporter ffmpegExporter)
+        {
+            ffmpegExporter.HardwareAccel = HardwareAccel;
+            Logger.Debug($"Hardware acceleration: {HardwareAccel}");
+        }
 
         if (AdditionalCliArguments.Count > 0)
         {
@@ -569,10 +911,11 @@ public class Generator
         if (_frameContent == null || _frameContent.Width != OutputVideoWidth || _frameContent.Height != OutputVideoHeight)
         {
             _frameContent = new(OutputVideoWidth, OutputVideoHeight);
-            var pixelCount = OutputVideoWidth * OutputVideoHeight;
-
-            WaterfallScaledWidth = (int)(WaterfallWidth * (pixelCount / 691200f));
-            WaterfallScaledHeight = (int)(WaterfallHeight * (pixelCount / 691200f));
+            
+            // 使用分辨率缩放因子来计算瀑布尺寸（基于 1080p 的 768x768）
+            float scale = ResolutionScale;
+            WaterfallScaledWidth = (int)(768 * scale);
+            WaterfallScaledHeight = (int)(768 * scale);
 
             _videoFrameX1 = OutputVideoWidth / (_subfiles.Count > 0 ? 4 : 2) - WaterfallScaledWidth / 2;
             if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
@@ -775,23 +1118,26 @@ public class Generator
                 // 5.1 清屏
                 ctx.Clear(new Rgba32(16, 16, 16, 255));
 
+                // 分辨率缩放因子（所有布局常量都乘以此因子）
+                float s = ResolutionScale;
+
                 // 5.2 右侧整体面板：上部列表 + 下部音频可视化
-                int rightPanelX1 = _videoFrameX2 + 64;       // 瀑布右侧留出间距
-                int rightPanelX2 = OutputVideoWidth - 32;    // 靠右留边
+                int rightPanelX1 = _videoFrameX2 + (int)(64 * s);       // 瀑布右侧留出间距
+                int rightPanelX2 = OutputVideoWidth - (int)(32 * s);    // 靠右留边
                 int subfileX1 = rightPanelX1;
                 int subfileX2 = rightPanelX2;
                 int audioVisX1 = rightPanelX1;
                 int audioVisX2 = rightPanelX2;
 
-                float subfileH = 48f; // 每一行子文件条目的高度
+                float subfileH = 48f * s; // 每一行子文件条目的高度
 
                 // 顶部/底部淡出渐变以画面中线为基准，用于营造整体氛围
                 float shadowY1 = (OutputVideoHeight / 2f) - subfileH * 8.5f;
                 float shadowY2 = (OutputVideoHeight / 2f) + subfileH * 6.5f;
 
                 // 右侧面板整体垂直范围：放在两个淡出区域之间，避免列表/波形/频谱被淡出遮挡
-                float rightPanelTop = shadowY1 + subfileH * 2f + 16f;
-                float rightPanelBottom = shadowY2 - 16f;
+                float rightPanelTop = shadowY1 + subfileH * 2f + 16f * s;
+                float rightPanelBottom = shadowY2 - 16f * s;
                 float rightPanelHeight = rightPanelBottom - rightPanelTop;
                 float listHeight = rightPanelHeight * 0.20f; // 顶部 20% 用于列表
                 float listTop = rightPanelTop;
@@ -1022,505 +1368,387 @@ public class Generator
 
             Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
-            if (_exitRequested) break;
+
+            OnProgress?.Invoke(1f);
+
+            if (_exitRequested)
+            {
+                break;
+            }
         }
     }
 
-    // 计算频谱：Hann窗 + DFT + 对数频率映射
-    private static float[] ComputeSpectrumBins(float[] samples, int fftSize, int binCount, float gamma = 2.0f)
-    {
-        int length = Math.Min(fftSize, samples.Length);
-        if (length <= 0 || binCount <= 0) return Array.Empty<float>();
+    // 频谱平滑缓冲
+    private float[] _smoothedSpectrum = null;
+    // 音频历史缓冲（用于更大的 FFT 窗口以提高低频分辨率）
+    private float[] _audioHistoryBuffer = null;
+    private int _audioHistoryWritePos = 0;
+    // FFT 旋转因子缓存
+    private double[] _fftCosTable = null;
+    private double[] _fftSinTable = null;
+    private int _fftCachedSize = 0;
+    // FFT 输入输出缓冲区复用
+    private double[] _fftReal = null;
+    private double[] _fftImag = null;
+    private float[] _fftMagnitudes = null;
+    // 位逆序查找表
+    private int[] _bitReverseTable = null;
+    // Hann 窗口缓存
+    private float[] _hannWindow = null;
 
-        int n = length;
-        float[] windowed = new float[n];
-        float windowSum = 0f;
+    // 验证并获取有效的 FFT 大小（必须是 2 的幂次方）
+    private int GetValidFftSize()
+    {
+        int size = Math.Clamp(FftSize, 512, 8192);
+        // 确保是 2 的幂次方
+        int power = (int)Math.Log2(size);
+        return 1 << power;
+    }
+
+    // 预计算位逆序查找表
+    private void PrecomputeBitReverseTable(int n)
+    {
+        if (_bitReverseTable != null && _bitReverseTable.Length == n) return;
+        
+        _bitReverseTable = new int[n];
+        int bits = (int)Math.Log2(n);
         for (int i = 0; i < n; i++)
         {
-            float window = 0.5f * (1f - (float)Math.Cos(2 * Math.PI * i / (n - 1)));
-            windowed[i] = samples[i] * window;
-            windowSum += window;
-        }
-
-        float normFactor = 2.0f / windowSum;
-        int halfN = n / 2;
-        float[] magnitudes = new float[halfN];
-        for (int k = 0; k < halfN; k++)
-        {
-            double sumRe = 0, sumIm = 0;
-            for (int t = 0; t < n; t++)
+            int result = 0;
+            int x = i;
+            for (int b = 0; b < bits; b++)
             {
-                double angle = -2.0 * Math.PI * k * t / n;
-                sumRe += windowed[t] * Math.Cos(angle);
-                sumIm += windowed[t] * Math.Sin(angle);
+                result = (result << 1) | (x & 1);
+                x >>= 1;
             }
-            magnitudes[k] = (float)(Math.Sqrt(sumRe * sumRe + sumIm * sumIm) * normFactor);
+            _bitReverseTable[i] = result;
         }
-
-        float[] result = new float[binCount];
-        for (int i = 0; i < binCount; i++)
-        {
-            float posLow = i / (float)binCount;
-            float posHigh = (i + 1) / (float)binCount;
-            float freqLow = (float)Math.Pow(posLow, gamma);
-            float freqHigh = (float)Math.Pow(posHigh, gamma);
-
-            int kLow = Math.Max(1, (int)(freqLow * (halfN - 1)));
-            int kHigh = Math.Max(kLow, (int)(freqHigh * (halfN - 1)));
-            if (kHigh >= halfN) kHigh = halfN - 1;
-
-            float maxMag = 0f;
-            for (int k = kLow; k <= kHigh; k++)
-                if (magnitudes[k] > maxMag) maxMag = magnitudes[k];
-            result[i] = maxMag;
-        }
-        return result;
     }
 
-    // 音频可视化绘制：上半部分为波形，下半部分为频谱
+    // 预计算 Hann 窗口
+    private void PrecomputeHannWindow(int n)
+    {
+        if (_hannWindow != null && _hannWindow.Length == n) return;
+        
+        _hannWindow = new float[n];
+        double factor = 2.0 * Math.PI / (n - 1);
+        for (int i = 0; i < n; i++)
+        {
+            _hannWindow[i] = 0.5f * (1f - (float)Math.Cos(factor * i));
+        }
+    }
+
+    // SIMD 加速的 Cooley-Tukey FFT 实现
+    private void ComputeFFT(double[] real, double[] imag, int n)
+    {
+        // 使用预计算的位逆序表进行重排
+        PrecomputeBitReverseTable(n);
+        for (int i = 0; i < n; i++)
+        {
+            int j = _bitReverseTable[i];
+            if (j > i)
+            {
+                (real[i], real[j]) = (real[j], real[i]);
+                (imag[i], imag[j]) = (imag[j], imag[i]);
+            }
+        }
+
+        // 缓存旋转因子
+        if (_fftCachedSize != n)
+        {
+            _fftCosTable = new double[n / 2];
+            _fftSinTable = new double[n / 2];
+            double angleStep = -2.0 * Math.PI / n;
+            for (int i = 0; i < n / 2; i++)
+            {
+                double angle = angleStep * i;
+                _fftCosTable[i] = Math.Cos(angle);
+                _fftSinTable[i] = Math.Sin(angle);
+            }
+            _fftCachedSize = n;
+        }
+
+        // Cooley-Tukey 蝶形运算（SIMD 优化的内层循环）
+        int vectorSize = Vector<double>.Count;
+        
+        for (int size = 2; size <= n; size *= 2)
+        {
+            int halfSize = size / 2;
+            int tableStep = n / size;
+            
+            for (int i = 0; i < n; i += size)
+            {
+                int j = 0;
+                
+                // SIMD 向量化处理（如果支持且数据量足够）
+                if (Vector.IsHardwareAccelerated && halfSize >= vectorSize)
+                {
+                    for (; j <= halfSize - vectorSize; j += vectorSize)
+                    {
+                        // 加载旋转因子
+                        var cosVec = new Vector<double>(_fftCosTable, j * tableStep);
+                        var sinVec = new Vector<double>(_fftSinTable, j * tableStep);
+                        
+                        // 加载实部和虚部
+                        var realHi = new Vector<double>(real, i + j + halfSize);
+                        var imagHi = new Vector<double>(imag, i + j + halfSize);
+                        var realLo = new Vector<double>(real, i + j);
+                        var imagLo = new Vector<double>(imag, i + j);
+                        
+                        // 复数乘法: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+                        var tRe = realHi * cosVec - imagHi * sinVec;
+                        var tIm = realHi * sinVec + imagHi * cosVec;
+                        
+                        // 蝶形运算
+                        (realLo + tRe).CopyTo(real, i + j);
+                        (imagLo + tIm).CopyTo(imag, i + j);
+                        (realLo - tRe).CopyTo(real, i + j + halfSize);
+                        (imagLo - tIm).CopyTo(imag, i + j + halfSize);
+                    }
+                }
+                
+                // 处理剩余元素（标量运算）
+                for (; j < halfSize; j++)
+                {
+                    int idx = j * tableStep;
+                    double tRe = real[i + j + halfSize] * _fftCosTable[idx] - imag[i + j + halfSize] * _fftSinTable[idx];
+                    double tIm = real[i + j + halfSize] * _fftSinTable[idx] + imag[i + j + halfSize] * _fftCosTable[idx];
+                    
+                    real[i + j + halfSize] = real[i + j] - tRe;
+                    imag[i + j + halfSize] = imag[i + j] - tIm;
+                    real[i + j] += tRe;
+                    imag[i + j] += tIm;
+                }
+            }
+        }
+    }
+
+    // SIMD 加速的幅度计算
+    private void ComputeMagnitudesSimd(double[] real, double[] imag, float[] magnitudes, int halfN, int n)
+    {
+        double scale = 2.0 / n;
+        int vectorSize = Vector<double>.Count;
+        int i = 1;
+        
+        // SIMD 向量化处理
+        if (Vector.IsHardwareAccelerated && halfN >= vectorSize + 1)
+        {
+            var scaleVec = new Vector<double>(scale);
+            for (; i <= halfN - vectorSize; i += vectorSize)
+            {
+                var re = new Vector<double>(real, i);
+                var im = new Vector<double>(imag, i);
+                var magSquared = re * re + im * im;
+                
+                // 逐元素计算平方根并转换为 float
+                for (int k = 0; k < vectorSize && i + k < halfN; k++)
+                {
+                    magnitudes[i + k] = (float)(Math.Sqrt(magSquared[k]) * scale);
+                }
+            }
+        }
+        
+        // 处理剩余元素
+        for (; i < halfN; i++)
+        {
+            magnitudes[i] = (float)(Math.Sqrt(real[i] * real[i] + imag[i] * imag[i]) * scale);
+        }
+    }
+
+    // 音频可视化绘制：简洁专业的设计
     private void DrawAudioVisualizer(IImageProcessingContext ctx, RectangleF region, AudioBuffer audioBuffer)
     {
-        // 音频缓冲区为空时不绘制
-        if (audioBuffer == null || audioBuffer.TotalSampleCount == 0)
-        {
-            return;
-        }
+        if (audioBuffer == null || audioBuffer.TotalSampleCount == 0) return;
 
         int channelCount = audioBuffer.ChannelCount;
         int sampleCount = audioBuffer.SampleCount;
-        if (channelCount <= 0 || sampleCount <= 0)
-        {
-            return;
-        }
+        if (channelCount <= 0 || sampleCount <= 0) return;
 
-        // 将交织 PCM 拆分为每通道数组，并计算平均波形 mono，便于后续频谱与默认波形计算
-        float[] interleaved = audioBuffer.ToArray(); // 当前帧交织格式 PCM
-        float[][] channels = new float[channelCount][]; // 每个通道独立波形
-        for (int ch = 0; ch < channelCount; ch++)
-        {
-            channels[ch] = new float[sampleCount];
-        }
-        float[] mono = new float[sampleCount]; // 各通道平均后的单声道波形
+        // 提取单声道音频数据
+        float[] interleaved = audioBuffer.ToArray();
+        float[] mono = new float[sampleCount];
         for (int i = 0; i < sampleCount; i++)
         {
-            double sum = 0;
-            int usedChannels = 0;
+            float sum = 0f;
             for (int ch = 0; ch < channelCount; ch++)
             {
-                int idx = (i * channelCount) + ch;
-                if (idx >= interleaved.Length)
-                {
-                    break;
-                }
-                float v = interleaved[idx];
-                channels[ch][i] = v;
-                sum += v;
-                usedChannels++;
+                int idx = i * channelCount + ch;
+                if (idx < interleaved.Length) sum += interleaved[idx];
             }
-            mono[i] = usedChannels > 0 ? (float)(sum / usedChannels) : 0f;
+            mono[i] = sum / channelCount;
         }
 
-        // 频谱 FFT 尺寸：使用较大的窗口以获得更好的低频分辨率
-        // 48kHz 采样率下：1024 点 FFT → 约 47 Hz/bin 分辨率
-        // 这比 256 点的 187 Hz/bin 分辨率好很多，能更准确地显示低频
-        int fftSize = Math.Min(1024, mono.Length);
-        if (fftSize < 64)
+        // 布局：上 55% 波形，下 45% 频谱
+        float waveH = region.Height * 0.55f;
+        float specH = region.Height * 0.45f;
+        float waveTop = region.Top;
+        float specTop = waveTop + waveH;
+
+        // 绘制波形
+        DrawWaveform(ctx, new RectangleF(region.Left, waveTop, region.Width, waveH), mono);
+
+        // 绘制频谱
+        DrawSpectrum(ctx, new RectangleF(region.Left, specTop, region.Width, specH), mono);
+    }
+
+    // 波形（折线）
+    private void DrawWaveform(IImageProcessingContext ctx, RectangleF region, float[] samples)
+    {
+        if (samples.Length < 2) return;
+
+        // 显示窗口
+        int windowSize = (int)(AudioOutputSampleRate * WaveformLengthMs / 1000f);
+        windowSize = Math.Clamp(windowSize, 64, samples.Length);
+        int startIdx = samples.Length - windowSize;
+
+        // 归一化
+        float maxAbs = 0.001f;
+        for (int i = 0; i < windowSize; i++)
         {
-            return;
+            float abs = Math.Abs(samples[startIdx + i]);
+            if (abs > maxAbs) maxAbs = abs;
         }
 
-        // 垂直布局：区域上方绘制波形，下方绘制频谱
-        float waveformTop = region.Top;
-        float waveformHeight = region.Height * 0.60f; // 上部 60% 用于波形
-        float spectrumTop = waveformTop + waveformHeight;
-        float spectrumHeight = region.Height - waveformHeight; // 下部区域用于频谱
+        float centerY = region.Top + region.Height / 2f;
+        float amplitude = region.Height * 0.45f;
+        float lineWidth = Math.Max(1.5f, WaveformLineWidth * ResolutionScale);
 
-        // 频谱参数：柱数量和平滑系数，来源于用户可配置参数
-        int barCount = Math.Clamp(SpectrumBarCount, 8, 1024); // 频谱柱数量 8~1024
-        float smoothing = SpectrumSmoothing;
-        if (float.IsNaN(smoothing) || float.IsInfinity(smoothing))
+        // 下采样点数（折线顶点数）
+        int pointCount = Math.Min(512, windowSize);
+        var points = new PointF[pointCount];
+
+        for (int i = 0; i < pointCount; i++)
         {
-            smoothing = 0.6f;
+            // 每个点对应的样本索引
+            int sampleIdx = startIdx + (i * windowSize / pointCount);
+            float v = samples[sampleIdx] / maxAbs;
+
+            float x = region.Left + (i / (float)(pointCount - 1)) * region.Width;
+            float y = centerY - v * amplitude;
+            points[i] = new PointF(x, y);
         }
-        smoothing = Math.Clamp(smoothing, 0.1f, 1f); // 平滑系数限制在 0.1~1
+        ctx.DrawLine(Color.White, lineWidth, points);
+    }
 
-        // 计算频谱柱数据
-        float[] spectrumRaw = ComputeSpectrumBins(mono, fftSize, barCount);
-        int binCount = spectrumRaw.Length;
-        if (binCount > 0)
+    // 频谱绘制：使用历史缓冲实现大 FFT 窗口 + 对数频率映射 + 时间平滑
+    private void DrawSpectrum(IImageProcessingContext ctx, RectangleF region, float[] samples)
+    {
+        // 使用可配置的 FFT 大小（确保是 2 的幂次方）
+        int fftSize = GetValidFftSize();
+        
+        // 初始化或重置历史缓冲
+        if (_audioHistoryBuffer == null || _audioHistoryBuffer.Length != fftSize)
         {
-            // 先转换到 dB 域，使用固定参考电平而非逐帧归一化
-            // 这样可以保持不同音量段之间的相对差异
-            const float minDb = -80f;   // 噪声底（dB）
-            const float maxDb = 0f;     // 参考电平（满幅度）
-            const float dbRange = maxDb - minDb;
+            _audioHistoryBuffer = new float[fftSize];
+            _audioHistoryWritePos = 0;
+        }
+        
+        // 将当前帧样本追加到历史缓冲（循环写入）
+        for (int i = 0; i < samples.Length; i++)
+        {
+            _audioHistoryBuffer[_audioHistoryWritePos] = samples[i];
+            _audioHistoryWritePos = (_audioHistoryWritePos + 1) % fftSize;
+        }
 
-            float[] currentDbValues = new float[binCount];
-            for (int i = 0; i < binCount; i++)
+        int n = fftSize;
+        int halfN = n / 2;
+
+        // 复用 FFT 缓冲区
+        if (_fftReal == null || _fftReal.Length != n)
+        {
+            _fftReal = new double[n];
+            _fftImag = new double[n];
+            _fftMagnitudes = new float[halfN];
+        }
+
+        // 预计算 Hann 窗口
+        PrecomputeHannWindow(n);
+
+        // 准备 FFT 输入：从历史缓冲提取 + 预计算的 Hann 窗
+        for (int i = 0; i < n; i++)
+        {
+            int idx = (_audioHistoryWritePos + i) % n;
+            _fftReal[i] = _audioHistoryBuffer[idx] * _hannWindow[i];
+            _fftImag[i] = 0;
+        }
+
+        // 执行 SIMD 加速的快速 FFT
+        ComputeFFT(_fftReal, _fftImag, n);
+
+        // 使用 SIMD 加速计算幅度谱
+        ComputeMagnitudesSimd(_fftReal, _fftImag, _fftMagnitudes, halfN, n);
+
+        // 频率范围：30Hz ~ 18kHz
+        float freqPerBin = (float)AudioOutputSampleRate / n;
+        float minFreq = 30f;
+        float maxFreq = Math.Min(18000f, AudioOutputSampleRate / 2f * 0.9f);
+
+        // 频谱柱
+        int barCount = Math.Clamp(SpectrumBarCount, 16, 128);
+        float[] bars = new float[barCount];
+
+        // 对数频率映射：每个柱对应不同的频率范围
+        float logMin = (float)Math.Log10(minFreq);
+        float logMax = (float)Math.Log10(maxFreq);
+        float logRange = logMax - logMin;
+
+        for (int i = 0; i < barCount; i++)
+        {
+            float t0 = i / (float)barCount;
+            float t1 = (i + 1) / (float)barCount;
+            float freqLo = (float)Math.Pow(10, logMin + t0 * logRange);
+            float freqHi = (float)Math.Pow(10, logMin + t1 * logRange);
+
+            // 转换为 FFT bin 索引（使用浮点数以支持插值）
+            float binLo = freqLo / freqPerBin;
+            float binHi = freqHi / freqPerBin;
+            int bin0 = Math.Max(1, (int)binLo);
+            int bin1 = Math.Min(halfN - 1, (int)Math.Ceiling(binHi));
+            if (bin1 < bin0) bin1 = bin0;
+
+            // 取该范围内的最大幅度
+            float maxMag = 0f;
+            for (int k = bin0; k <= bin1; k++)
             {
-                float magnitude = spectrumRaw[i];
-                // 幅度转 dBFS: 20 * log10(magnitude)，满幅度正弦波 = 0 dBFS
-                float db = 20f * (float)Math.Log10(magnitude + 1e-10f);
-                currentDbValues[i] = db;
+                if (_fftMagnitudes[k] > maxMag) maxMag = _fftMagnitudes[k];
             }
 
-            // 初始化平滑缓冲
-            if (_lastSpectrumBins == null || _lastSpectrumBins.Length != binCount)
+            // 对数功率刻度（dB）：-60dB ~ 0dB 映射到 0 ~ 1
+            float db = 20f * (float)Math.Log10(maxMag + 1e-10f);
+            bars[i] = Math.Clamp((db + 60f) / 60f, 0f, 1f);
+        }
+
+        // 时间平滑（快攻慢放）
+        if (_smoothedSpectrum == null || _smoothedSpectrum.Length != barCount)
+        {
+            _smoothedSpectrum = new float[barCount];
+            Array.Copy(bars, _smoothedSpectrum, barCount);
+        }
+
+        float release = Math.Clamp(SpectrumSmoothing, 0.3f, 0.95f);
+        for (int i = 0; i < barCount; i++)
+        {
+            if (bars[i] > _smoothedSpectrum[i])
             {
-                _lastSpectrumBins = new float[binCount];
-                Array.Copy(currentDbValues, _lastSpectrumBins, binCount);
+                _smoothedSpectrum[i] = _smoothedSpectrum[i] * 0.2f + bars[i] * 0.8f;
             }
-
-            // 快速上升、适度下降的平滑策略（在 dB 域进行）
-            // 攻击：几乎瞬时响应（系数接近 1）
-            // 释放：根据用户 smoothing 参数调节，但保持足够的动态感
-            float attackCoeff = 0.9f;                      // 上升时的跟随系数（越大越快）
-            float releaseCoeff = smoothing;                // 直接使用用户设置的平滑系数作为释放速度
-
-            for (int i = 0; i < binCount; i++)
+            else
             {
-                float prev = _lastSpectrumBins[i];
-                float curr = currentDbValues[i];
-
-                if (curr > prev)
-                {
-                    // 信号上升：几乎瞬时跟随，让频谱对节拍有即时反应
-                    _lastSpectrumBins[i] = prev + (curr - prev) * attackCoeff;
-                }
-                else
-                {
-                    // 信号下降：根据 smoothing 参数控制衰减速度
-                    // smoothing 越大，衰减越快（更有动感）；越小，衰减越慢（更平滑）
-                    _lastSpectrumBins[i] = prev + (curr - prev) * releaseCoeff;
-                }
-            }
-
-            // 高频补偿：人耳对高频不太敏感，适当提升高频显示
-            float[] dbToDraw = new float[binCount];
-            for (int j = 0; j < binCount; j++)
-            {
-                float t = j / (float)Math.Max(1, binCount - 1); // 0..1
-                // 高频提升曲线：低频不变，高频最多提升 12 dB
-                float boost = t * t * 12f;
-                dbToDraw[j] = _lastSpectrumBins[j] + boost;
-            }
-
-            // 峰值保持：跟踪每个柱的历史峰值，缓慢衰减
-            // 这是专业频谱仪的常见功能，可以更好地显示瞬态峰值
-            if (_spectrumPeakHold == null || _spectrumPeakHold.Length != binCount)
-            {
-                _spectrumPeakHold = new float[binCount];
-                for (int i = 0; i < binCount; i++)
-                {
-                    _spectrumPeakHold[i] = minDb;
-                }
-            }
-
-            // 峰值衰减速度：每帧下降约 0.5 dB（60fps 下约 30 dB/秒）
-            const float peakDecayPerFrame = 0.5f;
-            for (int i = 0; i < binCount; i++)
-            {
-                float currentDb = dbToDraw[i];
-                if (currentDb > _spectrumPeakHold[i])
-                {
-                    // 新峰值：立即更新
-                    _spectrumPeakHold[i] = currentDb;
-                }
-                else
-                {
-                    // 缓慢衰减
-                    _spectrumPeakHold[i] -= peakDecayPerFrame;
-                    if (_spectrumPeakHold[i] < minDb)
-                    {
-                        _spectrumPeakHold[i] = minDb;
-                    }
-                }
-            }
-
-            // 绘制频谱柱和峰值指示器
-            float barWidth = region.Width / binCount;
-            float barGap = barWidth * 0.15f;  // 柱子之间的间隙
-            float actualBarWidth = barWidth - barGap;
-
-            for (int i = 0; i < binCount; i++)
-            {
-                float barX = region.Left + (i * barWidth) + (barGap / 2f);
-
-                // 将 dB 值映射到 [0, 1] 显示高度
-                float normalized = (dbToDraw[i] - minDb) / dbRange;
-                normalized = Math.Clamp(normalized, 0f, 1f);
-
-                float barHeight = normalized * spectrumHeight;
-                if (barHeight < 1f) barHeight = 1f;  // 最小 1 像素
-
-                // 绘制主频谱柱
-                var barRect = new RectangleF(
-                    barX,
-                    spectrumTop + (spectrumHeight - barHeight),
-                    actualBarWidth,
-                    barHeight);
-                ctx.Fill(Color.White, barRect);
-
-                // 绘制峰值指示器（细线）
-                float peakNormalized = (_spectrumPeakHold[i] - minDb) / dbRange;
-                peakNormalized = Math.Clamp(peakNormalized, 0f, 1f);
-                float peakY = spectrumTop + (spectrumHeight * (1f - peakNormalized));
-
-                // 只有当峰值高于当前柱高时才绘制峰值指示器
-                if (peakNormalized > normalized + 0.02f)
-                {
-                    var peakRect = new RectangleF(
-                        barX,
-                        peakY,
-                        actualBarWidth,
-                        2f);  // 2 像素高的峰值指示线
-                    ctx.Fill(Color.Gray, peakRect);
-                }
+                _smoothedSpectrum[i] = _smoothedSpectrum[i] * release + bars[i] * (1f - release);
             }
         }
 
-        // 波形部分：根据 WaveformLengthMs 与 WaveformMode 生成可视窗口波形，并进行归一化
-        int windowSamples = (int)(AudioOutputSampleRate * WaveformLengthMs / 1000f); // 目标窗口长度（样本数）
-        if (windowSamples < 8)
+        // 绘制
+        float barWidth = region.Width / barCount;
+        float gap = barWidth * 0.15f;
+        float actualWidth = barWidth - gap;
+
+        for (int i = 0; i < barCount; i++)
         {
-            windowSamples = 8;
-        }
-        if (windowSamples > sampleCount)
-        {
-            windowSamples = sampleCount;
-        }
-        int windowStart = sampleCount - windowSamples; // 使用当前帧最后一段样本作为可视窗口
-
-        string mode = (WaveformMode ?? "average").ToLowerInvariant(); // 波形显示模式
-        bool drawStereo = false;
-        float[] waveMain = null;   // 单声道波形
-        float[] waveLeft = null;   // 立体声左通道
-        float[] waveRight = null;  // 立体声右通道
-
-        bool hasLeft = channelCount >= 1;
-        bool hasRight = channelCount >= 2;
-
-        switch (mode)
-        {
-            case "left":
-                // 只显示左声道
-                waveMain = new float[windowSamples];
-                for (int i = 0; i < windowSamples; i++)
-                {
-                    waveMain[i] = hasLeft ? channels[0][windowStart + i] : 0f;
-                }
-                break;
-
-            case "right":
-                // 只显示右声道（若无右声道则退回左声道）
-                waveMain = new float[windowSamples];
-                if (hasRight)
-                {
-                    for (int i = 0; i < windowSamples; i++)
-                    {
-                        waveMain[i] = channels[1][windowStart + i];
-                    }
-                }
-                else if (hasLeft)
-                {
-                    for (int i = 0; i < windowSamples; i++)
-                    {
-                        waveMain[i] = channels[0][windowStart + i];
-                    }
-                }
-                else
-                {
-                    Array.Clear(waveMain, 0, waveMain.Length);
-                }
-                break;
-
-            case "diffavg":
-                // 左右声道差值：反映立体声宽度
-                waveMain = new float[windowSamples];
-                if (hasLeft && hasRight)
-                {
-                    for (int i = 0; i < windowSamples; i++)
-                    {
-                        float l = channels[0][windowStart + i];
-                        float r = channels[1][windowStart + i];
-                        waveMain[i] = (l - r) * 0.5f;
-                    }
-                }
-                else
-                {
-                    Array.Clear(waveMain, 0, waveMain.Length);
-                }
-                break;
-
-            case "stereo":
-                // 立体声：同时绘制左右两个波形，并共享同一归一化因子
-                drawStereo = true;
-                waveLeft = new float[windowSamples];
-                waveRight = new float[windowSamples];
-                for (int i = 0; i < windowSamples; i++)
-                {
-                    waveLeft[i] = hasLeft ? channels[0][windowStart + i] : 0f;
-                    if (hasRight)
-                    {
-                        waveRight[i] = channels[1][windowStart + i];
-                    }
-                    else
-                    {
-                        waveRight[i] = waveLeft[i];
-                    }
-                }
-                break;
-
-            default:
-                // average（默认）：所有声道平均
-                waveMain = new float[windowSamples];
-                for (int i = 0; i < windowSamples; i++)
-                {
-                    waveMain[i] = mono[windowStart + i];
-                }
-                break;
-        }
-
-        // 对选中的波形进行归一化，使波形在可视区域内充分占用高度
-        const float minNorm = 1e-6f;
-        if (drawStereo && waveLeft != null && waveRight != null)
-        {
-            // stereo 模式：左右声道共享同一个归一化因子
-            float maxAbs = 0f;
-            for (int i = 0; i < windowSamples; i++)
-            {
-                float a = Math.Abs(waveLeft[i]);
-                if (a > maxAbs) maxAbs = a;
-                float b = Math.Abs(waveRight[i]);
-                if (b > maxAbs) maxAbs = b;
-            }
-            if (maxAbs < minNorm)
-            {
-                maxAbs = 1f;
-            }
-            float inv = 1f / maxAbs;
-            for (int i = 0; i < windowSamples; i++)
-            {
-                waveLeft[i] *= inv;
-                waveRight[i] *= inv;
-            }
-        }
-        else if (waveMain != null)
-        {
-            float maxAbs = 0f;
-            for (int i = 0; i < windowSamples; i++)
-            {
-                float a = Math.Abs(waveMain[i]);
-                if (a > maxAbs) maxAbs = a;
-            }
-            if (maxAbs < minNorm)
-            {
-                maxAbs = 1f;
-            }
-            float inv = 1f / maxAbs;
-            for (int i = 0; i < windowSamples; i++)
-            {
-                waveMain[i] *= inv;
-            }
-        }
-
-        // 使用 Min/Max 包络线渲染波形（类似 DAW 风格）
-        // 每个像素列计算对应样本范围的最小值和最大值，绘制垂直线段
-        // 这样可以保留瞬态细节，比单点采样更专业
-        // 列数设为区域实际宽度，最大 2048 像素以支持高分辨率显示
-        int columnCount = (int)region.Width;
-        if (columnCount < 8) columnCount = 8;
-        if (columnCount > 2048) columnCount = 2048;
-
-        float lineWidth = WaveformLineWidth;
-        if (lineWidth <= 0f || float.IsNaN(lineWidth) || float.IsInfinity(lineWidth))
-        {
-            lineWidth = 2f;
-        }
-
-        var waveformBrush = new SolidBrush(Color.White);
-
-        if (!drawStereo && waveMain != null)
-        {
-            float centerY = waveformTop + (waveformHeight / 2f);
-            float halfHeight = waveformHeight / 2f;
-
-            // 计算每列对应的样本数
-            float samplesPerColumn = windowSamples / (float)columnCount;
-
-            for (int col = 0; col < columnCount; col++)
-            {
-                // 该列对应的样本范围
-                int startSample = (int)(col * samplesPerColumn);
-                int endSample = (int)((col + 1) * samplesPerColumn);
-                if (endSample > windowSamples) endSample = windowSamples;
-                if (startSample >= endSample) continue;
-
-                // 找出该范围内的最小和最大值
-                float minVal = float.MaxValue;
-                float maxVal = float.MinValue;
-                for (int s = startSample; s < endSample; s++)
-                {
-                    float v = waveMain[s];
-                    if (v < minVal) minVal = v;
-                    if (v > maxVal) maxVal = v;
-                }
-
-                // 转换为屏幕坐标并绘制垂直线段
-                float x = region.Left + (col / (float)(columnCount - 1)) * region.Width;
-                float yMin = centerY - (maxVal * halfHeight); // maxVal 在上方
-                float yMax = centerY - (minVal * halfHeight); // minVal 在下方
-
-                // 确保至少有 1 像素高度
-                if (yMax - yMin < 1f) yMax = yMin + 1f;
-
-                ctx.Fill(waveformBrush, new RectangleF(x - lineWidth / 2f, yMin, lineWidth, yMax - yMin));
-            }
-        }
-        else if (drawStereo && waveLeft != null && waveRight != null)
-        {
-            // 立体声：上下两个波形区域
-            float centerYLeft = waveformTop + (waveformHeight * 0.25f);
-            float halfHeightLeft = waveformHeight * 0.22f;  // 留一点间距
-            float centerYRight = waveformTop + (waveformHeight * 0.75f);
-            float halfHeightRight = waveformHeight * 0.22f;
-
-            float samplesPerColumn = windowSamples / (float)columnCount;
-
-            for (int col = 0; col < columnCount; col++)
-            {
-                int startSample = (int)(col * samplesPerColumn);
-                int endSample = (int)((col + 1) * samplesPerColumn);
-                if (endSample > windowSamples) endSample = windowSamples;
-                if (startSample >= endSample) continue;
-
-                // 左声道 min/max
-                float minL = float.MaxValue, maxL = float.MinValue;
-                float minR = float.MaxValue, maxR = float.MinValue;
-                for (int s = startSample; s < endSample; s++)
-                {
-                    float vL = waveLeft[s];
-                    float vR = waveRight[s];
-                    if (vL < minL) minL = vL;
-                    if (vL > maxL) maxL = vL;
-                    if (vR < minR) minR = vR;
-                    if (vR > maxR) maxR = vR;
-                }
-
-                float x = region.Left + (col / (float)(columnCount - 1)) * region.Width;
-
-                // 左声道
-                float yMinL = centerYLeft - (maxL * halfHeightLeft);
-                float yMaxL = centerYLeft - (minL * halfHeightLeft);
-                if (yMaxL - yMinL < 1f) yMaxL = yMinL + 1f;
-                ctx.Fill(waveformBrush, new RectangleF(x - lineWidth / 2f, yMinL, lineWidth, yMaxL - yMinL));
-
-                // 右声道
-                float yMinR = centerYRight - (maxR * halfHeightRight);
-                float yMaxR = centerYRight - (minR * halfHeightRight);
-                if (yMaxR - yMinR < 1f) yMaxR = yMinR + 1f;
-                ctx.Fill(waveformBrush, new RectangleF(x - lineWidth / 2f, yMinR, lineWidth, yMaxR - yMinR));
-            }
+            float x = region.Left + i * barWidth + gap / 2f;
+            float h = Math.Max(2f, _smoothedSpectrum[i] * region.Height);
+            float y = region.Top + region.Height - h;
+            ctx.Fill(Color.White, new RectangleF(x, y, actualWidth, h));
         }
     }
 

@@ -14,45 +14,28 @@ public class AudioFrameResizer<T>
 	}
 	public Action<T[]> OutputCallback { get; set; } = null;
 
+	// 将输入数据推入缓冲区，当缓冲区满时调用 OutputCallback
 	public void Push(T[] input)
 	{
-		var newBufOfs = _bufOfs + input.Length;
-		if (newBufOfs >= BufferLength)
+		int inputOfs = 0;
+		
+		while (inputOfs < input.Length)
 		{
-			int inputOfs = 0;
-			int outputOfs = _bufOfs;
-			while (inputOfs < input.Length)
+			// 计算本次可以复制多少数据
+			int spaceLeft = BufferLength - _bufOfs;
+			int toCopy = Math.Min(spaceLeft, input.Length - inputOfs);
+			
+			// 复制数据到缓冲区
+			Array.Copy(input, inputOfs, _outputBuffer, _bufOfs, toCopy);
+			inputOfs += toCopy;
+			_bufOfs += toCopy;
+			
+			// 缓冲区满时输出并重置
+			if (_bufOfs >= BufferLength)
 			{
-				int subBufSize = BufferLength - outputOfs;
-				if (inputOfs + subBufSize >= input.Length)
-				{
-					subBufSize = input.Length - inputOfs;
-				}
-				Logger.Trace($"Audio buffer rearrangement: {subBufSize} bytes, {inputOfs}–{inputOfs + subBufSize}/{input.Length} → {outputOfs}-{outputOfs + subBufSize}/{BufferLength}");
-				Array.Copy(input, inputOfs, _outputBuffer, outputOfs, subBufSize);
-				inputOfs += subBufSize;
-				outputOfs += subBufSize;
-				outputOfs %= BufferLength;
-
-				if (inputOfs < input.Length)
-				{
-					Logger.Trace($"Sending output buffer…");
-					OutputCallback?.Invoke(_outputBuffer);
-				}
-			}
-
-			_bufOfs = outputOfs;
-			if (_bufOfs > BufferLength)
-			{
-				Logger.Warning($"Buffer overrun {_bufOfs} > {BufferLength}");
-				_bufOfs %= BufferLength;
+				OutputCallback?.Invoke(_outputBuffer);
+				_bufOfs = 0;
 			}
 		}
-		else
-		{
-			Array.Copy(input, 0, _outputBuffer, _bufOfs, input.Length);
-			_bufOfs += input.Length;
-		}
-		Logger.Trace($"audio buf status: filled {_bufOfs,4}/{BufferLength,4} {BufferLength - _bufOfs} bytes left");
 	}
 }

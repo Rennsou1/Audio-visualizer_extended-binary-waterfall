@@ -6,6 +6,16 @@ using SixLabors.ImageSharp.PixelFormats;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
+// 硬件加速类型枚举
+public enum HardwareAccelType
+{
+	Auto,    // 自动检测可用的硬件加速
+	None,    // 不使用硬件加速（纯软件编码）
+	NVENC,   // NVIDIA NVENC
+	QSV,     // Intel Quick Sync Video
+	AMF      // AMD Advanced Media Framework
+}
+
 [Exporter("ffmpeg", "FFmpeg Stream", "Use FFmpeg libraries to encode audio and video data and output it in Matroska format.")]
 public class FfmpegExporter : IExporter
 {
@@ -25,10 +35,14 @@ public class FfmpegExporter : IExporter
 	private unsafe AVPacket* _audioAvPacket;
 
 	private unsafe SwsContext* _swsCtx;
+	// 复用的像素数据缓冲区，避免每帧分配
+	private byte[] _pixelDataBuffer = null;
 
 	private readonly AudioFrameResizer<float> _audioQueue = new();
 
 	private int _frameNum = 0;
+	// 音频样本计数器（用于正确计算音频 PTS）
+	private long _audioSampleCount = 0;
 
 	public Generator Generator { get; set; }
 	
@@ -41,7 +55,45 @@ public class FfmpegExporter : IExporter
 	[CliParameter("Output Video Bitrate", "output-bitrate")]
 	public uint OutputVideoBitRate { get; set; } = 9_000_000;
 
+	// 硬件加速类型：Auto=自动检测, None=软件编码, NVENC=NVIDIA, QSV=Intel, AMF=AMD
+	[CliParameter("Hardware Acceleration", "hwaccel")]
+	public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
+
 	#endregion
+
+	// 尝试查找可用的硬件编码器，返回编码器名称
+	private unsafe AVCodec* FindVideoEncoder()
+	{
+		AVCodec* encoder = null;
+		
+		// 按优先级尝试不同的硬件编码器
+		string[] encodersToTry = HardwareAccel switch
+		{
+			HardwareAccelType.NVENC => new[] { "h264_nvenc" },
+			HardwareAccelType.QSV => new[] { "h264_qsv" },
+			HardwareAccelType.AMF => new[] { "h264_amf" },
+			HardwareAccelType.Auto => new[] { "h264_nvenc", "h264_qsv", "h264_amf", "libx264" },
+			_ => new[] { "libx264" }
+		};
+
+		foreach (var encoderName in encodersToTry)
+		{
+			encoder = ffmpeg.avcodec_find_encoder_by_name(encoderName);
+			if (encoder != null)
+			{
+				Logger.Info($"使用视频编码器: {encoderName}");
+				return encoder;
+			}
+		}
+
+		// 回退到默认 H.264 编码器
+		encoder = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
+		if (encoder != null)
+		{
+			Logger.Info("使用默认 H.264 软件编码器");
+		}
+		return encoder;
+	}
 
 	public void InitializeFfmpeg()
 	{
@@ -92,17 +144,26 @@ public class FfmpegExporter : IExporter
 			// ========
 
 			AVRational videoFps; videoFps.num = Generator.OutputFps; videoFps.den = 1;
+			// 使用音频采样率作为视频 time_base，确保音视频完美同步
+			// 视频 PTS = 帧号 × (采样率 / fps)
+			int videoTimeBaseDen = Generator.AudioOutputSampleRate;
 
-			var videoEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
+			// 使用硬件加速编码器（如果可用）
+			var videoEnc = FindVideoEncoder();
+			if (videoEnc == null)
+			{
+				throw new InvalidOperationException("找不到可用的视频编码器！");
+			}
 			var audioEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_AAC);
 
 			_videoCtx = ffmpeg.avcodec_alloc_context3(videoEnc);
 			_videoCtx->codec_type = AVMediaType.AVMEDIA_TYPE_VIDEO;
 			_videoCtx->pix_fmt = AVPixelFormat.AV_PIX_FMT_YUV420P;
-			_videoCtx->width = 1920;
-			_videoCtx->height = 1080;
+			_videoCtx->width = Generator.OutputVideoWidth;
+			_videoCtx->height = Generator.OutputVideoHeight;
+			// 视频 time_base = 1/采样率，与音频一致
 			_videoCtx->time_base.num = 1;
-			_videoCtx->time_base.den = videoFps.num;
+			_videoCtx->time_base.den = videoTimeBaseDen;
 			_videoCtx->framerate.num = videoFps.num;
 			_videoCtx->framerate.den = videoFps.den;
 			_videoCtx->bit_rate = OutputVideoBitRate;
@@ -183,8 +244,8 @@ public class FfmpegExporter : IExporter
 
 			_videoAvFrame = ffmpeg.av_frame_alloc();
 			_videoAvFrame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
-			_videoAvFrame->width = 1920;
-			_videoAvFrame->height = 1080;
+			_videoAvFrame->width = Generator.OutputVideoWidth;
+			_videoAvFrame->height = Generator.OutputVideoHeight;
 			_videoAvFrame->time_base = _videoStream->time_base;
 
 			ret = ffmpeg.av_frame_get_buffer(_videoAvFrame, 0);
@@ -192,8 +253,8 @@ public class FfmpegExporter : IExporter
 
 			_videoAvFramePre = ffmpeg.av_frame_alloc();
 			_videoAvFramePre->format = (int)AVPixelFormat.AV_PIX_FMT_RGBA;
-			_videoAvFramePre->width = 1920;
-			_videoAvFramePre->height = 1080;
+			_videoAvFramePre->width = Generator.OutputVideoWidth;
+			_videoAvFramePre->height = Generator.OutputVideoHeight;
 			_videoAvFramePre->time_base = _videoStream->time_base;
 
 			ret = ffmpeg.av_frame_get_buffer(_videoAvFramePre, 0);
@@ -222,14 +283,21 @@ public class FfmpegExporter : IExporter
 			_audioQueue.BufferLength = _audioAvFrame->nb_samples * _audioAvFrame->ch_layout.nb_channels;
 			_audioQueue.OutputCallback = (buf) =>
 			{
+				// 设置正确的音频 PTS（基于已编码的样本数）
+				_audioAvFrame->pts = _audioSampleCount;
+				
 				float* ab0 = (float*)_audioAvFrame->data[0];
 				float* ab1 = (float*)_audioAvFrame->data[1];
-				for (int i = 0; i < _audioAvFrame->linesize[0] / sizeof(float); i++)
+				int samplesPerChannel = _audioAvFrame->nb_samples;
+				for (int i = 0; i < samplesPerChannel; i++)
 				{
 					ab0[i] = buf[i * 2];
 					ab1[i] = buf[i * 2 + 1];
 				}
 				DoEncode(_audioCtx, _audioStream, _audioAvFrame, _audioAvPacket);
+				
+				// 更新音频样本计数
+				_audioSampleCount += samplesPerChannel;
 			};
 
 			Logger.Debug($"video original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
@@ -302,8 +370,7 @@ public class FfmpegExporter : IExporter
 		ret = ffmpeg.av_frame_make_writable(_audioAvFrame);
 		FfmpegUtils.LogIfAvError(ret, "cannot make audio sample buffer writable");
 
-		_audioAvFrame->pts = (long)(_audioAvFrame->sample_rate * (_frameNum / (float)Generator.OutputFps));
-		_audioAvFrame->duration = Generator.AudioOutputSamplesPerFrame;
+		// 音频 PTS 现在在 _audioQueue.OutputCallback 中设置
 
 		// TODO: move to init method
 		if (_swsCtx == null)
@@ -318,11 +385,30 @@ public class FfmpegExporter : IExporter
 
 		if (_swsCtx != null)
 		{
-			var pixelData = new byte[videoFrame.Width * videoFrame.Height * 4];
-			videoFrame.CopyPixelDataTo(pixelData);
+			// 复用像素数据缓冲区
+			int requiredSize = videoFrame.Width * videoFrame.Height * 4;
+			if (_pixelDataBuffer == null || _pixelDataBuffer.Length < requiredSize)
+			{
+				_pixelDataBuffer = new byte[requiredSize];
+			}
+			videoFrame.CopyPixelDataTo(_pixelDataBuffer);
 
-			Marshal.Copy(pixelData, 0, (nint)_videoAvFramePre->data[0], pixelData.Length);
-			ffmpeg.sws_scale(_swsCtx, _videoAvFramePre->data, _videoAvFramePre->linesize, 0, _videoAvFramePre->height, _videoAvFrame->data, _videoAvFrame->linesize);
+			// 使用正确的 linesize 进行 sws_scale
+			// 输入数据的 linesize 是 width * 4 (RGBA)
+			int srcLinesize = videoFrame.Width * 4;
+			
+			fixed (byte* srcData = _pixelDataBuffer)
+			{
+				// 创建源数据指针数组
+				byte_ptrArray8 srcDataArray = new byte_ptrArray8();
+				srcDataArray[0] = srcData;
+				
+				// 创建源 linesize 数组
+				int_array8 srcLinesizeArray = new int_array8();
+				srcLinesizeArray[0] = srcLinesize;
+				
+				ffmpeg.sws_scale(_swsCtx, srcDataArray, srcLinesizeArray, 0, videoFrame.Height, _videoAvFrame->data, _videoAvFrame->linesize);
+			}
 		}
 		else if (_videoAvFrame->format == (int)AVPixelFormat.AV_PIX_FMT_GBRP)
 		{
@@ -346,8 +432,11 @@ public class FfmpegExporter : IExporter
 
 		_videoAvFrame->time_base.num = _videoCtx->time_base.num;
 		_videoAvFrame->time_base.den = _videoCtx->time_base.den;
-		_videoAvFrame->pts = _frameNum;
-		_videoAvFrame->duration = 1;
+		// 视频 PTS = 帧号 × 每帧采样数，与音频完美同步
+		// 例如 60fps @ 48kHz: 每帧 800 采样
+		long samplesPerFrame = Generator.AudioOutputSampleRate / Generator.OutputFps;
+		_videoAvFrame->pts = _frameNum * samplesPerFrame;
+		_videoAvFrame->duration = samplesPerFrame;
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
 
 		_audioQueue.Push(audioFrame.ToArray());

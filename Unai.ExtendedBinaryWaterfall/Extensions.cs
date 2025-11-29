@@ -13,14 +13,23 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 public static class Extensions
 {
-	public static void DrawProgressBar(this IImageProcessingContext ictx, float percent, int x1, int x2, float y)
+	// 绘制进度条，支持可选的不透明度参数（用于淡入淡出效果）
+	public static void DrawProgressBar(this IImageProcessingContext ictx, float percent, int x1, int x2, float y, float opacity = 1f)
 	{
 		percent = Math.Clamp(percent, 0, 1);
+		opacity = Math.Clamp(opacity, 0f, 1f);
 
-		ictx.DrawLine(new(), new SolidBrush(Color.FromRgb(32, 32, 32)), 8,
+		// 根据 opacity 调整颜色的 alpha 通道
+		byte bgAlpha = (byte)(255 * opacity * 0.5f);  // 背景色半透明
+		byte fgAlpha = (byte)(255 * opacity);          // 前景色
+
+		var bgColor = Color.FromRgba(32, 32, 32, bgAlpha);
+		var fgColor = Color.FromRgba(192, 192, 192, fgAlpha); // Silver
+
+		ictx.DrawLine(new(), new SolidBrush(bgColor), 8,
 				new PointF(x1, y),
 				new PointF(x2, y)
-			).DrawLine(new(), new SolidBrush(Color.Silver), 8,
+			).DrawLine(new(), new SolidBrush(fgColor), 8,
 				new PointF(x1, y),
 				new PointF(x1 + (x2 - x1) * percent, y)
 			);

@@ -28,6 +28,8 @@
 		<!-- Used for real audio decoding (mp3/flac/ogg/wav 等) -->
 		<PackageReference Include="CSCore" Version="1.2.1.2" />
 		<PackageReference Include="CSCore.Ogg" Version="1.0.0.1" />
+		<!-- Used for reading audio metadata (album/artist/genre 等) -->
+		<PackageReference Include="TagLibSharp" Version="2.3.0" />
 	</ItemGroup>
 
 </Project>

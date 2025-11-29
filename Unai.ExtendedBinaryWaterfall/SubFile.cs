@@ -12,6 +12,14 @@ public class SubFile(string path, long startOffset, long length)
 	public string Description { get; set; } = null;
 	public string IconString { get; set; } = null;
 	public Image Icon { get; set; } = null;
+	// 可选的音频元数据字段：用于在右上文件列表中显示 Album/Album Artist/Track/Artist/Genre 信息
+	public string AlbumTitle { get; set; } = null;              // 专辑名
+	public string AlbumArtistName { get; set; } = null;        // 专辑作者/专辑艺术家名
+	public int? DiscNumber { get; set; } = null;               // 第几碟
+	public int? TrackNumber { get; set; } = null;              // 第几首
+	public string TrackTitle { get; set; } = null;             // 曲名
+	public string ArtistName { get; set; } = null;             // 艺术家/作曲家
+	public string Genre { get; set; } = null;                  // 曲目风格
 
 	public string FileName => System.IO.Path.GetFileName(Path);
 	public string FileDirectory => System.IO.Path.GetDirectoryName(Path);

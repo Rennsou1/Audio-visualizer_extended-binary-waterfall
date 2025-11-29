@@ -88,10 +88,10 @@ public class AudioBuffer
 		return this;
 	}
 
-	/// <summary>
+	
 	/// 从交织的 float PCM 数组加载数据（samples 形如 L0,R0,L1,R1,...），用于对接外部解码器。
 	/// 数组长度不足时会保留尾部为 0；数组长度超出内部缓冲区时会截断并记录日志。
-	/// </summary>
+	
 	/// <param name="buffer">交织格式的 PCM 浮点数组，范围通常在 [-1,1]</param>
 	/// <param name="channelCount">交织通道数，必须与当前缓冲区通道数一致</param>
 	public AudioBuffer LoadFromInterleavedFloats(float[] buffer, int channelCount)

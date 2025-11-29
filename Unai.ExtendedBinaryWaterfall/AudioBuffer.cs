@@ -88,6 +88,50 @@ public class AudioBuffer
 		return this;
 	}
 
+	/// <summary>
+	/// 从交织的 float PCM 数组加载数据（samples 形如 L0,R0,L1,R1,...），用于对接外部解码器。
+	/// 数组长度不足时会保留尾部为 0；数组长度超出内部缓冲区时会截断并记录日志。
+	/// </summary>
+	/// <param name="buffer">交织格式的 PCM 浮点数组，范围通常在 [-1,1]</param>
+	/// <param name="channelCount">交织通道数，必须与当前缓冲区通道数一致</param>
+	public AudioBuffer LoadFromInterleavedFloats(float[] buffer, int channelCount)
+	{
+		// 通道数不匹配时直接抛异常，便于在接入阶段快速发现问题
+		if (channelCount != ChannelCount)
+		{
+			throw new InvalidOperationException($"Channel mismatch: buffer={channelCount}ch, AudioBuffer={ChannelCount}ch");
+		}
+
+		int samplesPerChannel = buffer.Length / channelCount;
+		int maxSamples = SampleCount;
+		int totalSamples = Math.Min(samplesPerChannel, maxSamples);
+
+		// 将交织数据写入内部按通道分离的数组
+		for (int i = 0; i < totalSamples * channelCount; i++)
+		{
+			int ch = i % channelCount;
+			int s = i / channelCount;
+			Samples[ch][s] = buffer[i];
+		}
+
+		// 如果源数据长度不足一整帧，剩余部分清零，避免上帧残留
+		if (totalSamples < maxSamples)
+		{
+			for (int ch = 0; ch < ChannelCount; ch++)
+			{
+				Array.Clear(Samples[ch], totalSamples, maxSamples - totalSamples);
+			}
+		}
+
+		// 如果源数据太长，只简单截断并给出提示
+		if (samplesPerChannel > maxSamples)
+		{
+			Logger.Warning($"AudioBuffer: source has {samplesPerChannel} samples/ch, truncated to {maxSamples}.");
+		}
+
+		return this;
+	}
+
 	public AudioBuffer Resample(int newSampleCount)
 	{
 		if (newSampleCount == SampleCount) return this;

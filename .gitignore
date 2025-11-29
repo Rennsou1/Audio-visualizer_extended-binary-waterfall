@@ -4,3 +4,5 @@
 *.mkv
 .vscode/**
 *.glade~
+*.flac
+*.mp3

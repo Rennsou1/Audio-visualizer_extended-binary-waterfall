@@ -18,4 +18,11 @@ public class SubFile(string path, long startOffset, long length)
 	public string Extension => System.IO.Path.GetExtension(Path);
 
 	public bool Intersects(long start, long end) => end > StartOffset && start <= EndOffset;
+
+	// 根据整个输入文件构造一个“虚拟子文件”，用于在没有解析到真实子文件时显示歌曲列表
+	public static SubFile FromWholeFile(string path, long fileLength)
+	{
+		// 虚拟子文件从 0 偏移开始，长度为整个文件大小
+		return new SubFile(path, 0, fileLength);
+	}
 }

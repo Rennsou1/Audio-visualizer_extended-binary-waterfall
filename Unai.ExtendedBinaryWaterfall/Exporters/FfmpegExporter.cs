@@ -59,6 +59,14 @@ public class FfmpegExporter : IExporter
 	[CliParameter("Hardware Acceleration", "hwaccel")]
 	public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
 
+	// NVENC 编码配置
+	public string NvencPreset { get; set; } = "p4";         // p1-p7, 默认 p4 平衡
+	public string NvencTune { get; set; } = "hq";           // hq, ll, ull, lossless
+	public string NvencRateControl { get; set; } = "vbr";   // vbr, cbr, cq
+	public bool NvencTemporalAQ { get; set; } = true;       // 时域自适应量化
+	public bool NvencSpatialAQ { get; set; } = true;        // 空域自适应量化
+	public int NvencLookahead { get; set; } = 20;           // lookahead 帧数
+
 	#endregion
 
 	// 尝试查找可用的硬件编码器，返回编码器名称
@@ -180,7 +188,44 @@ public class FfmpegExporter : IExporter
 				_videoCtx->extradata = (byte*)ffmpeg.av_malloc(32);
 				_videoCtx->extradata_size = 24;
 			}
-			AVDictionary* videoEncOpts;
+			
+			// 为 NVENC 设置特定的编码选项
+			AVDictionary* videoEncOpts = null;
+			string encoderName = Marshal.PtrToStringAnsi((nint)videoEnc->name);
+			if (encoderName == "h264_nvenc" || encoderName == "hevc_nvenc")
+			{
+				// NVENC 预设：使用 GUI 配置的值
+				ffmpeg.av_dict_set(&videoEncOpts, "preset", NvencPreset, 0);
+				// 调优模式
+				ffmpeg.av_dict_set(&videoEncOpts, "tune", NvencTune, 0);
+				// 码率控制
+				ffmpeg.av_dict_set(&videoEncOpts, "rc", NvencRateControl, 0);
+				// 启用 B 帧以提高压缩效率
+				ffmpeg.av_dict_set(&videoEncOpts, "b_ref_mode", "middle", 0);
+				// 时域自适应量化
+				ffmpeg.av_dict_set(&videoEncOpts, "temporal-aq", NvencTemporalAQ ? "1" : "0", 0);
+				// 空域自适应量化
+				ffmpeg.av_dict_set(&videoEncOpts, "spatial-aq", NvencSpatialAQ ? "1" : "0", 0);
+				// lookahead 帧数
+				ffmpeg.av_dict_set(&videoEncOpts, "rc-lookahead", NvencLookahead.ToString(), 0);
+				// 设置 GPU 设备
+				ffmpeg.av_dict_set(&videoEncOpts, "gpu", "0", 0);
+				
+				Logger.Info($"NVENC 选项: preset={NvencPreset}, tune={NvencTune}, rc={NvencRateControl}, lookahead={NvencLookahead}");
+			}
+			else if (encoderName == "h264_qsv" || encoderName == "hevc_qsv")
+			{
+				// Intel QSV 选项
+				ffmpeg.av_dict_set(&videoEncOpts, "preset", "medium", 0);
+				Logger.Info($"QSV 选项已配置: preset=medium");
+			}
+			else if (encoderName == "h264_amf" || encoderName == "hevc_amf")
+			{
+				// AMD AMF 选项
+				ffmpeg.av_dict_set(&videoEncOpts, "quality", "balanced", 0);
+				Logger.Info($"AMF 选项已配置: quality=balanced");
+			}
+			
 			var ret = ffmpeg.avcodec_open2(_videoCtx, videoEnc, &videoEncOpts);
 			FfmpegUtils.LogIfAvError(ret, "cannot open video codec");
 

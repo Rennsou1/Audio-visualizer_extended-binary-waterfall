@@ -58,6 +58,22 @@ public class Generator
     private float[] _spectrumPeakHold = null;
     private int _videoFrameX1, _videoFrameX2, _videoFrameY1, _videoFrameY2;
     internal bool _exitRequested = false;
+    
+    // 歌曲切换过渡动画相关字段
+    private int _lastSubfileIndex = -1;
+    private long _transitionStartOffset = -1;
+    private long _transitionEndOffset = -1;
+    
+    // Ease-out 缓动函数（快到慢）
+    private static float EaseOutCubic(float t) => 1f - MathF.Pow(1f - t, 3f);
+    
+    // 测量文本宽度
+    private float MeasureTextWidth(string text, Font font)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        var bounds = TextMeasurer.MeasureBounds(text, new TextOptions(font));
+        return bounds.Width;
+    }
 
     // 公共方法：请求停止生成
     public void RequestStop() => _exitRequested = true;
@@ -111,6 +127,7 @@ public class Generator
         
         InitializeParser();
         ParseSubfiles();
+        PrecomputeSubfileWaveforms();
         InitializeFonts();
         UpdateValues();
         
@@ -368,22 +385,7 @@ public class Generator
                 HorizontalAlignment = HorizontalAlignment.Right,
             }, readSpeedString, Color.White);
             
-            // 标题
-            if (!string.IsNullOrEmpty(Title))
-            {
-                ctx.DrawText(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(32, OutputVideoHeight - 64),
-                    VerticalAlignment = VerticalAlignment.Bottom,
-                }, "TARGET", Color.DimGray)
-                .DrawText(new RichTextOptions(_font32)
-                {
-                    Origin = new Vector2(32, OutputVideoHeight - 32),
-                    VerticalAlignment = VerticalAlignment.Bottom,
-                }, Title, Color.White);
-            }
-            
-            // 作者
+            // 作者（顶部中央）
             if (!string.IsNullOrEmpty(Author))
             {
                 ctx.DrawText(new RichTextOptions(_font32)
@@ -393,6 +395,198 @@ public class Generator
                     HorizontalAlignment = HorizontalAlignment.Center,
                 }, Author, Color.White);
             }
+            
+            // 底部播放器区域
+            float bottomPanelHeight = 100f * s;
+            float bottomY = OutputVideoHeight - bottomPanelHeight - 16f * s;
+            float coverSize = 72f * s;
+            float coverX = 32f * s;
+            float coverY = bottomY + (bottomPanelHeight - coverSize) / 2f;
+            float infoX = coverX + coverSize + 16f * s;
+            float timeX = OutputVideoWidth - 32f * s;
+            
+            // 获取当前歌曲信息
+            string trackName = "";
+            string artistName = "";
+            string genreText = "";
+            TimeSpan currentTime = TimeSpan.Zero;
+            TimeSpan totalTime = TimeSpan.Zero;
+            float trackProgress = 0f;
+            Image coverImage = null;
+            
+            if (currentSubfile?.Value != null)
+            {
+                var sf = currentSubfile.Value.Value;
+                trackName = !string.IsNullOrWhiteSpace(sf.TrackTitle) ? sf.TrackTitle : sf.FileName;
+                artistName = sf.ArtistName ?? sf.AlbumArtistName ?? "";
+                genreText = sf.Genre ?? "";
+                coverImage = sf.Icon;
+                
+                if (InputBytesPerSecond > 0)
+                {
+                    totalTime = TimeSpan.FromSeconds(sf.Length / (double)InputBytesPerSecond);
+                    long offsetInTrack = currentOffset - sf.StartOffset;
+                    currentTime = TimeSpan.FromSeconds(Math.Max(0, offsetInTrack) / (double)InputBytesPerSecond);
+                    trackProgress = Math.Clamp((float)offsetInTrack / sf.Length, 0f, 1f);
+                }
+            }
+            
+            // 检测歌曲切换并计算过渡动画
+            int currSubIdx = currentSubfile?.Key ?? -1;
+            float transitionT = 1f;
+            bool isInTransition = false;
+            long transitionBytes = InputBytesPerSecond;
+            
+            if (currSubIdx != _lastSubfileIndex && currSubIdx >= 0)
+            {
+                var currSf = currentSubfile.Value.Value;
+                _transitionStartOffset = currSf.StartOffset - transitionBytes;
+                _transitionEndOffset = currSf.StartOffset + transitionBytes;
+                _lastSubfileIndex = currSubIdx;
+            }
+            
+            if (_transitionStartOffset >= 0 && currentOffset >= _transitionStartOffset && currentOffset <= _transitionEndOffset)
+            {
+                isInTransition = true;
+                float rawT = (currentOffset - _transitionStartOffset) / (float)(_transitionEndOffset - _transitionStartOffset);
+                transitionT = EaseOutCubic(Math.Clamp(rawT, 0f, 1f));
+            }
+            
+            byte contentAlpha = (byte)(255 * transitionT);
+            Color labelColor = Color.FromRgba(105, 105, 105, contentAlpha);
+            Color textColor = Color.FromRgba(255, 255, 255, contentAlpha);
+            
+            // 绘制封面
+            var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
+            ctx.Fill(Color.FromRgba(32, 32, 32, 255), coverRect);
+            ctx.Draw(Color.FromRgba(200, 200, 200, 255), 2f, coverRect);
+            
+            if (coverImage != null)
+            {
+                using var scaledCover = coverImage.Clone(imgCtx => imgCtx.Resize((int)coverSize - 4, (int)coverSize - 4));
+                ctx.DrawImage(scaledCover, new Point((int)(coverX + 2), (int)(coverY + 2)), transitionT);
+            }
+            else
+            {
+                ctx.DrawText(new RichTextOptions(_font48)
+                {
+                    Origin = new Vector2(coverX + coverSize / 2, coverY + coverSize / 2),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
+                }, "♪", Color.FromRgba(100, 100, 100, contentAlpha));
+            }
+            
+            // 标签行位置
+            float labelY = bottomY + 4f * s;
+            float valueY = labelY + 18f * s;
+            float waveformY = valueY + 32f * s;
+            
+            // 测量文本宽度以动态定位标签
+            float trackNameWidth = MeasureTextWidth(trackName, _font32);
+            float separatorWidth = MeasureTextWidth(" // ", _font32);
+            float artistNameWidth = MeasureTextWidth(artistName, _font32);
+            
+            bool hasArtist = !string.IsNullOrWhiteSpace(artistName);
+            bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
+            
+            // 计算标签位置
+            float titleLabelX = infoX;
+            float composerLabelX = infoX + trackNameWidth + separatorWidth;
+            float genreLabelX = infoX + trackNameWidth + (hasArtist ? separatorWidth + artistNameWidth : 0);
+            
+            // 过渡动画：标签偏移
+            float labelOffsetX = isInTransition ? (1f - transitionT) * 50f * s : 0f;
+            
+            // 绘制 Title: 标签
+            ctx.DrawText(new RichTextOptions(_font16)
+            {
+                Origin = new Vector2(titleLabelX + labelOffsetX, labelY),
+            }, "Title:", labelColor);
+            
+            // 绘制 Composer: 标签（仅当有艺术家时）
+            if (hasArtist)
+            {
+                ctx.DrawText(new RichTextOptions(_font16)
+                {
+                    Origin = new Vector2(composerLabelX + labelOffsetX, labelY),
+                }, "Composer:", labelColor);
+            }
+            
+            // 绘制 Genre: 标签（仅当有风格时）
+            if (hasGenre)
+            {
+                ctx.DrawText(new RichTextOptions(_font16)
+                {
+                    Origin = new Vector2(genreLabelX + labelOffsetX, labelY),
+                }, "Genre:", labelColor);
+            }
+            
+            // 绘制 Time: 标签
+            ctx.DrawText(new RichTextOptions(_font16)
+            {
+                Origin = new Vector2(timeX, labelY),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, "Time:", labelColor);
+            
+            // 构建歌曲信息
+            string displayInfo = trackName;
+            if (hasArtist) displayInfo += $" // {artistName}";
+            if (hasGenre) displayInfo += $" [{genreText}]";
+            
+            ctx.DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(infoX, valueY),
+                WrappingLength = timeX - infoX - 120f * s,
+            }, Utils.TruncateString(displayInfo, 55), textColor);
+            
+            // 时间显示
+            string timeString = $"{(int)currentTime.TotalMinutes}:{currentTime.Seconds:D2} / {(int)totalTime.TotalMinutes}:{totalTime.Seconds:D2}";
+            ctx.DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(timeX, valueY),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, timeString, textColor);
+            
+            // 波形进度条
+            float waveformX1 = infoX;
+            float waveformX2 = timeX;
+            float waveformHeight = 20f * s;
+            var waveformRect = new RectangleF(waveformX1, waveformY, waveformX2 - waveformX1, waveformHeight);
+            ctx.Fill(Color.FromRgba(40, 40, 40, contentAlpha), waveformRect);
+            
+            float barWidth = 2f;
+            float barSpacing = 1f;
+            int totalBars = (int)(waveformRect.Width / (barWidth + barSpacing));
+            float progressX = waveformRect.X + waveformRect.Width * trackProgress;
+            float gapWidth = 4f * s;
+            
+            for (int i = 0; i < totalBars; i++)
+            {
+                float barX = waveformRect.X + i * (barWidth + barSpacing);
+                float heightRatio = 0.3f + 0.6f * (float)Math.Abs(Math.Sin(i * 0.4 + currSubIdx * 0.1));
+                float barHeight = waveformHeight * heightRatio * 0.85f;
+                float barY = waveformRect.Y + (waveformHeight - barHeight) / 2f;
+                
+                if (barX > progressX - gapWidth && barX < progressX + gapWidth)
+                    continue;
+                
+                Color barColor = barX < progressX 
+                    ? Color.FromRgba(100, 100, 100, contentAlpha)
+                    : Color.FromRgba(220, 220, 220, contentAlpha);
+                
+                ctx.Fill(barColor, new RectangleF(barX, barY, barWidth, barHeight));
+            }
+            
+            // 绘制播放头
+            float headlineWidth = 2f;
+            float borderWidth = 2f;
+            
+            ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(
+                progressX - headlineWidth / 2 - borderWidth, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
+            ctx.Fill(Color.FromRgba(255, 255, 255, contentAlpha), new RectangleF(
+                progressX - headlineWidth / 2, waveformRect.Y - 2f, headlineWidth, waveformHeight + 4f));
+            ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(
+                progressX + headlineWidth / 2, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
         });
     }
 
@@ -425,6 +619,13 @@ public class Generator
     public string ExporterId { get; set; } = null;
     // 硬件加速类型（仅适用于 FFmpeg 导出器）
     public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
+    // NVENC 编码配置
+    public string NvencPreset { get; set; } = "p4";
+    public string NvencTune { get; set; } = "hq";
+    public string NvencRateControl { get; set; } = "vbr";
+    public bool NvencTemporalAQ { get; set; } = true;
+    public bool NvencSpatialAQ { get; set; } = true;
+    public int NvencLookahead { get; set; } = 20;
     public int InputBytesPerSecond { get; set; } = 48000 * 2;
     public string FontName { get; set; } = null;
     [CliParameter("Font Antialiasing", "font-antialiasing")]
@@ -535,6 +736,7 @@ public class Generator
         InitializeParser();
 
         ParseSubfiles();
+        PrecomputeSubfileWaveforms();
 
         InitializeExporter();
 
@@ -702,10 +904,16 @@ public class Generator
 
         Exporter.Generator = this;
 
-        // 如果是 FFmpeg 导出器，应用硬件加速设置
+        // 如果是 FFmpeg 导出器，应用硬件加速设置和 NVENC 配置
         if (Exporter is FfmpegExporter ffmpegExporter)
         {
             ffmpegExporter.HardwareAccel = HardwareAccel;
+            ffmpegExporter.NvencPreset = NvencPreset;
+            ffmpegExporter.NvencTune = NvencTune;
+            ffmpegExporter.NvencRateControl = NvencRateControl;
+            ffmpegExporter.NvencTemporalAQ = NvencTemporalAQ;
+            ffmpegExporter.NvencSpatialAQ = NvencSpatialAQ;
+            ffmpegExporter.NvencLookahead = NvencLookahead;
             Logger.Debug($"Hardware acceleration: {HardwareAccel}");
         }
 
@@ -858,6 +1066,93 @@ public class Generator
                 Logger.Debug($"Failed to read metadata for subfile '{sf.Path}': {ex.Message}");
             }
         }
+    }
+
+    // 预计算所有子文件的波形 RMS 值（用于底部进度条显示）
+    // 使用 CSCore 解码音频文件获取真正的 PCM 采样数据，然后计算 RMS
+    private void PrecomputeSubfileWaveforms()
+    {
+        Logger.Info("Precomputing waveform RMS for subfiles…");
+        
+        // 每个子文件生成固定数量的 RMS 值
+        const int rmsCount = 256;
+        
+        foreach (var sf in _subfiles)
+        {
+            if (sf == null || sf.Length <= 0) continue;
+            if (string.IsNullOrWhiteSpace(sf.Path) || !System.IO.File.Exists(sf.Path)) continue;
+            
+            try
+            {
+                // 使用 CSCore 解码音频文件获取真正的 PCM 采样
+                using var waveSource = CodecFactory.Instance.GetCodec(sf.Path);
+                using var sampleSource = waveSource.ToSampleSource();
+                
+                // 获取音频总采样数（单声道）
+                long totalSamples = sampleSource.Length / sampleSource.WaveFormat.Channels;
+                if (totalSamples <= 0) continue;
+                
+                // 计算每个 RMS 段的采样数
+                long samplesPerSegment = totalSamples / rmsCount;
+                if (samplesPerSegment < 64) samplesPerSegment = 64;
+                
+                float[] rmsValues = new float[rmsCount];
+                float globalMaxRms = 0f;
+                
+                // 读取缓冲区（交织格式）
+                int channelCount = sampleSource.WaveFormat.Channels;
+                int bufferSize = (int)Math.Min(samplesPerSegment * channelCount, 65536);
+                float[] buffer = new float[bufferSize];
+                
+                for (int i = 0; i < rmsCount; i++)
+                {
+                    // 计算该段的 RMS（均方根）值
+                    double sumSquares = 0.0;
+                    int sampleCount = 0;
+                    long samplesToRead = samplesPerSegment * channelCount;
+                    
+                    while (samplesToRead > 0)
+                    {
+                        int toRead = (int)Math.Min(samplesToRead, bufferSize);
+                        int read = sampleSource.Read(buffer, 0, toRead);
+                        if (read <= 0) break;
+                        
+                        // 累加平方和（混合所有声道）
+                        for (int j = 0; j < read; j++)
+                        {
+                            double sample = buffer[j];
+                            sumSquares += sample * sample;
+                            sampleCount++;
+                        }
+                        
+                        samplesToRead -= read;
+                    }
+                    
+                    // 计算 RMS 值
+                    float rms = sampleCount > 0 ? (float)Math.Sqrt(sumSquares / sampleCount) : 0f;
+                    rmsValues[i] = rms;
+                    if (rms > globalMaxRms) globalMaxRms = rms;
+                }
+                
+                // 峰值归一化：找到全局最大 RMS，然后将所有值按此缩放到 0-1 范围
+                if (globalMaxRms > 0.0001f)
+                {
+                    for (int i = 0; i < rmsCount; i++)
+                    {
+                        rmsValues[i] = rmsValues[i] / globalMaxRms;
+                    }
+                }
+                
+                sf.WaveformPeaks = rmsValues;
+                Logger.Debug($"Waveform computed for '{sf.FileName}': max RMS = {globalMaxRms:F4}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug($"Failed to compute waveform for subfile '{sf.Path}': {ex.Message}");
+            }
+        }
+        
+        Logger.Info("Waveform precomputation completed.");
     }
 
     // 初始化解析器：优先用用户指定的 parser ID，否则根据扩展名自动猜测
@@ -1297,33 +1592,8 @@ public class Generator
                     }, Author, Color.White);
                 }
 
-                if (Title != null)
-                {
-                    ctx.DrawTextAndCache(new RichTextOptions(_font24)
-                    {
-                        Origin = new Vector2(32, OutputVideoHeight - 64 - (Title.Contains('\n') ? 32 : 0)),
-                        VerticalAlignment = VerticalAlignment.Bottom,
-                    }, "TARGET", Color.DimGray)
-                    .DrawTextAndCache(new RichTextOptions(_font32)
-                    {
-                        Origin = new Vector2(32, OutputVideoHeight - 32),
-                        VerticalAlignment = VerticalAlignment.Bottom,
-                    }, Title, Color.White);
-                }
-
-                if (currentSubfile?.value?.Icon != null)
-                {
-                    ctx.DrawImage(currentSubfile.value.Icon, new Point(OutputVideoWidth / 2, OutputVideoHeight - 128 - 32), 1f);
-                }
-
-                if (currentSubfile?.value?.Description != null)
-                {
-                    ctx.DrawText(new RichTextOptions(_font32)
-                    {
-                        Origin = new Vector2(OutputVideoWidth / 2f + 128 + 32, OutputVideoHeight - 32),
-                        VerticalAlignment = VerticalAlignment.Bottom,
-                    }, currentSubfile.value.Description, Color.White);
-                }
+                // 底部音乐播放器 UI
+                DrawBottomPlayerUI(ctx, s, currentOffset, currentSubfile?.key ?? -1, currentSubfile?.value);
             });
 
             Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
@@ -1346,6 +1616,165 @@ public class Generator
         }
 
         Exporter.Finish();
+    }
+
+    // 绘制底部音乐播放器 UI
+    private void DrawBottomPlayerUI(IImageProcessingContext ctx, float s, long currentOffset, int subfileIdx, SubFile subfile)
+    {
+        float bottomPanelHeight = 100f * s;
+        float bottomY = OutputVideoHeight - bottomPanelHeight - 16f * s;
+        float coverSize = 72f * s;
+        float coverX = 32f * s;
+        float coverY = bottomY + (bottomPanelHeight - coverSize) / 2f;
+        float infoX = coverX + coverSize + 16f * s;
+        float timeX = OutputVideoWidth - 32f * s;
+        
+        string trackName = "";
+        string artistName = "";
+        string genreText = "";
+        TimeSpan currentTime = TimeSpan.Zero;
+        TimeSpan totalTime = TimeSpan.Zero;
+        float trackProgress = 0f;
+        Image coverImage = null;
+        
+        if (subfile != null)
+        {
+            trackName = !string.IsNullOrWhiteSpace(subfile.TrackTitle) ? subfile.TrackTitle : subfile.FileName;
+            artistName = subfile.ArtistName ?? subfile.AlbumArtistName ?? "";
+            genreText = subfile.Genre ?? "";
+            coverImage = subfile.Icon;
+            
+            if (InputBytesPerSecond > 0)
+            {
+                totalTime = TimeSpan.FromSeconds(subfile.Length / (double)InputBytesPerSecond);
+                long offsetInTrack = currentOffset - subfile.StartOffset;
+                currentTime = TimeSpan.FromSeconds(Math.Max(0, offsetInTrack) / (double)InputBytesPerSecond);
+                trackProgress = Math.Clamp((float)offsetInTrack / subfile.Length, 0f, 1f);
+            }
+        }
+        
+        int currSubIdx = subfileIdx;
+        float transitionT = 1f;
+        bool isInTransition = false;
+        long transitionBytes = InputBytesPerSecond;
+        
+        if (currSubIdx != _lastSubfileIndex && currSubIdx >= 0 && subfile != null)
+        {
+            _transitionStartOffset = subfile.StartOffset - transitionBytes;
+            _transitionEndOffset = subfile.StartOffset + transitionBytes;
+            _lastSubfileIndex = currSubIdx;
+        }
+        
+        if (_transitionStartOffset >= 0 && currentOffset >= _transitionStartOffset && currentOffset <= _transitionEndOffset)
+        {
+            isInTransition = true;
+            float rawT = (currentOffset - _transitionStartOffset) / (float)(_transitionEndOffset - _transitionStartOffset);
+            transitionT = EaseOutCubic(Math.Clamp(rawT, 0f, 1f));
+        }
+        
+        byte contentAlpha = (byte)(255 * transitionT);
+        Color labelColor = Color.FromRgba(105, 105, 105, contentAlpha);
+        Color textColor = Color.FromRgba(255, 255, 255, contentAlpha);
+        
+        var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
+        ctx.Fill(Color.FromRgba(32, 32, 32, 255), coverRect);
+        ctx.Draw(Color.FromRgba(200, 200, 200, 255), 2f, coverRect);
+        
+        if (coverImage != null)
+        {
+            using var scaledCover = coverImage.Clone(imgCtx => imgCtx.Resize((int)coverSize - 4, (int)coverSize - 4));
+            ctx.DrawImage(scaledCover, new Point((int)(coverX + 2), (int)(coverY + 2)), transitionT);
+        }
+        else
+        {
+            ctx.DrawText(new RichTextOptions(_font48)
+            {
+                Origin = new Vector2(coverX + coverSize / 2, coverY + coverSize / 2),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            }, "♪", Color.FromRgba(100, 100, 100, contentAlpha));
+        }
+        
+        float labelY = bottomY + 4f * s;
+        float valueY = labelY + 18f * s;
+        float waveformY = valueY + 32f * s;
+        
+        float trackNameWidth = MeasureTextWidth(trackName, _font32);
+        float separatorWidth = MeasureTextWidth(" // ", _font32);
+        float artistNameWidth = MeasureTextWidth(artistName, _font32);
+        float bracketWidth = MeasureTextWidth(" [", _font32);
+        
+        bool hasArtist = !string.IsNullOrWhiteSpace(artistName);
+        bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
+        
+        float titleLabelX = infoX;
+        // Composer: 标签对齐到 artistName 首字符（即 " // " 之后）
+        float composerLabelX = infoX + trackNameWidth + separatorWidth;
+        // Genre: 标签对齐到 "[" 符号（即 " [" 位置）
+        float genreValueStartX = infoX + trackNameWidth + (hasArtist ? separatorWidth + artistNameWidth : 0) + bracketWidth;
+        float labelOffsetX = isInTransition ? (1f - transitionT) * 50f * s : 0f;
+        
+        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(titleLabelX + labelOffsetX, labelY) }, "Title:", labelColor);
+        if (hasArtist) ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(composerLabelX + labelOffsetX, labelY) }, "Composer:", labelColor);
+        if (hasGenre) ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(genreValueStartX + labelOffsetX, labelY) }, "Genre:", labelColor);
+        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(timeX, labelY), HorizontalAlignment = HorizontalAlignment.Right }, "Time:", labelColor);
+        
+        string displayInfo = trackName;
+        if (hasArtist) displayInfo += $" // {artistName}";
+        if (hasGenre) displayInfo += $" [{genreText}]";
+        
+        ctx.DrawText(new RichTextOptions(_font32) { Origin = new Vector2(infoX, valueY), WrappingLength = timeX - infoX - 120f * s }, Utils.TruncateString(displayInfo, 55), textColor);
+        
+        string timeString = $"{(int)currentTime.TotalMinutes}:{currentTime.Seconds:D2} / {(int)totalTime.TotalMinutes}:{totalTime.Seconds:D2}";
+        ctx.DrawText(new RichTextOptions(_font32) { Origin = new Vector2(timeX, valueY), HorizontalAlignment = HorizontalAlignment.Right }, timeString, textColor);
+        
+        float waveformX1 = infoX;
+        float waveformX2 = timeX;
+        float waveformHeight = 20f * s;
+        var waveformRect = new RectangleF(waveformX1, waveformY, waveformX2 - waveformX1, waveformHeight);
+        ctx.Fill(Color.FromRgba(40, 40, 40, contentAlpha), waveformRect);
+        
+        float barWidth = 2f;
+        float barSpacing = 1f;
+        int totalBars = (int)(waveformRect.Width / (barWidth + barSpacing));
+        float progressX = waveformRect.X + waveformRect.Width * trackProgress;
+        float gapWidth = 4f * s;
+        
+        // 获取预计算的波形峰值数据
+        float[] waveformPeaks = subfile?.WaveformPeaks;
+        bool hasRealWaveform = waveformPeaks != null && waveformPeaks.Length > 0;
+        
+        for (int i = 0; i < totalBars; i++)
+        {
+            float barX = waveformRect.X + i * (barWidth + barSpacing);
+            
+            float heightRatio;
+            if (hasRealWaveform)
+            {
+                // 使用真实波形数据，映射到当前柱状图位置
+                int peakIndex = (int)((float)i / totalBars * waveformPeaks.Length);
+                peakIndex = Math.Clamp(peakIndex, 0, waveformPeaks.Length - 1);
+                // 波形峰值已归一化到 0-1 范围，添加最小高度保证可见性
+                heightRatio = 0.15f + waveformPeaks[peakIndex] * 0.85f;
+            }
+            else
+            {
+                // 无真实波形数据时使用伪随机波形
+                heightRatio = 0.3f + 0.6f * (float)Math.Abs(Math.Sin(i * 0.4 + currSubIdx * 0.1));
+            }
+            
+            float barHeight = waveformHeight * heightRatio * 0.85f;
+            float barY = waveformRect.Y + (waveformHeight - barHeight) / 2f;
+            if (barX > progressX - gapWidth && barX < progressX + gapWidth) continue;
+            Color barColor = barX < progressX ? Color.FromRgba(100, 100, 100, contentAlpha) : Color.FromRgba(220, 220, 220, contentAlpha);
+            ctx.Fill(barColor, new RectangleF(barX, barY, barWidth, barHeight));
+        }
+        
+        float headlineWidth = 2f;
+        float borderWidth = 1f;
+        ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(progressX - headlineWidth / 2 - borderWidth, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
+        ctx.Fill(Color.FromRgba(255, 255, 255, contentAlpha), new RectangleF(progressX - headlineWidth / 2, waveformRect.Y - 2f, headlineWidth, waveformHeight + 4f));
+        ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(progressX + headlineWidth / 2, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
     }
 
     // 生成结尾淡出画面

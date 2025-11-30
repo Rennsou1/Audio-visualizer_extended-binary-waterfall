@@ -20,6 +20,7 @@ public class SubFile(string path, long startOffset, long length)
 	public string TrackTitle { get; set; } = null;             // 曲名
 	public string ArtistName { get; set; } = null;             // 艺术家/作曲家
 	public string Genre { get; set; } = null;                  // 曲目风格
+	public float[] WaveformPeaks { get; set; } = null;        // 预计算的波形峰值数组（用于底部进度条显示）
 
 	public string FileName => System.IO.Path.GetFileName(Path);
 	public string FileDirectory => System.IO.Path.GetDirectoryName(Path);

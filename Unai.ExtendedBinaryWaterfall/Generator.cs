@@ -237,33 +237,35 @@ public class Generator
                 VerticalAlignment = VerticalAlignment.Center,
             }, "▶", Color.White);
             
-            // 绘制右上歌曲/子文件列表
-            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 3));
-            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 3));
-            float subfileY = listTop + subfileH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileH;
+            // 绘制右上歌曲/子文件列表（减少显示条目以避免重叠）
+            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
+            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 2));
+            float subfileRowH = 36f * s; // 使用更紧凑的行高
+            float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
             
             for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
             {
                 if (sfi < 0 || sfi >= _subfiles.Count)
                 {
-                    subfileY += subfileH;
+                    subfileY += subfileRowH;
                     continue;
                 }
 
                 var subfile = _subfiles[sfi];
                 bool isMainSubfile = sfi == (currentSubfile?.Key ?? -1);
 
-                ctx.DrawText(new RichTextOptions(_font32)
+                // 使用更小的字体（_font24 代替 _font32）
+                ctx.DrawText(new RichTextOptions(_font24)
                 {
                     Origin = new Vector2(subfileX1, subfileY),
                     VerticalAlignment = VerticalAlignment.Center,
                 }, isMainSubfile ? "▶" : " ", Color.White)
-                .DrawText(new RichTextOptions(_font32)
+                .DrawText(new RichTextOptions(_font24)
                 {
-                    Origin = new Vector2(subfileX1 + 32, subfileY),
+                    Origin = new Vector2(subfileX1 + 24 * s, subfileY),
                     VerticalAlignment = VerticalAlignment.Center,
-                }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}", Color.White)
-                .DrawText(new RichTextOptions(_font32)
+                }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 40)}", Color.White)
+                .DrawText(new RichTextOptions(_font24)
                 {
                     Origin = new Vector2(subfileX2, subfileY),
                     HorizontalAlignment = HorizontalAlignment.Right,
@@ -275,14 +277,14 @@ public class Generator
                     float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
                     ctx.DrawText(new RichTextOptions(_font16)
                     {
-                        Origin = new PointF(subfileX1 + 48, subfileY + 20),
+                        Origin = new PointF(subfileX1 + 40 * s, subfileY + 16 * s),
                         HorizontalAlignment = HorizontalAlignment.Center,
                         VerticalAlignment = VerticalAlignment.Center,
                     }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", Color.White)
-                    .DrawProgressBar(percentOfSubfile, subfileX1 + 80, subfileX2, subfileY + 20);
+                    .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, subfileY + 16 * s);
                 }
 
-                subfileY += subfileH;
+                subfileY += subfileRowH;
             }
             
             // 音频可视化占位符区域
@@ -619,13 +621,13 @@ public class Generator
     public string ExporterId { get; set; } = null;
     // 硬件加速类型（仅适用于 FFmpeg 导出器）
     public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
-    // NVENC 编码配置
-    public string NvencPreset { get; set; } = "p4";
+    // NVENC 编码配置（默认为最快速度）
+    public string NvencPreset { get; set; } = "p1";
     public string NvencTune { get; set; } = "hq";
     public string NvencRateControl { get; set; } = "vbr";
-    public bool NvencTemporalAQ { get; set; } = true;
-    public bool NvencSpatialAQ { get; set; } = true;
-    public int NvencLookahead { get; set; } = 20;
+    public bool NvencTemporalAQ { get; set; } = false;
+    public bool NvencSpatialAQ { get; set; } = false;
+    public int NvencLookahead { get; set; } = 0;
     public int InputBytesPerSecond { get; set; } = 48000 * 2;
     public string FontName { get; set; } = null;
     [CliParameter("Font Antialiasing", "font-antialiasing")]
@@ -1426,7 +1428,7 @@ public class Generator
 
                 float subfileH = 48f * s; // 每一行子文件条目的高度
 
-                // 顶部/底部淡出渐变以画面中线为基准，用于营造整体氛围
+                // 顶部/底部淡出渐变以画面中线为基准
                 float shadowY1 = (OutputVideoHeight / 2f) - subfileH * 8.5f;
                 float shadowY2 = (OutputVideoHeight / 2f) + subfileH * 6.5f;
 
@@ -1438,35 +1440,38 @@ public class Generator
                 float listTop = rightPanelTop;
                 float listBottom = listTop + listHeight;
 
-                int firstSubfileIndex = (int)(subfileWindowIndex - 7);
-                int lastSubfileIndex = (int)Math.Ceiling(subfileWindowIndex + 7);
+                // 显示条目数
+                int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
+                int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)Math.Ceiling(subfileWindowIndex + 7));
+                float subfileRowH = 36f * s; // 行高
 
-                float subfileY = listTop + subfileH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileH;
+                float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
 
                 // 绘制右上“歌曲/子文件列表”
                 for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
                 {
                     if (sfi < 0 || sfi >= _subfiles.Count)
                     {
-                        subfileY += subfileH;
+                        subfileY += subfileRowH;
                         continue;
                     }
 
                     var subfile = _subfiles[sfi];
                     bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
 
-                    ctx.DrawText(_drawOpts, new RichTextOptions(_font32)
+                    // 使用更小的字体（_font24 代替 _font32）
+                    ctx.DrawText(_drawOpts, new RichTextOptions(_font24)
                     {
                         Origin = new Vector2(subfileX1, subfileY),
                         VerticalAlignment = VerticalAlignment.Center,
                     }, isMainSubfile ? "▶" : " ", new SolidBrush(Color.White), null)
-                    .DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
+                    .DrawTextAndCache(_drawOpts, new RichTextOptions(_font24)
                     {
-                        Origin = new Vector2(subfileX1 + 32, subfileY),
+                        Origin = new Vector2(subfileX1 + 24 * s, subfileY),
                         VerticalAlignment = VerticalAlignment.Center,
                         FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
-                    }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 80)}", new SolidBrush(Color.White), null)
-                    .DrawTextAndCache(_drawOpts, new RichTextOptions(_font32)
+                    }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}", new SolidBrush(Color.White), null)
+                    .DrawTextAndCache(_drawOpts, new RichTextOptions(_font24)
                     {
                         Origin = new Vector2(subfileX2, subfileY),
                         HorizontalAlignment = HorizontalAlignment.Right,
@@ -1479,14 +1484,14 @@ public class Generator
 
                         ctx.DrawText(_drawOpts, new RichTextOptions(_font16)
                         {
-                            Origin = new PointF(subfileX1 + 48, subfileY + 20),
+                            Origin = new PointF(subfileX1 + 40 * s, subfileY + 14 * s),
                             HorizontalAlignment = HorizontalAlignment.Center,
                             VerticalAlignment = VerticalAlignment.Center,
                         }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", new SolidBrush(Color.White), null)
-                        .DrawProgressBar(percentOfSubfile, subfileX1 + 80, subfileX2, subfileY + 20);
+                        .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, subfileY + 14 * s);
                     }
 
-                    subfileY += subfileH;
+                    subfileY += subfileRowH;
                 }
 
                 // 5.3 左侧瀑布视图

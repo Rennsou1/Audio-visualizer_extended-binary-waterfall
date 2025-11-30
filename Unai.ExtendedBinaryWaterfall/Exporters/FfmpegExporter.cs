@@ -59,13 +59,13 @@ public class FfmpegExporter : IExporter
 	[CliParameter("Hardware Acceleration", "hwaccel")]
 	public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
 
-	// NVENC 编码配置
-	public string NvencPreset { get; set; } = "p4";         // p1-p7, 默认 p4 平衡
+	// NVENC 编码配置（默认为最快速度）
+	public string NvencPreset { get; set; } = "p1";         // p1-p7, 默认 p1 最快
 	public string NvencTune { get; set; } = "hq";           // hq, ll, ull, lossless
 	public string NvencRateControl { get; set; } = "vbr";   // vbr, cbr, cq
-	public bool NvencTemporalAQ { get; set; } = true;       // 时域自适应量化
-	public bool NvencSpatialAQ { get; set; } = true;        // 空域自适应量化
-	public int NvencLookahead { get; set; } = 20;           // lookahead 帧数
+	public bool NvencTemporalAQ { get; set; } = false;      // 时域自适应量化（关闭更快）
+	public bool NvencSpatialAQ { get; set; } = false;       // 空域自适应量化（关闭更快）
+	public int NvencLookahead { get; set; } = 0;            // lookahead 帧数（0=最快）
 
 	#endregion
 

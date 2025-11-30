@@ -117,7 +117,7 @@ public class Generator
     public int CurrentFrameWidth => _frameContent?.Width ?? 0;
     public int CurrentFrameHeight => _frameContent?.Height ?? 0;
 
-    // 预览模式初始化（不需要导出器）
+    // 预览模式初始化（不需要导出器，？？？）
     public void InitializeForPreview()
     {
         if (InputFileStream == null && !string.IsNullOrEmpty(InputFilePath))
@@ -237,10 +237,10 @@ public class Generator
                 VerticalAlignment = VerticalAlignment.Center,
             }, "▶", Color.White);
             
-            // 绘制右上歌曲/子文件列表（减少显示条目以避免重叠）
+            // 绘制右上歌曲/子文件列表
             int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
-            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 2));
-            float subfileRowH = 36f * s; // 使用更紧凑的行高
+            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 7));
+            float subfileRowH = 36f * s; // 行高
             float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
             
             for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
@@ -254,7 +254,7 @@ public class Generator
                 var subfile = _subfiles[sfi];
                 bool isMainSubfile = sfi == (currentSubfile?.Key ?? -1);
 
-                // 使用更小的字体（_font24 代替 _font32）
+                // （_font24 代替 _font32）
                 ctx.DrawText(new RichTextOptions(_font24)
                 {
                     Origin = new Vector2(subfileX1, subfileY),
@@ -275,13 +275,14 @@ public class Generator
                 if (isMainSubfile)
                 {
                     float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
+                    float progressY = subfileY + 22 * s; // 间距
                     ctx.DrawText(new RichTextOptions(_font16)
                     {
-                        Origin = new PointF(subfileX1 + 40 * s, subfileY + 16 * s),
+                        Origin = new PointF(subfileX1 + 40 * s, progressY),
                         HorizontalAlignment = HorizontalAlignment.Center,
                         VerticalAlignment = VerticalAlignment.Center,
                     }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", Color.White)
-                    .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, subfileY + 16 * s);
+                    .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
                 }
 
                 subfileY += subfileRowH;
@@ -1354,7 +1355,7 @@ public class Generator
                     Array.Clear(_audioSampleBuffer, readSamples, samplesPerFrame - readSamples);
                 }
 
-                // 将交织 float PCM 写入输出缓冲供可视化使用
+                // 将float PCM 写入输出缓冲供可视化使用
                 _outputAudioBuffer.LoadFromInterleavedFloats(_audioSampleBuffer, AudioOutputChannelCount);
             }
             else
@@ -1481,14 +1482,15 @@ public class Generator
                     if (isMainSubfile)
                     {
                         float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
+                        float progressY = subfileY + 22 * s; // 进度条间距调整（噢噢噢噢）
 
                         ctx.DrawText(_drawOpts, new RichTextOptions(_font16)
                         {
-                            Origin = new PointF(subfileX1 + 40 * s, subfileY + 14 * s),
+                            Origin = new PointF(subfileX1 + 40 * s, progressY),
                             HorizontalAlignment = HorizontalAlignment.Center,
                             VerticalAlignment = VerticalAlignment.Center,
                         }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", new SolidBrush(Color.White), null)
-                        .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, subfileY + 14 * s);
+                        .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
                     }
 
                     subfileY += subfileRowH;

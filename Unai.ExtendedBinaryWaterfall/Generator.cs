@@ -64,6 +64,27 @@ public class Generator
     private long _transitionStartOffset = -1;
     private long _transitionEndOffset = -1;
     
+    // 性能优化：预计算的布局参数缓存
+    private struct LayoutCache
+    {
+        public float Scale;
+        public int RightPanelX1, RightPanelX2;
+        public int SubfileX1, SubfileX2;
+        public int AudioVisX1, AudioVisX2;
+        public float SubfileH, SubfileRowH;
+        public float ShadowY1, ShadowY2;
+        public float RightPanelTop, RightPanelBottom;
+        public float ListTop, ListBottom;
+        public float BottomPanelHeight, BottomY;
+        public float CoverSize, CoverX, CoverY;
+        public float InfoX, TimeX;
+        public bool IsValid;
+    }
+    private LayoutCache _layoutCache;
+    
+    // 性能优化：预渲染的静态 UI 元素
+    private Image<Rgba32> _staticLabelsCache = null;
+    
     // Ease-out 缓动函数（快到慢）
     private static float EaseOutCubic(float t) => 1f - MathF.Pow(1f - t, 3f);
     
@@ -1219,7 +1240,45 @@ public class Generator
             if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
             _videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
             if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
+            
+            // 初始化布局缓存
+            InitializeLayoutCache();
         }
+    }
+    
+    // 初始化布局参数缓存，避免每帧重复计算
+    private void InitializeLayoutCache()
+    {
+        float s = ResolutionScale;
+        _layoutCache = new LayoutCache
+        {
+            Scale = s,
+            RightPanelX1 = _videoFrameX2 + (int)(64 * s),
+            RightPanelX2 = OutputVideoWidth - (int)(32 * s),
+            SubfileH = 48f * s,
+            SubfileRowH = 36f * s,
+            IsValid = true
+        };
+        _layoutCache.SubfileX1 = _layoutCache.RightPanelX1;
+        _layoutCache.SubfileX2 = _layoutCache.RightPanelX2;
+        _layoutCache.AudioVisX1 = _layoutCache.RightPanelX1;
+        _layoutCache.AudioVisX2 = _layoutCache.RightPanelX2;
+        _layoutCache.ShadowY1 = (OutputVideoHeight / 2f) - _layoutCache.SubfileH * 8.5f;
+        _layoutCache.ShadowY2 = (OutputVideoHeight / 2f) + _layoutCache.SubfileH * 6.5f;
+        _layoutCache.RightPanelTop = _layoutCache.ShadowY1 + _layoutCache.SubfileH * 2f + 16f * s;
+        _layoutCache.RightPanelBottom = _layoutCache.ShadowY2 - 16f * s;
+        float rightPanelHeight = _layoutCache.RightPanelBottom - _layoutCache.RightPanelTop;
+        _layoutCache.ListTop = _layoutCache.RightPanelTop;
+        _layoutCache.ListBottom = _layoutCache.ListTop + rightPanelHeight * 0.20f;
+        _layoutCache.BottomPanelHeight = 100f * s;
+        _layoutCache.BottomY = OutputVideoHeight - _layoutCache.BottomPanelHeight - 16f * s;
+        _layoutCache.CoverSize = 72f * s;
+        _layoutCache.CoverX = 32f * s;
+        _layoutCache.CoverY = _layoutCache.BottomY + (_layoutCache.BottomPanelHeight - _layoutCache.CoverSize) / 2f;
+        _layoutCache.InfoX = _layoutCache.CoverX + _layoutCache.CoverSize + 16f * s;
+        _layoutCache.TimeX = OutputVideoWidth - 32f * s;
+        
+        Logger.Info("Layout cache initialized for performance optimization.");
     }
 
     // 总生成流程

@@ -50,7 +50,7 @@ public class Generator
     // CSCore 音频解码相关字段：使用 CodecFactory 自动根据扩展名选择解码器
     private IWaveSource _audioWaveSource = null;
     private ISampleSource _audioSampleSource = null;
-    // 用于暂存每帧交织的 float PCM 数据
+    // 用于暂存每的 float PCM 数据
     private float[] _audioSampleBuffer = null;
     // 频谱上一帧的柱状值，用于做简单的指数平滑，降低频谱动态速度
     private float[] _lastSpectrumBins = null;
@@ -1123,7 +1123,7 @@ public class Generator
                 float[] rmsValues = new float[rmsCount];
                 float globalMaxRms = 0f;
                 
-                // 读取缓冲区（交织格式）
+                // 读取缓冲区
                 int channelCount = sampleSource.WaveFormat.Channels;
                 int bufferSize = (int)Math.Min(samplesPerSegment * channelCount, 65536);
                 float[] buffer = new float[bufferSize];
@@ -1440,6 +1440,7 @@ public class Generator
             }
 
             // 3. 将视频字节缓冲转换为 Image，并翻转+缩放成用于绘制的瀑布视图
+            _viewportFramebuf?.Dispose();
             _viewportFramebuf = Image.LoadPixelData<Rgba32>(currentVideoBuffer, WaterfallWidth, WaterfallHeight);
             _viewportFramebuf.ProcessPixelRows(pa =>
             {

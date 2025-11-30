@@ -89,11 +89,11 @@ public class AudioBuffer
 	}
 
 	
-	/// 从交织的 float PCM 数组加载数据（samples 形如 L0,R0,L1,R1,...），用于对接外部解码器。
+	/// 从 float PCM 数组加载数据（samples 形如 L0,R0,L1,R1,...），用于对接外部解码器。
 	/// 数组长度不足时会保留尾部为 0；数组长度超出内部缓冲区时会截断并记录日志。
 	
-	/// <param name="buffer">交织格式的 PCM 浮点数组，范围通常在 [-1,1]</param>
-	/// <param name="channelCount">交织通道数，必须与当前缓冲区通道数一致</param>
+	/// <param name="buffer"> PCM 浮点数组，范围通常在 [-1,1]</param>
+	/// <param name="channelCount">通道数，必须与当前缓冲区通道数一致</param>
 	public AudioBuffer LoadFromInterleavedFloats(float[] buffer, int channelCount)
 	{
 		// 通道数不匹配时直接抛异常，便于在接入阶段快速发现问题
@@ -106,7 +106,7 @@ public class AudioBuffer
 		int maxSamples = SampleCount;
 		int totalSamples = Math.Min(samplesPerChannel, maxSamples);
 
-		// 将交织数据写入内部按通道分离的数组
+		// 将数据写入内部按通道分离的数组
 		for (int i = 0; i < totalSamples * channelCount; i++)
 		{
 			int ch = i % channelCount;
@@ -178,5 +178,15 @@ public class AudioBuffer
 		}
 
 		return ret;
+	}
+
+	// 将音频数据复制到目标数组（避免每帧分配新数组）
+	public void CopyTo(float[] destination)
+	{
+		int length = Math.Min(destination.Length, SampleCount * ChannelCount);
+		for (int i = 0; i < length; i++)
+		{
+			destination[i] = Samples[i % ChannelCount][i / ChannelCount];
+		}
 	}
 }

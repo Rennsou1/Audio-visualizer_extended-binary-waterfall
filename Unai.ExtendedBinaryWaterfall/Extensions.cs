@@ -25,6 +25,9 @@ public static class Extensions
 	private const int MaxTextCacheSize = 1024;  // 增大缓存容量
 	private const int CacheCleanupBatch = 256;  // 每次清理的数量
 	private static long _cacheAccessCounter = 0;
+	// LRU 清理复用数组（避免每次清理时分配）
+	private static int[] _lruRemoveKeys = null;
+	private static long[] _lruRemoveValues = null;
 	
 	// 可复用的文本绘制 Paint
 	private static readonly SKPaint _textPaint = new()
@@ -115,18 +118,46 @@ public static class Extensions
 		{
 			// 缓存未命中，预渲染文本到位图
 			
-			// LRU 清理：只清理最旧的一批，而不是全部清空
+			// LRU 清理：使用无分配方式找出最旧条目
 			if (_textRenderCache.Count >= MaxTextCacheSize)
 			{
-				// 找出最旧的 CacheCleanupBatch 个条目并移除
-				var toRemove = _textRenderCache
-					.OrderBy(kv => kv.Value.lastUsed)
-					.Take(CacheCleanupBatch)
-					.Select(kv => kv.Key)
-					.ToList();
-				
-				foreach (var key in toRemove)
+				// 复用静态数组存储待删除的 key（避免 LINQ 分配）
+				if (_lruRemoveKeys == null || _lruRemoveKeys.Length < CacheCleanupBatch)
 				{
+					_lruRemoveKeys = new int[CacheCleanupBatch];
+					_lruRemoveValues = new long[CacheCleanupBatch];
+				}
+				
+				// 初始化为最大值
+				for (int i = 0; i < CacheCleanupBatch; i++)
+				{
+					_lruRemoveValues[i] = long.MaxValue;
+				}
+				
+				// 遍历一次，找出最旧的 CacheCleanupBatch 个条目
+				foreach (var kv in _textRenderCache)
+				{
+					long lastUsed = kv.Value.lastUsed;
+					// 检查是否比当前最大的还小
+					if (lastUsed < _lruRemoveValues[CacheCleanupBatch - 1])
+					{
+						// 插入排序：找到合适位置
+						int insertPos = CacheCleanupBatch - 1;
+						while (insertPos > 0 && lastUsed < _lruRemoveValues[insertPos - 1])
+						{
+							_lruRemoveKeys[insertPos] = _lruRemoveKeys[insertPos - 1];
+							_lruRemoveValues[insertPos] = _lruRemoveValues[insertPos - 1];
+							insertPos--;
+						}
+						_lruRemoveKeys[insertPos] = kv.Key;
+						_lruRemoveValues[insertPos] = lastUsed;
+					}
+				}
+				
+				// 移除找到的条目
+				for (int i = 0; i < CacheCleanupBatch && _lruRemoveValues[i] != long.MaxValue; i++)
+				{
+					int key = _lruRemoveKeys[i];
 					if (_textRenderCache.TryGetValue(key, out var entry))
 					{
 						entry.bitmap.Dispose();

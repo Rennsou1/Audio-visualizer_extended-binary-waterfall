@@ -69,6 +69,8 @@ public class Generator
     private SKBitmap _reusableWaterfallImage = null;
     // 缩放后的瀑布图像复用（避免每帧 Clone+Resize 导致的内存分配）
     private SKBitmap _reusableScaledWaterfall = null;
+    // 复用的瀑布缩放 Canvas（避免每帧创建）
+    private SKCanvas _reusableScaledWaterfallCanvas = null;
     
     // 预渲染的渐变着色器
     private SKShader _cachedTopGradientShader = null;
@@ -511,7 +513,7 @@ public class Generator
     public float OutroFadeDuration { get; set; } = 2.0f; // 内容结束后的淡出时长（秒）
 
     [CliParameter("Intro text content", "intro-text")]
-    public string IntroText { get; set; } = "声明\n\n本视频由\nextended-binary-waterfall\n项目进行生成\n\nhttps://github.com/unai-d/extended-binary-waterfall"; // 入场显示的文字内容
+    public string IntroText { get; set; } = "声明\n\n本视频由\nextended-binary-waterfall\n项目改造进行生成\n\n"; // 入场显示的文字内容
 
     [CliParameter("Intro duration in seconds", "intro-duration")]
     public float IntroDuration { get; set; } = 5.0f; // 开场持续时间（秒）
@@ -1103,6 +1105,40 @@ public class Generator
                 {
                     sf.Genre = string.Join(", ", tag.Genres);
                 }
+                
+                // 专辑封面：从 tag.Pictures 读取嵌入的封面图片
+                if (sf.Icon == null && tag.Pictures != null && tag.Pictures.Length > 0)
+                {
+                    try
+                    {
+                        // 优先查找 FrontCover 类型的图片
+                        TagLib.IPicture coverPic = null;
+                        foreach (var pic in tag.Pictures)
+                        {
+                            if (pic.Type == TagLib.PictureType.FrontCover)
+                            {
+                                coverPic = pic;
+                                break;
+                            }
+                        }
+                        // 如果没有 FrontCover，使用第一张图片
+                        coverPic ??= tag.Pictures[0];
+                        
+                        if (coverPic?.Data?.Data != null && coverPic.Data.Data.Length > 0)
+                        {
+                            using var stream = new MemoryStream(coverPic.Data.Data);
+                            sf.Icon = SKBitmap.Decode(stream);
+                            if (sf.Icon != null)
+                            {
+                                Logger.Debug($"Loaded album art for '{sf.FileName}' ({sf.Icon.Width}x{sf.Icon.Height})");
+                            }
+                        }
+                    }
+                    catch (Exception picEx)
+                    {
+                        Logger.Debug($"Failed to decode album art for '{sf.FileName}': {picEx.Message}");
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1574,39 +1610,68 @@ public class Generator
             unsafe
             {
                 byte* destBase = (byte*)destPtr;
+                int vectorSize = Vector<byte>.Count;
+                
+                // 预计算 alpha 向量（每4字节设置一次 255）
+                byte[] alphaPattern = new byte[vectorSize];
+                for (int i = 3; i < vectorSize; i += 4) alphaPattern[i] = 255;
+                Vector<byte> alphaMask = new Vector<byte>(alphaPattern);
+                
+                // alpha 位置掩码（第3,7,11...字节为1，其余为0）
+                byte[] posPattern = new byte[vectorSize];
+                for (int i = 3; i < vectorSize; i += 4) posPattern[i] = 255;
+                Vector<byte> posMask = new Vector<byte>(posPattern);
+                
                 Parallel.For(0, height, y =>
                 {
                     int destOffset = y * destRowBytes;
                     int srcOffset = (height - 1 - y) * srcBytesPerRow;
                     byte* destRow = destBase + destOffset;
-                    for (int x = 0; x < width; x++)
+                    int rowBytes = width * 4;
+                    int x = 0;
+                    
+                    // SIMD 向量化处理（每次处理 vectorSize 字节）
+                    fixed (byte* srcPtr = &videoBuffer[srcOffset])
                     {
-                        int idx = x * 4;
-                        destRow[idx + 0] = videoBuffer[srcOffset + idx + 0];
-                        destRow[idx + 1] = videoBuffer[srcOffset + idx + 1];
-                        destRow[idx + 2] = videoBuffer[srcOffset + idx + 2];
-                        destRow[idx + 3] = 255;
+                        for (; x <= rowBytes - vectorSize; x += vectorSize)
+                        {
+                            // 加载源数据
+                            Vector<byte> src = *(Vector<byte>*)(srcPtr + x);
+                            // 清除源数据中的 alpha 位，然后或上 255
+                            Vector<byte> result = (src & ~posMask) | alphaMask;
+                            // 写入目标
+                            *(Vector<byte>*)(destRow + x) = result;
+                        }
+                        
+                        // 处理剩余字节
+                        for (; x < rowBytes; x += 4)
+                        {
+                            destRow[x + 0] = srcPtr[x + 0];
+                            destRow[x + 1] = srcPtr[x + 1];
+                            destRow[x + 2] = srcPtr[x + 2];
+                            destRow[x + 3] = 255;
+                        }
                     }
                 });
             }
 
-            // 复用缩放后的瀑布位图
+            // 复用缩放后的瀑布位图和 Canvas
             if (_reusableScaledWaterfall == null ||
                 _reusableScaledWaterfall.Width != WaterfallScaledWidth ||
                 _reusableScaledWaterfall.Height != WaterfallScaledHeight)
             {
+                _reusableScaledWaterfallCanvas?.Dispose();
                 _reusableScaledWaterfall?.Dispose();
                 _reusableScaledWaterfall = new SKBitmap(new SKImageInfo(WaterfallScaledWidth, WaterfallScaledHeight, SKColorType.Bgra8888, SKAlphaType.Premul));
+                _reusableScaledWaterfallCanvas = new SKCanvas(_reusableScaledWaterfall);
             }
 
-            using (var scaledCanvas = new SKCanvas(_reusableScaledWaterfall))
-            {
-                scaledCanvas.Clear(SKColors.Transparent);
-                var srcRect = new SKRect(0, 0, WaterfallWidth, WaterfallHeight);
-                var dstRect = new SKRect(0, 0, WaterfallScaledWidth, WaterfallScaledHeight);
-                _imagePaint.FilterQuality = SKFilterQuality.None; // 保持像素风格
-                scaledCanvas.DrawBitmap(_reusableWaterfallImage, srcRect, dstRect, _imagePaint);
-            }
+            // 复用 Canvas 绘制缩放瀑布
+            _reusableScaledWaterfallCanvas.Clear(SKColors.Transparent);
+            var srcRect = new SKRect(0, 0, WaterfallWidth, WaterfallHeight);
+            var dstRect = new SKRect(0, 0, WaterfallScaledWidth, WaterfallScaledHeight);
+            _imagePaint.FilterQuality = SKFilterQuality.None; // 保持像素风格
+            _reusableScaledWaterfallCanvas.DrawBitmap(_reusableWaterfallImage, srcRect, dstRect, _imagePaint);
 
             _viewportFramebuf = _reusableScaledWaterfall;
 
@@ -2485,15 +2550,47 @@ public class Generator
         {
             _audioMonoBuffer = new float[sampleCount];
         }
-        for (int i = 0; i < sampleCount; i++)
+        
+        // SIMD 优化的声道混合
+        if (channelCount == 2 && Vector.IsHardwareAccelerated)
         {
-            float sum = 0f;
-            for (int ch = 0; ch < channelCount; ch++)
+            // 立体声特化：使用 SIMD 向量化
+            int vectorSize = Vector<float>.Count;
+            float scale = 0.5f;
+            int i = 0;
+            
+            // 每次处理 vectorSize 个采样
+            for (; i <= sampleCount - vectorSize; i += vectorSize)
             {
-                int idx = i * channelCount + ch;
-                if (idx < interleavedLen) sum += _audioInterleavedBuffer[idx];
+                // 解交错：左右声道分别相加并平均
+                for (int k = 0; k < vectorSize && i + k < sampleCount; k++)
+                {
+                    int idx = (i + k) * 2;
+                    _audioMonoBuffer[i + k] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
+                }
             }
-            _audioMonoBuffer[i] = sum / channelCount;
+            
+            // 处理剩余采样
+            for (; i < sampleCount; i++)
+            {
+                int idx = i * 2;
+                _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
+            }
+        }
+        else
+        {
+            // 通用多声道处理
+            float invChannelCount = 1f / channelCount;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                float sum = 0f;
+                int baseIdx = i * channelCount;
+                for (int ch = 0; ch < channelCount; ch++)
+                {
+                    sum += _audioInterleavedBuffer[baseIdx + ch];
+                }
+                _audioMonoBuffer[i] = sum * invChannelCount;
+            }
         }
 
         // 布局：上 55% 波形，下 45% 频谱

@@ -6,8 +6,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using FFmpeg.AutoGen;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
@@ -327,8 +326,11 @@ public class FfmpegExporter : IExporter
 			_videoCtx->framerate.num = videoFps.num;
 			_videoCtx->framerate.den = videoFps.den;
 			_videoCtx->bit_rate = OutputVideoBitRate;
-			// _videoCtx->thread_count = Environment.ProcessorCount / 2;
-			// Console.Error.WriteLine($"using {_videoCtx->thread_count} threads");
+			// 设置关键帧间隔（GOP大小），默认每 2 秒一个关键帧以支持视频定位
+			int gopSize = KeyframeInterval > 0 ? KeyframeInterval : Generator.OutputFps * 2;
+			_videoCtx->gop_size = gopSize;
+			_videoCtx->max_b_frames = NvencBFrames;
+			Logger.Info($"视频 GOP 大小: {gopSize} 帧 (约 {gopSize / Generator.OutputFps} 秒)");
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
 				_videoCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -404,8 +406,8 @@ public class FfmpegExporter : IExporter
 				// 增加编码器表面缓冲区数量（提高并行度）
 				ffmpeg.av_dict_set(&videoEncOpts, "surfaces", "64", 0);
 				
-				// 禁用强制关键帧（减少编码开销）
-				ffmpeg.av_dict_set(&videoEncOpts, "forced-idr", "0", 0);
+				// 强制关键帧以支持视频定位
+				ffmpeg.av_dict_set(&videoEncOpts, "forced-idr", "1", 0);
 				
 				Logger.Info($"NVENC 配置: preset={preset}, tune=ll, rc={rc}, bf={NvencBFrames}, surfaces=64, zerolatency={NvencZeroLatency}");
 			}
@@ -828,12 +830,8 @@ public class FfmpegExporter : IExporter
 		}
 	}
 
-	public void PushNewFrame(Image videoFrame, AudioBuffer audioFrame, double delta)
-	{
-		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
-	}
-
-	public unsafe void PushNewFrame(Image<Rgba32> videoFrame, AudioBuffer audioFrame, double delta)
+	// 接受 SKBitmap 作为视频帧
+	public unsafe void PushNewFrame(SKBitmap videoFrame, AudioBuffer audioFrame, double delta)
 	{
 		if (!_init)
 		{
@@ -854,8 +852,9 @@ public class FfmpegExporter : IExporter
 			pixelBuffer = new byte[pixelSize];
 		}
 		
-		// 复制像素数据
-		videoFrame.CopyPixelDataTo(pixelBuffer);
+		// 从 SKBitmap 复制像素数据
+		ReadOnlySpan<byte> pixels = videoFrame.GetPixelSpan();
+		pixels.CopyTo(pixelBuffer);
 		pendingFrame.PixelData = pixelBuffer;
 		pendingFrame.Width = videoFrame.Width;
 		pendingFrame.Height = videoFrame.Height;
@@ -923,14 +922,19 @@ public class FfmpegExporter : IExporter
 		GC.WaitForPendingFinalizers();
 		
 		// 高优先级线程运行编码器
-		_encoderTask = Task.Factory.StartNew(AsyncEncoderLoop, _encoderCts.Token, 
-			TaskCreationOptions.LongRunning, TaskScheduler.Default);
+		// 使用 Task.Run + Unwrap 确保 async Task 被正确等待
+		_encoderTask = Task.Factory.StartNew(
+			() => AsyncEncoderLoop(), 
+			_encoderCts.Token, 
+			TaskCreationOptions.LongRunning, 
+			TaskScheduler.Default
+		).Unwrap();
 		
 		Logger.Info($"高性能编码器已启动，Channel 缓冲: {MaxQueueSize} 帧，预分配池: {PreallocPoolSize} 对象");
 	}
 	
 	// 异步编码循环（在后台线程运行）
-	private async void AsyncEncoderLoop()
+	private async Task AsyncEncoderLoop()
 	{
 		// 设置线程优先级为高
 		Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
@@ -939,17 +943,33 @@ public class FfmpegExporter : IExporter
 		{
 			await foreach (var frame in _frameChannel.Reader.ReadAllAsync(_encoderCts.Token))
 			{
-				EncodeFrameSync(frame);
-				ReturnToPool(frame);
+				try
+				{
+					EncodeFrameSync(frame);
+				}
+				catch (Exception encodeEx)
+				{
+					Logger.Error($"编码帧失败: {encodeEx.Message}");
+				}
+				finally
+				{
+					ReturnToPool(frame);
+				}
 			}
 		}
 		catch (OperationCanceledException)
 		{
-			// 正常取消
+			// 正常取消，Channel 关闭时会触发
+			Logger.Debug("编码器循环正常结束");
+		}
+		catch (ChannelClosedException)
+		{
+			// Channel 已关闭，正常结束
+			Logger.Debug("编码 Channel 已关闭");
 		}
 		catch (Exception ex)
 		{
-			Logger.Error($"异步编码器错误: {ex.Message}");
+			Logger.Error($"异步编码器错误: {ex.Message}\n{ex.StackTrace}");
 		}
 	}
 	
@@ -1030,12 +1050,30 @@ public class FfmpegExporter : IExporter
 
 	public unsafe void Finish()
 	{
+		try
+		{
+			FinishInternal();
+		}
+		catch (Exception ex)
+		{
+			Logger.Error($"Finish 方法异常: {ex.Message}\n{ex.StackTrace}");
+		}
+	}
+	
+	// 内部完成方法（包含实际清理逻辑）
+	private unsafe void FinishInternal()
+	{
 		Logger.Debug("等待异步编码器完成...");
 		
 		// 停止接受新帧并等待 Channel 清空
 		if (_frameChannel != null)
 		{
-			_frameChannel.Writer.Complete();
+			try
+			{
+				_frameChannel.Writer.Complete();
+			}
+			catch { }
+			
 			try
 			{
 				// 等待编码器线程完成所有待处理帧
@@ -1045,10 +1083,14 @@ public class FfmpegExporter : IExporter
 			{
 				Logger.Error($"编码器线程异常: {ex.InnerException?.Message}");
 			}
+			catch (Exception ex)
+			{
+				Logger.Error($"等待编码器异常: {ex.Message}");
+			}
 			finally
 			{
-				_encoderCts?.Cancel();
-				_encoderCts?.Dispose();
+				try { _encoderCts?.Cancel(); } catch { }
+				try { _encoderCts?.Dispose(); } catch { }
 			}
 		}
 		
@@ -1093,76 +1135,120 @@ public class FfmpegExporter : IExporter
 			}
 		}
 		
-		// 释放视频帧和包
-		if (_videoAvFrame != null)
+		// 释放视频帧和包（添加 try-catch 防止原生崩溃）
+		try
 		{
-			var frame = _videoAvFrame;
-			ffmpeg.av_frame_free(&frame);
-			_videoAvFrame = null;
+			if (_videoAvFrame != null)
+			{
+				var frame = _videoAvFrame;
+				ffmpeg.av_frame_free(&frame);
+				_videoAvFrame = null;
+			}
 		}
-		if (_videoAvFramePre != null)
+		catch (Exception ex) { Logger.Error($"释放 videoAvFrame 失败: {ex.Message}"); }
+		
+		try
 		{
-			var frame = _videoAvFramePre;
-			ffmpeg.av_frame_free(&frame);
-			_videoAvFramePre = null;
+			if (_videoAvFramePre != null)
+			{
+				var frame = _videoAvFramePre;
+				ffmpeg.av_frame_free(&frame);
+				_videoAvFramePre = null;
+			}
 		}
-		if (_videoAvPacket != null)
+		catch (Exception ex) { Logger.Error($"释放 videoAvFramePre 失败: {ex.Message}"); }
+		
+		try
 		{
-			var packet = _videoAvPacket;
-			ffmpeg.av_packet_free(&packet);
-			_videoAvPacket = null;
+			if (_videoAvPacket != null)
+			{
+				var packet = _videoAvPacket;
+				ffmpeg.av_packet_free(&packet);
+				_videoAvPacket = null;
+			}
 		}
+		catch (Exception ex) { Logger.Error($"释放 videoAvPacket 失败: {ex.Message}"); }
 		
 		// 释放音频帧和包
-		if (_audioAvFrame != null)
+		try
 		{
-			var frame = _audioAvFrame;
-			ffmpeg.av_frame_free(&frame);
-			_audioAvFrame = null;
+			if (_audioAvFrame != null)
+			{
+				var frame = _audioAvFrame;
+				ffmpeg.av_frame_free(&frame);
+				_audioAvFrame = null;
+			}
 		}
-		if (_audioAvPacket != null)
+		catch (Exception ex) { Logger.Error($"释放 audioAvFrame 失败: {ex.Message}"); }
+		
+		try
 		{
-			var packet = _audioAvPacket;
-			ffmpeg.av_packet_free(&packet);
-			_audioAvPacket = null;
+			if (_audioAvPacket != null)
+			{
+				var packet = _audioAvPacket;
+				ffmpeg.av_packet_free(&packet);
+				_audioAvPacket = null;
+			}
 		}
+		catch (Exception ex) { Logger.Error($"释放 audioAvPacket 失败: {ex.Message}"); }
 		
 		// 释放色彩转换上下文
-		if (_swsCtx != null)
+		try
 		{
-			ffmpeg.sws_freeContext(_swsCtx);
-			_swsCtx = null;
+			if (_swsCtx != null)
+			{
+				ffmpeg.sws_freeContext(_swsCtx);
+				_swsCtx = null;
+			}
 		}
+		catch (Exception ex) { Logger.Error($"释放 swsCtx 失败: {ex.Message}"); }
 		
 		// 释放音频重采样资源
-		if (_swrCtx != null)
+		try
 		{
-			var swrCtx = _swrCtx;
-			ffmpeg.swr_free(&swrCtx);
-			_swrCtx = null;
+			if (_swrCtx != null)
+			{
+				var swrCtx = _swrCtx;
+				ffmpeg.swr_free(&swrCtx);
+				_swrCtx = null;
+			}
 		}
-		if (_resampledAudioFrame != null)
+		catch (Exception ex) { Logger.Error($"释放 swrCtx 失败: {ex.Message}"); }
+		
+		try
 		{
-			var resampledFrame = _resampledAudioFrame;
-			ffmpeg.av_frame_free(&resampledFrame);
-			_resampledAudioFrame = null;
+			if (_resampledAudioFrame != null)
+			{
+				var resampledFrame = _resampledAudioFrame;
+				ffmpeg.av_frame_free(&resampledFrame);
+				_resampledAudioFrame = null;
+			}
 		}
+		catch (Exception ex) { Logger.Error($"释放 resampledAudioFrame 失败: {ex.Message}"); }
 		
 		// 释放视频编码器上下文
-		if (_videoCtx != null)
+		try
 		{
-			var videoCtx = _videoCtx;
-			ffmpeg.avcodec_free_context(&videoCtx);
-			_videoCtx = null;
+			if (_videoCtx != null)
+			{
+				var videoCtx = _videoCtx;
+				ffmpeg.avcodec_free_context(&videoCtx);
+				_videoCtx = null;
+			}
 		}
+		catch (Exception ex) { Logger.Error($"释放 videoCtx 失败: {ex.Message}"); }
 		
 		// 释放音频编码器上下文
-		if (_audioCtx != null)
+		try
 		{
-			var audioCtx = _audioCtx;
-			ffmpeg.avcodec_free_context(&audioCtx);
-			_audioCtx = null;
+			if (_audioCtx != null)
+			{
+				var audioCtx = _audioCtx;
+				ffmpeg.avcodec_free_context(&audioCtx);
+				_audioCtx = null;
+			}
 		}
+		catch (Exception ex) { Logger.Error($"释放 audioCtx 失败: {ex.Message}"); }
 
 		// 关闭输出文件并释放格式上下文
 		if (_fmtCtx != null)
@@ -1179,7 +1265,14 @@ public class FfmpegExporter : IExporter
 				Logger.Error($"avio_closep 失败: {ex.Message}");
 			}
 
-			ffmpeg.avformat_free_context(_fmtCtx);
+			try
+			{
+				ffmpeg.avformat_free_context(_fmtCtx);
+			}
+			catch (Exception ex)
+			{
+				Logger.Error($"avformat_free_context 失败: {ex.Message}");
+			}
 			_fmtCtx = null;
 		}
 		

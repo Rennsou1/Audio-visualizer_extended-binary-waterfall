@@ -10,12 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using CSCore;
 using CSCore.Codecs;
-using SixLabors.Fonts;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Drawing.Processing;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
-using SixLabors.ImageSharp.Processing.Processors.Transforms;
+using SkiaSharp;
 using Unai.ExtendedBinaryWaterfall.Exporters;
 using Unai.ExtendedBinaryWaterfall.Parsers;
 using TagLib;
@@ -46,8 +41,10 @@ public class Generator
 
     #region Generator Registers
 
-    private Image<Rgba32> _frameContent = null;
-    private Image<Rgba32> _viewportFramebuf = null;
+    // 渲染相关字段
+    private SKBitmap _frameContent = null;           // 主帧内容位图
+    private SKCanvas _frameCanvas = null;            // 主帧画布（复用，避免每帧创建）
+    private SKBitmap _viewportFramebuf = null;       // 瀑布视图位图
     private AudioBuffer _inputAudioBuffer = null;
     private AudioBuffer _outputAudioBuffer = null;
     // CSCore 音频解码相关字段：使用 CodecFactory 自动根据扩展名选择解码器
@@ -69,40 +66,53 @@ public class Generator
     private byte[] _reusableVideoBuffer = null;
     
     // 瀑布原始图像复用
-    private Image<Rgba32> _reusableWaterfallImage = null;
+    private SKBitmap _reusableWaterfallImage = null;
     // 缩放后的瀑布图像复用（避免每帧 Clone+Resize 导致的内存分配）
-    private Image<Rgba32> _reusableScaledWaterfall = null;
+    private SKBitmap _reusableScaledWaterfall = null;
     
-    // 预渲染的渐变遮罩图像
-    private Image<Rgba32> _cachedTopGradientMask = null;
-    private Image<Rgba32> _cachedBottomGradientMask = null;
+    // 预渲染的渐变着色器
+    private SKShader _cachedTopGradientShader = null;
+    private SKShader _cachedBottomGradientShader = null;
     private float _cachedGradientY1 = -1;
     private float _cachedGradientY2 = -1;
     private float _cachedGradientHeight = -1;
     
     // 文本测量缓存（避免重复测量相同文本）
-    private Dictionary<(string text, int fontHash), float> _textWidthCache = new();
+    private Dictionary<(string text, float fontSize), float> _textWidthCache = new();
     private const int MaxTextCacheSize = 256;
     
     // 预渲染的静态 UI 元素
     // 封面图片缓存（避免每帧 Clone + Resize）
-    private Image<Rgba32> _cachedScaledCover = null;
+    private SKBitmap _cachedScaledCover = null;
     private int _cachedCoverSubfileIndex = -1;
     private int _cachedCoverSize = 0;
     
     // 静态 UI 图层缓存（包含不变的标签文本）
-    private Image<Rgba32> _staticUILayer = null;
+    private SKBitmap _staticUILayer = null;
     private bool _staticUILayerValid = false;
     
     // 高级切换动画状态（基于时间）
     private string _prevDisplayInfo = "";         // 前一首显示信息（用于字符动画）
     private string _prevTimeString = "";          // 前一首时间字符串
     private float[] _prevWaveformPeaks = null;    // 前一首波形数据
-    private Image<Rgba32> _prevScaledCover = null; // 前一首缩放后的封面
+    private SKBitmap _prevScaledCover = null;     // 前一首缩放后的封面
     private byte[] _prevCoverHash = null;         // 前一首封面哈希（用于判断是否相同）
     private double _animationStartTime = -1;      // 动画开始时间（秒）
     private double _currentVideoTime = 0;         // 当前视频时间（秒）
     private const double AnimationDurationSeconds = 0.5; // 动画持续时间（秒）
+    
+    // 字符动画缓存（避免每帧分配列表）
+    private readonly List<(char c, float x, float width)> _oldCharPositions = new();
+    private readonly List<(char c, float x, float width)> _newCharPositions = new();
+    
+    // 波形点缓存（用于重用 SKPoint 数组）
+    private SKPoint[] _waveformPointCache = null;
+    
+    // 可复用的 Paint 对象（避免每帧创建）
+    private readonly SKPaint _fillPaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
+    private readonly SKPaint _strokePaint = new() { IsAntialias = true, Style = SKPaintStyle.Stroke };
+    private readonly SKPaint _textPaint = new() { IsAntialias = true, SubpixelText = true, Style = SKPaintStyle.Fill };
+    private readonly SKPaint _imagePaint = new() { FilterQuality = SKFilterQuality.None };  // 最近邻插值
     
     // Ease-out 缓动函数（快到慢）
     private static float EaseOutCubic(float t) => 1f - MathF.Pow(1f - t, 3f);
@@ -111,7 +121,7 @@ public class Generator
     private static float EaseInOutQuad(float t) => t < 0.5f ? 2f * t * t : 1f - MathF.Pow(-2f * t + 2f, 2f) / 2f;
     
     // 计算封面图像的简单哈希（用于比较是否相同）
-    private static byte[] ComputeImageHash(Image<Rgba32> image)
+    private static byte[] ComputeImageHash(SKBitmap image)
     {
         if (image == null) return null;
         // 简单取样哈希：取四角和中心的像素值
@@ -121,11 +131,11 @@ public class Generator
         int idx = 0;
         foreach (var (x, y) in positions)
         {
-            var pixel = image[x, y];
-            hash[idx++] = pixel.R;
-            hash[idx++] = pixel.G;
-            hash[idx++] = pixel.B;
-            hash[idx++] = pixel.A;
+            var pixel = image.GetPixel(x, y);
+            hash[idx++] = pixel.Red;
+            hash[idx++] = pixel.Green;
+            hash[idx++] = pixel.Blue;
+            hash[idx++] = pixel.Alpha;
         }
         return hash;
     }
@@ -142,22 +152,23 @@ public class Generator
     }
     
     // 测量文本宽度
-    private float MeasureTextWidth(string text, Font font)
+    private float MeasureTextWidth(string text, float fontSize)
     {
         if (string.IsNullOrEmpty(text)) return 0;
         
         // 使用缓存避免重复测量相同文本
-        var key = (text, font.GetHashCode());
+        var key = (text, fontSize);
         if (_textWidthCache.TryGetValue(key, out float cachedWidth))
         {
             return cachedWidth;
         }
         
         // 缓存未命中，执行测量
-        var bounds = TextMeasurer.MeasureBounds(text, new TextOptions(font));
-        float width = bounds.Width;
+        _textPaint.TextSize = fontSize;
+        _textPaint.Typeface = _typeface;
+        float width = _textPaint.MeasureText(text);
         
-        // 缓存清理（别弄了我要死了）
+        // 缓存清理
         if (_textWidthCache.Count >= MaxTextCacheSize)
         {
             _textWidthCache.Clear();
@@ -167,11 +178,84 @@ public class Generator
         return width;
     }
     
-    // 预渲染渐变遮罩图像
-    private void EnsureGradientMasksCached(float shadowY1, float shadowY2, float gradientHeight)
+    // 裁剪文本以适应指定宽度（使用省略号）
+    private string ClampTextToWidth(string text, float fontSize, float maxWidth)
+    {
+        if (string.IsNullOrEmpty(text) || maxWidth <= 0) return text;
+        float textWidth = MeasureTextWidth(text, fontSize);
+        if (textWidth <= maxWidth) return text;
+        
+        const string ellipsis = "…";
+        float ellipsisWidth = MeasureTextWidth(ellipsis, fontSize);
+        float availableWidth = maxWidth - ellipsisWidth;
+        
+        // 二分查找最大可容纳字符数
+        int lo = 0, hi = text.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi + 1) / 2;
+            if (MeasureTextWidth(text[..mid], fontSize) <= availableWidth)
+                lo = mid;
+            else
+                hi = mid - 1;
+        }
+        return lo > 0 ? text[..lo] + ellipsis : ellipsis;
+    }
+    
+    // 计算并填充每个字符的位置信息
+    private void PopulateCharacterPositions(string text, float fontSize, List<(char c, float x, float width)> positions)
+    {
+        positions.Clear();
+        if (string.IsNullOrEmpty(text)) return;
+        
+        _textPaint.Typeface = _typeface;
+        _textPaint.TextSize = fontSize;
+        
+        float currentX = 0f;
+        foreach (char c in text)
+        {
+            string charStr = c.ToString();
+            float charWidth = _textPaint.MeasureText(charStr);
+            positions.Add((c, currentX, charWidth));
+            currentX += charWidth;
+        }
+    }
+    
+    // 确保帧画布已创建（复用 SKCanvas 避免重复分配）
+    private void EnsureFrameCanvas()
+    {
+        if (_frameContent == null) return;
+        _frameCanvas ??= new SKCanvas(_frameContent);
+    }
+    
+    // 通用文本绘制辅助方法，支持对齐和字体大小
+    private void DrawText(float x, float y, float fontSize, string text, SKColor color,
+        VerticalAlign vAlign = VerticalAlign.Top, HorizontalAlign hAlign = HorizontalAlign.Left, SKTypeface typeface = null)
+    {
+        if (string.IsNullOrEmpty(text) || _frameCanvas == null) return;
+        typeface ??= _typeface;
+        _frameCanvas.DrawTextAndCache(typeface, fontSize, text, x, y, color, hAlign, vAlign);
+    }
+    
+    // 绘制多行文本（自动换行并居中，用于 Intro 文案）
+    private void DrawMultilineCentered(string text, float centerX, float centerY, float fontSize, SKColor color, float lineSpacingMultiplier = 1.25f)
+    {
+        if (string.IsNullOrEmpty(text) || _frameCanvas == null) return;
+        string[] lines = text.Split('\n');
+        float lineSpacing = fontSize * lineSpacingMultiplier;
+        float totalHeight = lineSpacing * (lines.Length - 1);
+        for (int i = 0; i < lines.Length; i++)
+        {
+            float lineY = centerY - totalHeight / 2f + i * lineSpacing;
+            DrawText(centerX, lineY, fontSize, lines[i], color, VerticalAlign.Center, HorizontalAlign.Center);
+        }
+    }
+    
+    // 预渲染渐变着色器（SKShader）
+    private void EnsureGradientShadersCached(float shadowY1, float shadowY2, float gradientHeight)
     {
         // 检查是否需要重新生成缓存
-        if (_cachedTopGradientMask != null && 
+        if (_cachedTopGradientShader != null && 
             Math.Abs(_cachedGradientY1 - shadowY1) < 0.1f &&
             Math.Abs(_cachedGradientY2 - shadowY2) < 0.1f &&
             Math.Abs(_cachedGradientHeight - gradientHeight) < 0.1f)
@@ -180,38 +264,30 @@ public class Generator
         }
         
         // 释放旧缓存
-        _cachedTopGradientMask?.Dispose();
-        _cachedBottomGradientMask?.Dispose();
+        _cachedTopGradientShader?.Dispose();
+        _cachedBottomGradientShader?.Dispose();
         
-        int maskWidth = OutputVideoWidth;
-        int maskHeight = (int)gradientHeight;
-        if (maskHeight < 1) maskHeight = 1;
+        // 背景色（深灰色）
+        var bgColor = new SKColor(16, 16, 16);
+        var bgColorTransparent = new SKColor(16, 16, 16, 0);
         
-        // 创建顶部渐变遮罩（从不透明到透明）
-        _cachedTopGradientMask = new Image<Rgba32>(maskWidth, maskHeight);
-        _cachedTopGradientMask.Mutate(ctx => ctx.Fill(
-            new LinearGradientBrush(
-                new PointF(0, 0),
-                new PointF(0, maskHeight),
-                GradientRepetitionMode.None,
-                new ColorStop(0.5f, Color.FromRgba(16, 16, 16, 255)),
-                new ColorStop(1f, Color.FromRgba(16, 16, 16, 0))
-            ),
-            new RectangleF(0, 0, maskWidth, maskHeight)
-        ));
+        // 创建顶部渐变着色器（从不透明到透明）
+        _cachedTopGradientShader = SKShader.CreateLinearGradient(
+            new SKPoint(0, shadowY1),
+            new SKPoint(0, shadowY1 + gradientHeight),
+            new[] { bgColor, bgColorTransparent },
+            new[] { 0.5f, 1f },
+            SKShaderTileMode.Clamp
+        );
         
-        // 创建底部渐变遮罩（从透明到不透明）
-        _cachedBottomGradientMask = new Image<Rgba32>(maskWidth, maskHeight);
-        _cachedBottomGradientMask.Mutate(ctx => ctx.Fill(
-            new LinearGradientBrush(
-                new PointF(0, 0),
-                new PointF(0, maskHeight),
-                GradientRepetitionMode.None,
-                new ColorStop(0f, Color.FromRgba(16, 16, 16, 0)),
-                new ColorStop(0.5f, Color.FromRgba(16, 16, 16, 255))
-            ),
-            new RectangleF(0, 0, maskWidth, maskHeight)
-        ));
+        // 创建底部渐变着色器（从透明到不透明）
+        _cachedBottomGradientShader = SKShader.CreateLinearGradient(
+            new SKPoint(0, shadowY2 - gradientHeight),
+            new SKPoint(0, shadowY2),
+            new[] { bgColorTransparent, bgColor },
+            new[] { 0f, 0.5f },
+            SKShaderTileMode.Clamp
+        );
         
         // 更新缓存标记
         _cachedGradientY1 = shadowY1;
@@ -222,7 +298,7 @@ public class Generator
     // 公共方法：请求停止生成
     public void RequestStop() => _exitRequested = true;
 
-    // 预渲染静态 UI 图层（包含不变的标签文本）
+    // 预渲染静态 UI 图层（仅包含灰色标签，数值在动态层绘制）
     private void EnsureStaticUILayerCached(string avSettingsString, string readSpeedString)
     {
         if (_staticUILayerValid && _staticUILayer != null) return;
@@ -230,84 +306,41 @@ public class Generator
         // 释放旧缓存
         _staticUILayer?.Dispose();
         
-        // 创建透明图层
-        _staticUILayer = new Image<Rgba32>(OutputVideoWidth, OutputVideoHeight);
+        // 创建透明图层（BGRA8888 格式）
+        _staticUILayer = new SKBitmap(OutputVideoWidth, OutputVideoHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
+        using var canvas = new SKCanvas(_staticUILayer);
+        canvas.Clear(SKColors.Transparent);
         
-        // 预渲染所有静态文本标签
-        _staticUILayer.Mutate(ctx =>
-        {
-            // A/V SETTINGS 标签
-            ctx.DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(32, 32),
-            }, "A/V SETTINGS", Color.DimGray)
-            // A/V SETTINGS 值
-            .DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(32, 32 + 24),
-            }, avSettingsString, Color.White)
-            // ABS. OFFSET 标签
-            .DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(OutputVideoWidth - 32, 32),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, "ABS. OFFSET", Color.DimGray)
-            // BITRATE 标签
-            .DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(OutputVideoWidth - 256, 32),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, "BITRATE", Color.DimGray)
-            // BITRATE 值（静态）
-            .DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, readSpeedString, Color.White);
-            
-            // Author（如果有）
-            if (Author != null)
-            {
-                ctx.DrawText(new RichTextOptions(_font32)
-                {
-                    Origin = new Vector2(OutputVideoWidth / 2f, 32 + 24),
-                    VerticalAlignment = VerticalAlignment.Center,
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                }, Author, Color.White);
-            }
-        });
+        // 颜色定义
+        var dimGray = new SKColor(105, 105, 105);
+        
+        // A/V SETTINGS 标签（左上角，x=32 左对齐）
+        canvas.DrawTextAndCache(_typeface, _fontSize16, "A/V SETTINGS", 32, 32, dimGray, HorizontalAlign.Left, VerticalAlign.Top);
+        
+        // ABS. OFFSET 标签（右上角，x=右边界，右对齐）
+        canvas.DrawTextAndCache(_typeface, _fontSize16, "ABS. OFFSET", OutputVideoWidth - 32, 32, dimGray, HorizontalAlign.Right, VerticalAlign.Top);
+        
+        // BITRATE 标签（ABS. OFFSET 左侧，间隔 240px，x=右边界，右对齐）
+        canvas.DrawTextAndCache(_typeface, _fontSize16, "BITRATE", OutputVideoWidth - 280, 32, dimGray, HorizontalAlign.Right, VerticalAlign.Top);
         
         _staticUILayerValid = true;
         Logger.Info("静态 UI 图层已预渲染");
     }
-
+    // 获取当前帧的 BGRA 字节数组（用于 WPF 显示）
     public byte[] GetCurrentFrameAsBgra()
     {
         if (_frameContent == null) return null;
         
         try
         {
-            var width = _frameContent.Width;
-            var height = _frameContent.Height;
-            var data = new byte[width * height * 4];
+            int width = _frameContent.Width;
+            int height = _frameContent.Height;
             
-            _frameContent.ProcessPixelRows(pa =>
-            {
-                for (int y = 0; y < pa.Height; y++)
-                {
-                    var row = pa.GetRowSpan(y);
-                    for (int x = 0; x < pa.Width; x++)
-                    {
-                        var pixel = row[x];
-                        int idx = (y * width + x) * 4;
-                        // BGRA 格式（WPF 使用）
-                        data[idx + 0] = pixel.B;
-                        data[idx + 1] = pixel.G;
-                        data[idx + 2] = pixel.R;
-                        data[idx + 3] = pixel.A;
-                    }
-                }
-            });
+            // 使用 GetPixelSpan 高效获取像素数据（SkiaSharp 使用 BGRA 格式）
+            ReadOnlySpan<byte> srcSpan = _frameContent.GetPixelSpan();
+            
+            byte[] data = new byte[width * height * 4];
+            srcSpan.CopyTo(data);
             
             return data;
         }
@@ -339,462 +372,19 @@ public class Generator
         _outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
     }
 
-    // 渲染指定位置的预览帧（progress: 0-1）
-    public void RenderPreviewFrame(float progress)
-    {
-        if (InputFileStream == null) return;
-        
-        progress = Math.Clamp(progress, 0f, 1f);
-        long currentOffset = (long)(InputFileStream.Length * progress);
-        
-        // 对齐到帧边界
-        currentOffset = currentOffset - (currentOffset % (WaterfallWidth * 4));
-        if (currentOffset < 0) currentOffset = 0;
-        if (currentOffset >= InputFileStream.Length) currentOffset = InputFileStream.Length - WaterfallFrameLength;
-        
-        // 计算帧起始偏移
-        long frameStartByteOffset = currentOffset - (WaterfallFrameLength / 2);
-        int playHeadRelPos = 0;
-        
-        if (frameStartByteOffset < 0)
-        {
-            playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallWidth * 4));
-            frameStartByteOffset = 0;
-        }
-        else if (frameStartByteOffset + WaterfallFrameLength >= InputFileStream.Length)
-        {
-            playHeadRelPos = (int)((InputFileStream.Length - (frameStartByteOffset + WaterfallFrameLength)) / (WaterfallWidth * 4));
-            frameStartByteOffset = InputFileStream.Length - WaterfallFrameLength;
-        }
-        
-        // 读取视频字节（使用 ReadExactly 确保读取完整）
-        InputFileStream.Position = frameStartByteOffset;
-        byte[] currentVideoBuffer = new byte[WaterfallFrameLength];
-        InputFileStream.ReadExactly(currentVideoBuffer, 0, WaterfallFrameLength);
-        
-        // 创建瀑布视图
-        _viewportFramebuf?.Dispose();
-        _viewportFramebuf = Image.LoadPixelData<Rgba32>(currentVideoBuffer, WaterfallWidth, WaterfallHeight);
-        _viewportFramebuf.ProcessPixelRows(pa =>
-        {
-            for (int y = 0; y < pa.Height; y++)
-            {
-                var row = pa.GetRowSpan(y);
-                for (int x = 0; x < row.Length; x++)
-                {
-                    row[x].A = 255;
-                }
-            }
-        });
-        _viewportFramebuf.Mutate(vctx => vctx
-            .Flip(FlipMode.Vertical)
-            .Resize(WaterfallScaledWidth, WaterfallScaledHeight, new NearestNeighborResampler()));
-        
-        // 查找当前偏移对应的子文件
-        KeyValuePair<int, SubFile>? currentSubfile = null;
-        float subfileWindowIndex = 0f;
-        for (int sfi = 0; sfi < _subfiles.Count; sfi++)
-        {
-            var sf = _subfiles[sfi];
-            if (currentOffset >= sf.StartOffset && currentOffset < sf.StartOffset + sf.Length)
-            {
-                currentSubfile = new(sfi, sf);
-                subfileWindowIndex = sfi;
-                break;
-            }
-        }
-
-        // 绘制预览帧（完整布局）
-        _frameContent.Mutate(ctx =>
-        {
-            ctx.Clear(new Rgba32(16, 16, 16, 255));
-            
-            float s = ResolutionScale;
-            
-            // 布局参数
-            int rightPanelX1 = _videoFrameX2 + (int)(64 * s);
-            int rightPanelX2 = OutputVideoWidth - (int)(32 * s);
-            int subfileX1 = rightPanelX1;
-            int subfileX2 = rightPanelX2;
-            int audioVisX1 = rightPanelX1;
-            int audioVisX2 = rightPanelX2;
-            float subfileH = 48f * s;
-            float shadowY1 = (OutputVideoHeight / 2f) - subfileH * 8.5f;
-            float shadowY2 = (OutputVideoHeight / 2f) + subfileH * 6.5f;
-            
-            // 右侧面板垂直范围
-            float rightPanelTop = shadowY1 + subfileH * 2f + 16f * s;
-            float rightPanelBottom = shadowY2 - 16f * s;
-            float rightPanelHeight = rightPanelBottom - rightPanelTop;
-            float listHeight = rightPanelHeight * 0.20f;
-            float listTop = rightPanelTop;
-            float listBottom = listTop + listHeight;
-            
-            // 绘制瀑布视图
-            ctx.DrawImage(_viewportFramebuf, new Point(_videoFrameX1, _videoFrameY1), 1f);
-            
-            // 播放指示器
-            ctx.DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(32, (OutputVideoHeight / 2f) + (playHeadRelPos * (WaterfallScaledHeight / (float)WaterfallHeight))),
-                VerticalAlignment = VerticalAlignment.Center,
-            }, "▶", Color.White);
-            
-            // 绘制右上歌曲/子文件列表
-            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
-            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 2));
-            float subfileRowH = 36f * s; // 行高
-            float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
-            
-            for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
-            {
-                if (sfi < 0 || sfi >= _subfiles.Count)
-                {
-                    subfileY += subfileRowH;
-                    continue;
-                }
-
-                var subfile = _subfiles[sfi];
-                bool isMainSubfile = sfi == (currentSubfile?.Key ?? -1);
-
-                // （_font24 代替 _font32）
-                ctx.DrawText(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(subfileX1, subfileY),
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, isMainSubfile ? "▶" : " ", Color.White)
-                .DrawText(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(subfileX1 + 24 * s, subfileY),
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 40)}", Color.White)
-                .DrawText(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(subfileX2, subfileY),
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, Utils.ToByteSizeString(subfile.Length), Color.DimGray);
-
-                if (isMainSubfile)
-                {
-                    float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
-                    float progressY = subfileY + 22 * s; // 间距
-                    ctx.DrawText(new RichTextOptions(_font16)
-                    {
-                        Origin = new PointF(subfileX1 + 40 * s, progressY),
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center,
-                    }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", Color.White)
-                    .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
-                }
-
-                subfileY += subfileRowH;
-            }
-            
-            // 音频可视化占位符区域
-            float audioVisTop = listBottom + 16f;
-            float audioVisBottom = rightPanelBottom;
-            if (audioVisBottom > audioVisTop + 16f)
-            {
-                var audioVisRegion = new RectangleF(audioVisX1, audioVisTop, audioVisX2 - audioVisX1, audioVisBottom - audioVisTop);
-                
-                // 绘制占位符边框和文字
-                ctx.Draw(Color.FromRgba(80, 80, 80, 128), 1f, audioVisRegion);
-                ctx.DrawText(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(audioVisRegion.X + audioVisRegion.Width / 2, audioVisRegion.Y + audioVisRegion.Height / 2),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, "🎵 音频可视化\n（导出时显示波形和频谱）", Color.FromRgba(128, 128, 128, 200));
-            }
-            
-            // 顶部/底部渐变遮罩
-            ctx.Fill(
-                new LinearGradientBrush(
-                    new PointF(0, shadowY1),
-                    new PointF(0, shadowY1 + subfileH * 2f),
-                    GradientRepetitionMode.None,
-                    new(0.5f, Color.FromRgba(16, 16, 16, 255)),
-                    new(1, Color.FromRgba(16, 16, 16, 0))
-                ),
-                new RectangleF(0, shadowY1, OutputVideoWidth, subfileH * 2f)
-            )
-            .Fill(
-                new LinearGradientBrush(
-                    new PointF(0, shadowY2),
-                    new PointF(0, shadowY2 + subfileH * 2f),
-                    GradientRepetitionMode.None,
-                    new(0, Color.FromRgba(16, 16, 16, 0)),
-                    new(0.5f, Color.FromRgba(16, 16, 16, 255))
-                ),
-                new RectangleF(0, shadowY2, OutputVideoWidth, subfileH * 2f)
-            );
-            
-            // 专辑/目录抬头文字
-            string albumHeaderText = "";
-            if (currentSubfile?.Value != null)
-            {
-                var sfValue = currentSubfile.Value.Value;
-                if (!string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
-                {
-                    albumHeaderText = sfValue.AlbumTitle;
-                    if (!string.IsNullOrWhiteSpace(sfValue.AlbumArtistName))
-                    {
-                        albumHeaderText += " // " + sfValue.AlbumArtistName;
-                    }
-                }
-                else
-                {
-                    albumHeaderText = sfValue.FileDirectory ?? "";
-                }
-            }
-            
-            ctx.DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(subfileX1 + 40, rightPanelTop - 24f),
-                VerticalAlignment = VerticalAlignment.Center,
-            }, Utils.TruncateString(albumHeaderText, 72), Color.DimGray);
-            
-            // A/V 设置信息
-            string avSettingsString = $"{OutputVideoWidth}×{OutputVideoHeight} @ {OutputFps} fps\n" +
-                $"{AudioOutputSampleRate / 1000}kHz {AudioOutputChannelCount}ch\n" +
-                $"RGBA (32bpp), {WaterfallWidth} px/line";
-            string readSpeedString = $"{InputBytesPerSecond / 1024} KiB/s";
-            
-            ctx.DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(32, 32),
-            }, "A/V SETTINGS", Color.DimGray)
-            .DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(32, 32 + 24),
-            }, avSettingsString, Color.White)
-            .DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(OutputVideoWidth - 32, 32),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, "ABS. OFFSET", Color.DimGray)
-            .DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(OutputVideoWidth - 32, 32 + 24),
-                HorizontalAlignment = HorizontalAlignment.Right,
-                TextAlignment = TextAlignment.End,
-            }, $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", Color.White)
-            .DrawText(new RichTextOptions(_font24)
-            {
-                Origin = new Vector2(OutputVideoWidth - 256, 32),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, "BITRATE", Color.DimGray)
-            .DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, readSpeedString, Color.White);
-            
-            // 作者（顶部中央）
-            if (!string.IsNullOrEmpty(Author))
-            {
-                ctx.DrawText(new RichTextOptions(_font32)
-                {
-                    Origin = new Vector2(OutputVideoWidth / 2f, 32 + 24),
-                    VerticalAlignment = VerticalAlignment.Center,
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                }, Author, Color.White);
-            }
-            
-            // 底部播放器区域
-            float bottomPanelHeight = 100f * s;
-            float bottomY = OutputVideoHeight - bottomPanelHeight - 16f * s;
-            float coverSize = 72f * s;
-            float coverX = 32f * s;
-            float coverY = bottomY + (bottomPanelHeight - coverSize) / 2f;
-            float infoX = coverX + coverSize + 16f * s;
-            float timeX = OutputVideoWidth - 32f * s;
-            
-            // 获取当前歌曲信息
-            string trackName = "";
-            string artistName = "";
-            string genreText = "";
-            TimeSpan currentTime = TimeSpan.Zero;
-            TimeSpan totalTime = TimeSpan.Zero;
-            float trackProgress = 0f;
-            Image coverImage = null;
-            
-            if (currentSubfile?.Value != null)
-            {
-                var sf = currentSubfile.Value.Value;
-                trackName = !string.IsNullOrWhiteSpace(sf.TrackTitle) ? sf.TrackTitle : sf.FileName;
-                // 作曲家：优先使用 Composer，其次 Artist，最后 AlbumArtist
-                artistName = sf.ComposerName ?? sf.ArtistName ?? sf.AlbumArtistName ?? "";
-                genreText = sf.Genre ?? "";
-                coverImage = sf.Icon;
-                
-                if (InputBytesPerSecond > 0)
-                {
-                    totalTime = TimeSpan.FromSeconds(sf.Length / (double)InputBytesPerSecond);
-                    long offsetInTrack = currentOffset - sf.StartOffset;
-                    currentTime = TimeSpan.FromSeconds(Math.Max(0, offsetInTrack) / (double)InputBytesPerSecond);
-                    trackProgress = Math.Clamp((float)offsetInTrack / sf.Length, 0f, 1f);
-                }
-            }
-            
-            // 预览模式不需要过渡动画
-            float transitionT = 1f;
-            bool isInTransition = false;
-            byte contentAlpha = 255;
-            int currSubIdx = currentSubfile?.Key ?? 0;
-            Color labelColor = Color.FromRgba(105, 105, 105, 255);
-            Color textColor = Color.FromRgba(255, 255, 255, 255);
-            
-            // 绘制封面
-            var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
-            ctx.Fill(Color.FromRgba(32, 32, 32, 255), coverRect);
-            ctx.Draw(Color.FromRgba(200, 200, 200, 255), 2f, coverRect);
-            
-            if (coverImage != null)
-            {
-                using var scaledCover = coverImage.Clone(imgCtx => imgCtx.Resize((int)coverSize - 4, (int)coverSize - 4));
-                ctx.DrawImage(scaledCover, new Point((int)(coverX + 2), (int)(coverY + 2)), transitionT);
-            }
-            else
-            {
-                ctx.DrawText(new RichTextOptions(_font48)
-                {
-                    Origin = new Vector2(coverX + coverSize / 2, coverY + coverSize / 2),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, "♪", Color.FromRgba(100, 100, 100, contentAlpha));
-            }
-            
-            // 标签行位置
-            float labelY = bottomY + 4f * s;
-            float valueY = labelY + 18f * s;
-            float waveformY = valueY + 32f * s;
-            
-            // 测量文本宽度以动态定位标签
-            float trackNameWidth = MeasureTextWidth(trackName, _font32);
-            float separatorWidth = MeasureTextWidth(" // ", _font32);
-            float artistNameWidth = MeasureTextWidth(artistName, _font32);
-            
-            bool hasArtist = !string.IsNullOrWhiteSpace(artistName);
-            bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
-            
-            // 计算标签位置
-            float titleLabelX = infoX;
-            float composerLabelX = infoX + trackNameWidth + separatorWidth;
-            float genreLabelX = infoX + trackNameWidth + (hasArtist ? separatorWidth + artistNameWidth : 0);
-            
-            // 过渡动画：标签偏移
-            float labelOffsetX = isInTransition ? (1f - transitionT) * 50f * s : 0f;
-            
-            // 绘制 Title: 标签
-            ctx.DrawText(new RichTextOptions(_font16)
-            {
-                Origin = new Vector2(titleLabelX + labelOffsetX, labelY),
-            }, "Title:", labelColor);
-            
-            // 绘制 Composer: 标签（仅当有艺术家时）
-            if (hasArtist)
-            {
-                ctx.DrawText(new RichTextOptions(_font16)
-                {
-                    Origin = new Vector2(composerLabelX + labelOffsetX, labelY),
-                }, "Composer:", labelColor);
-            }
-            
-            // 绘制 Genre: 标签（仅当有风格时）
-            if (hasGenre)
-            {
-                ctx.DrawText(new RichTextOptions(_font16)
-                {
-                    Origin = new Vector2(genreLabelX + labelOffsetX, labelY),
-                }, "Genre:", labelColor);
-            }
-            
-            // 绘制 Time: 标签
-            ctx.DrawText(new RichTextOptions(_font16)
-            {
-                Origin = new Vector2(timeX, labelY),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, "Time:", labelColor);
-            
-            // 构建歌曲信息
-            string displayInfo = trackName;
-            if (hasArtist) displayInfo += $" // {artistName}";
-            if (hasGenre) displayInfo += $" [{genreText}]";
-            
-            ctx.DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(infoX, valueY),
-                WrappingLength = timeX - infoX - 120f * s,
-            }, Utils.TruncateString(displayInfo, 55), textColor);
-            
-            // 时间显示
-            string timeString = $"{(int)currentTime.TotalMinutes}:{currentTime.Seconds:D2} / {(int)totalTime.TotalMinutes}:{totalTime.Seconds:D2}";
-            ctx.DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(timeX, valueY),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            }, timeString, textColor);
-            
-            // 波形进度条
-            float waveformX1 = infoX;
-            float waveformX2 = timeX;
-            float waveformHeight = 20f * s;
-            var waveformRect = new RectangleF(waveformX1, waveformY, waveformX2 - waveformX1, waveformHeight);
-            ctx.Fill(Color.FromRgba(40, 40, 40, contentAlpha), waveformRect);
-            
-            float barWidth = 2f;
-            float barSpacing = 1f;
-            int totalBars = (int)(waveformRect.Width / (barWidth + barSpacing));
-            float progressX = waveformRect.X + waveformRect.Width * trackProgress;
-            float gapWidth = 4f * s;
-            
-            for (int i = 0; i < totalBars; i++)
-            {
-                float barX = waveformRect.X + i * (barWidth + barSpacing);
-                float heightRatio = 0.3f + 0.6f * (float)Math.Abs(Math.Sin(i * 0.4 + currSubIdx * 0.1));
-                float barHeight = waveformHeight * heightRatio * 0.85f;
-                float barY = waveformRect.Y + (waveformHeight - barHeight) / 2f;
-                
-                if (barX > progressX - gapWidth && barX < progressX + gapWidth)
-                    continue;
-                
-                Color barColor = barX < progressX 
-                    ? Color.FromRgba(100, 100, 100, contentAlpha)
-                    : Color.FromRgba(220, 220, 220, contentAlpha);
-                
-                ctx.Fill(barColor, new RectangleF(barX, barY, barWidth, barHeight));
-            }
-            
-            // 绘制播放头
-            float headlineWidth = 2f;
-            float borderWidth = 2f;
-            
-            ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(
-                progressX - headlineWidth / 2 - borderWidth, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
-            ctx.Fill(Color.FromRgba(255, 255, 255, contentAlpha), new RectangleF(
-                progressX - headlineWidth / 2, waveformRect.Y - 2f, headlineWidth, waveformHeight + 4f));
-            ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(
-                progressX + headlineWidth / 2, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
-        });
-    }
-
     #endregion
 
-    #region ImageSharp-specific
+    #region SkiaSharp-specific
 
-    private FontCollection _fontCollection;
-    private FontFamily _fontFamily, _emojiFontFamily;
-    private Font _font16, _font24, _font32, _font48;
-    private readonly DrawingOptions _drawOpts = new()
-    {
-        GraphicsOptions = new()
-        {
-            Antialias = true,
-            AntialiasSubpixelDepth = 0, // coalesced value
-        }
-    };
+    // 字体相关
+    private SKTypeface _typeface;
+    private SKTypeface _emojiTypeface;
+    
+    // 不同大小的字体尺寸（根据分辨率缩放）
+    private float _fontSize16, _fontSize24, _fontSize32, _fontSize48;
+    
+    // 抗锯齿设置
+    private bool _fontAntialiasing = true;
 
     #endregion
 
@@ -839,7 +429,7 @@ public class Generator
     public int InputBytesPerSecond { get; set; } = 48000 * 2;
     public string FontName { get; set; } = null;
     [CliParameter("Font Antialiasing", "font-antialiasing")]
-    public bool FontAntialiasing { get => _drawOpts.GraphicsOptions.Antialias; set => _drawOpts.GraphicsOptions.Antialias = value; }
+    public bool FontAntialiasing { get => _fontAntialiasing; set => _fontAntialiasing = value; }
 
     #endregion
 
@@ -980,13 +570,10 @@ public class Generator
         // 使用 CSCore 初始化真实音频解码器，并让输出采样率/声道数跟随解码器参数
         InitializeAudioDecoder();
 
-        if (_drawOpts.GraphicsOptions.Antialias)
-        {
-            if (_drawOpts.GraphicsOptions.AntialiasSubpixelDepth < 0)
-            {
-                _drawOpts.GraphicsOptions.AntialiasSubpixelDepth = 1;
-            }
-        }
+        // 配置画笔的抗锯齿设置
+        _fillPaint.IsAntialias = _fontAntialiasing;
+        _strokePaint.IsAntialias = _fontAntialiasing;
+        _textPaint.IsAntialias = _fontAntialiasing;
 
         LogGeneratorStatus();
     }
@@ -1107,7 +694,7 @@ public class Generator
     {
         Logger.Debug($"Selected parser: {Parser?.GetType().GetCustomAttribute<ParserAttribute>()?.Name ?? "<null>"}");
         Logger.Debug($"Selected exporter: {Exporter?.GetType().GetCustomAttribute<ExporterAttribute>()?.Name ?? "<null>"}");
-        Logger.Debug($"Selected font: {_fontFamily.Name ?? "<null>"}");
+        Logger.Debug($"Selected font: {_typeface?.FamilyName ?? "<null>"}");
         Logger.Debug($"Read speed: {InputBytesPerFrame} bytes/frame ({InputBytesPerSecond} bytes/second)");
         Logger.Debug($"Waterfall duration will be around {TimeSpan.FromSeconds(InputFileStream.Length / InputBytesPerSecond)}.");
         Logger.Debug($"Video input:  {WaterfallWidth}×{WaterfallHeight}");
@@ -1117,50 +704,130 @@ public class Generator
 
     private void InitializeFonts()
     {
-        Logger.Info("Loading fonts…");
+        Logger.Info("Loading fonts (SkiaSharp)…");
         Logger.Debug($"Requested font: '{FontName}'.");
 
-        if (_fontCollection == null)
+        // 尝试按用户指定的字体名加载
+        if (!string.IsNullOrEmpty(FontName))
         {
-            _fontCollection = new();
-            _fontCollection.AddSystemFonts();
-        }
-
-        if (FontName != null)
-        {
-            // Try getting the font by the font name specified by the user
-            if (!_fontCollection.TryGet(FontName, out _fontFamily))
+            _typeface = TryLoadFont(FontName);
+            if (_typeface == null)
             {
-                Logger.Error($"Cannot find font '{FontName}'.");
+                Logger.Error($"Cannot find font '{FontName}', using fallback.");
             }
         }
 
-        if (_fontFamily.Name == null)
+        // 如果用户指定的字体不可用，尝试备选字体
+        if (_typeface == null)
         {
-            // 默认字体 unifont
-            if (_fontCollection.TryGet("unifont", out _fontFamily))
-            {
-                // unifont upper
-                _fontCollection.TryGet("unifont upper", out _emojiFontFamily);
-            }
+            // 按优先级尝试字体（包含大小写变体）
+            string[] fallbackFonts = Environment.OSVersion.Platform == PlatformID.Win32NT
+                ? new[] { "Unifont", "unifont", "UNIFONT", "Unifont Upper", "Segoe UI Symbol", "Consolas", "Microsoft YaHei" }
+                : new[] { "Unifont", "unifont", "Source Code Pro", "DejaVu Sans Mono", "Liberation Mono" };
 
-            else if (Environment.OSVersion.Platform == PlatformID.Win32NT && _fontCollection.TryGet("Segoe UI Symbol", out _fontFamily))
+            foreach (var fontName in fallbackFonts)
             {
-            // 没有以上字体后使用 Segoe UI Symbol
-            }
-            else
-            {
-                // 最后回退 Consolas / Source Code Pro
-                _fontFamily = _fontCollection.Get(Environment.OSVersion.Platform == PlatformID.Win32NT ? "Consolas" : "Source Code Pro");
+                _typeface = TryLoadFont(fontName);
+                if (_typeface != null)
+                {
+                    Logger.Debug($"Using fallback font: '{fontName}' → '{_typeface.FamilyName}'");
+                    break;
+                }
             }
         }
+        
+        // 尝试从常见路径加载 unifont TTF 文件
+        if (_typeface == null)
+        {
+            _typeface = TryLoadUnifontFromFile();
+        }
+
+        // 最后回退到默认字体
+        _typeface ??= SKTypeface.Default;
+        Logger.Debug($"Selected font: '{_typeface?.FamilyName ?? "Default"}'");
+
+        // 尝试加载 emoji 字体
+        _emojiTypeface = SKTypeface.FromFamilyName("Segoe UI Emoji") 
+            ?? SKTypeface.FromFamilyName("Noto Color Emoji")
+            ?? _typeface;
 
         // 根据分辨率缩放字体大小
         float scale = ResolutionScale;
-        _font48 = _fontFamily.CreateFont(48f * scale, FontStyle.Regular);
-        _font32 = _fontFamily.CreateFont(32f * scale, FontStyle.Regular);
-        _font24 = _fontFamily.CreateFont(24f * scale, FontStyle.Regular);
-        _font16 = _fontFamily.CreateFont(16f * scale, FontStyle.Regular);
+        _fontSize48 = 48f * scale;
+        _fontSize32 = 32f * scale;
+        _fontSize24 = 24f * scale;
+        _fontSize16 = 16f * scale;
+
+        // 配置文本画笔的抗锯齿
+        _textPaint.IsAntialias = _fontAntialiasing;
+        _textPaint.Typeface = _typeface;
+    }
+    
+    // 尝试加载指定名称的字体（使用 SKFontManager 进行精确匹配）
+    private SKTypeface TryLoadFont(string fontName)
+    {
+        if (string.IsNullOrEmpty(fontName)) return null;
+        
+        // 使用 SKFontManager 进行精确匹配
+        var fontManager = SKFontManager.Default;
+        var typeface = fontManager.MatchFamily(fontName);
+        
+        // 检查是否真的找到了请求的字体（而不是回退字体）
+        if (typeface != null && 
+            typeface.FamilyName.Equals(fontName, StringComparison.OrdinalIgnoreCase))
+        {
+            Logger.Debug($"Font matched: '{fontName}' → '{typeface.FamilyName}'");
+            return typeface;
+        }
+        
+        // 如果 MatchFamily 返回了不同的字体，说明没有找到
+        Logger.Trace($"Font not found: '{fontName}' (got '{typeface?.FamilyName ?? "null"}')");
+        return null;
+    }
+    
+    // 尝试从常见路径加载 unifont TTF 文件
+    private SKTypeface TryLoadUnifontFromFile()
+    {
+        // Windows 和 Linux 的常见字体路径
+        string[] possiblePaths = Environment.OSVersion.Platform == PlatformID.Win32NT
+            ? new[]
+            {
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "unifont.ttf"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "unifont-15.1.05.ttf"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "Windows", "Fonts", "unifont.ttf"),
+                @"C:\Windows\Fonts\unifont.ttf",
+                @"C:\Windows\Fonts\unifont-15.1.05.ttf",
+            }
+            : new[]
+            {
+                "/usr/share/fonts/truetype/unifont/unifont.ttf",
+                "/usr/share/fonts/unifont/unifont.ttf",
+                "/usr/share/fonts/TTF/unifont.ttf",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".fonts", "unifont.ttf"),
+            };
+        
+        foreach (var path in possiblePaths)
+        {
+            if (System.IO.File.Exists(path))
+            {
+                try
+                {
+                    var typeface = SKTypeface.FromFile(path);
+                    if (typeface != null)
+                    {
+                        Logger.Info($"Loaded unifont from file: '{path}'");
+                        return typeface;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Trace($"Failed to load font from '{path}': {ex.Message}");
+                }
+            }
+        }
+        
+        Logger.Warning("unifont not found in system fonts or common file paths. Please install unifont TTF.");
+        return null;
     }
 
     private void InitializeExporter()
@@ -1636,7 +1303,7 @@ public class Generator
         // 尝试使用服务器 GC（如果可用会更高效）
         // 注意：服务器 GC 需要在 csproj 中配置 <ServerGarbageCollection>true</ServerGarbageCollection>
         
-        Logger.Info($"高性能模式已启用: {processorCount} 核心, 线程池 min={minWorkerThreads}/{minIOThreads} max={maxWorkerThreads}/{maxIOThreads}, GC={GCSettings.LatencyMode}");
+        Logger.Info($"GC已启用: {processorCount} 核心, 线程池 min={minWorkerThreads}/{minIOThreads} max={maxWorkerThreads}/{maxIOThreads}, GC={GCSettings.LatencyMode}");
     }
 
     // 生成开头的免责声明画面（可配置淡入淡出效果）
@@ -1644,71 +1311,49 @@ public class Generator
     {
         Logger.Info("Generating introduction…");
 
-        // 使用 IntroDuration 参数控制开场持续时间
-        var totalFrames = (int)(IntroDuration * OutputFps);
-        
-        // 淡入淡出的帧数（由 IntroFadeDuration 参数控制，可选）
-        int fadeFrames = IntroFadeEnabled ? (int)(IntroFadeDuration * OutputFps) : 0;
-        if (fadeFrames > 0)
-        {
-            fadeFrames = Math.Clamp(fadeFrames, 1, (int)(totalFrames / 3)); // 最多占总时长的 1/3
-        }
+        int totalFrames = Math.Max(1, (int)(IntroDuration * OutputFps));
+        int fadeFrames = IntroFadeEnabled ? Math.Clamp((int)(IntroFadeDuration * OutputFps), 1, Math.Max(1, totalFrames / 3)) : 0;
 
-        // 创建静音音频缓冲区（intro 阶段不播放音频）
-        // 重要：必须使用解码器的采样率和声道数，因为 FFmpeg 导出器期望输入格式与主视频阶段一致
-        int introSamplesPerChannel = AudioDecoderSampleRate / OutputFps;
+        int introSamplesPerChannel = Math.Max(1, AudioDecoderSampleRate / OutputFps);
         var silentAudioBuffer = new AudioBuffer(introSamplesPerChannel, AudioDecoderChannelCount);
         silentAudioBuffer.Clear();
 
-        for (long frameNumber = 0; frameNumber < totalFrames; frameNumber++)
+        EnsureFrameCanvas();
+        if (_frameCanvas == null)
         {
-            // 计算当前帧的不透明度（如果启用淡入淡出效果）
+            Logger.Error("Frame canvas is not initialized; cannot render intro.");
+            return;
+        }
+
+        for (int frameNumber = 0; frameNumber < totalFrames; frameNumber++)
+        {
             float opacity = 1f;
             if (IntroFadeEnabled && fadeFrames > 0)
             {
                 if (frameNumber < fadeFrames)
                 {
-                    // 淡入阶段
                     opacity = frameNumber / (float)fadeFrames;
                 }
                 else if (frameNumber >= totalFrames - fadeFrames)
                 {
-                    // 淡出阶段
                     opacity = (totalFrames - frameNumber) / (float)fadeFrames;
                 }
                 opacity = Math.Clamp(opacity, 0f, 1f);
             }
 
-            // 背景色
-            _frameContent.Mutate(ctx => ctx.Clear(new Rgba32(16, 16, 16, 255)));
+            _frameCanvas.Clear(new SKColor(16, 16, 16));
 
-            // 根据 opacity 计算文字颜色（通过 alpha 通道实现淡入淡出）
             byte alpha = (byte)(255 * opacity);
-            var textColor = Color.FromRgba(255, 255, 255, alpha);
+            var textColor = new SKColor(255, 255, 255, alpha);
+            string countdown = $"Starting in {(totalFrames - frameNumber) / (float)OutputFps:N1} seconds…";
 
-            // 使用 IntroText 参数显示自定义入场文字
-            _frameContent.Mutate(av => av
-                .DrawText(new RichTextOptions(_font48)
-                {
-                    Origin = new Vector2(OutputVideoWidth / 2f, OutputVideoHeight / 2f),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    TextAlignment = TextAlignment.Center,
-                }, IntroText ?? "", textColor)
-                .DrawText(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(OutputVideoWidth / 2f, OutputVideoHeight - 128),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                }, $"Starting in {(totalFrames - frameNumber) / (float)OutputFps:N1} seconds…", textColor)
-                .DrawProgressBar(frameNumber / (float)totalFrames,
-                    (int)(OutputVideoWidth * 0.3f),
-                    (int)(OutputVideoWidth * 0.7f),
-                    OutputVideoHeight - 64,
-                    opacity)); // 传递 opacity 给进度条
+            DrawMultilineCentered(IntroText ?? string.Empty, OutputVideoWidth / 2f, OutputVideoHeight / 2f, _fontSize48, textColor);
+            DrawText(OutputVideoWidth / 2f, OutputVideoHeight - 128, _fontSize24, countdown, textColor, VerticalAlign.Center, HorizontalAlign.Center);
+            _frameCanvas.DrawProgressBar(frameNumber / (float)totalFrames,
+                (int)(OutputVideoWidth * 0.3f), (int)(OutputVideoWidth * 0.7f), OutputVideoHeight - 64, opacity);
 
-            // 使用静音缓冲区，不在 intro 阶段播放音频
             Exporter.PushNewFrame(_frameContent, silentAudioBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
-
             OnProgress?.Invoke(frameNumber / (float)totalFrames);
 
             if (_exitRequested)
@@ -1901,98 +1546,62 @@ public class Generator
                     .RemixChannels(AudioOutputChannelCount);
             }
 
-            // 将视频字节缓冲转换为 Image，并翻转+缩放成用于绘制的瀑布视图
-            // 复用临时 Image 对象 + Parallel.For 并行处理像素
-            if (_reusableWaterfallImage == null || 
-                _reusableWaterfallImage.Width != WaterfallWidth || 
+            // 将视频字节缓冲转换为位图，并完成垂直翻转
+            if (_reusableWaterfallImage == null ||
+                _reusableWaterfallImage.Width != WaterfallWidth ||
                 _reusableWaterfallImage.Height != WaterfallHeight)
             {
                 _reusableWaterfallImage?.Dispose();
-                _reusableWaterfallImage = new Image<Rgba32>(WaterfallWidth, WaterfallHeight);
+                _reusableWaterfallImage = new SKBitmap(new SKImageInfo(WaterfallWidth, WaterfallHeight, SKColorType.Bgra8888, SKAlphaType.Premul));
             }
-            
-            // 高效像素处理（使用 unsafe 指针 + 并行处理）
+
             int srcBytesPerRow = WaterfallWidth * 4;
             int imageHeight = WaterfallHeight;
             var videoBuffer = _reusableVideoBuffer;
-            
-            // 使用 unsafe 指针直接操作内存
+
+            // 使用 GetPixels 获取指针并转换为可写 Span
+            IntPtr destPtr = _reusableWaterfallImage.GetPixels();
+            int destRowBytes = _reusableWaterfallImage.RowBytes;
+            int width = WaterfallWidth;
+            int height = WaterfallHeight;
+
             unsafe
             {
-                // 锁定图像内存并并行处理
-                if (_reusableWaterfallImage.DangerousTryGetSinglePixelMemory(out var pixelMemory))
+                byte* destBase = (byte*)destPtr;
+                Parallel.For(0, height, y =>
                 {
-                    using var handle = pixelMemory.Pin();
-                    var pixelPtr = (Rgba32*)handle.Pointer;
-                    int width = WaterfallWidth;
-                    int height = WaterfallHeight;
-                    
-                    // 并行处理每一行（利用多核 CPU）
-                    Parallel.For(0, height, y =>
+                    int destOffset = y * destRowBytes;
+                    int srcOffset = (height - 1 - y) * srcBytesPerRow;
+                    byte* destRow = destBase + destOffset;
+                    for (int x = 0; x < width; x++)
                     {
-                        // 垂直翻转：从缓冲区底部开始读取
-                        int srcY = height - 1 - y;
-                        int srcOffset = srcY * srcBytesPerRow;
-                        int destOffset = y * width;
-                        
-                        for (int x = 0; x < width; x++)
-                        {
-                            int pixelOffset = srcOffset + x * 4;
-                            pixelPtr[destOffset + x] = new Rgba32(
-                                videoBuffer[pixelOffset],
-                                videoBuffer[pixelOffset + 1],
-                                videoBuffer[pixelOffset + 2],
-                                255);
-                        }
-                    });
-                }
+                        int idx = x * 4;
+                        destRow[idx + 0] = videoBuffer[srcOffset + idx + 0];
+                        destRow[idx + 1] = videoBuffer[srcOffset + idx + 1];
+                        destRow[idx + 2] = videoBuffer[srcOffset + idx + 2];
+                        destRow[idx + 3] = 255;
+                    }
+                });
             }
-            
-            // 复用缩放后的图像
+
+            // 复用缩放后的瀑布位图
             if (_reusableScaledWaterfall == null ||
                 _reusableScaledWaterfall.Width != WaterfallScaledWidth ||
                 _reusableScaledWaterfall.Height != WaterfallScaledHeight)
             {
                 _reusableScaledWaterfall?.Dispose();
-                _reusableScaledWaterfall = new Image<Rgba32>(WaterfallScaledWidth, WaterfallScaledHeight);
+                _reusableScaledWaterfall = new SKBitmap(new SKImageInfo(WaterfallScaledWidth, WaterfallScaledHeight, SKColorType.Bgra8888, SKAlphaType.Premul));
             }
-            
-            // 使用 unsafe 指针并行缩放像素
-            float scaleX = (float)WaterfallWidth / WaterfallScaledWidth;
-            float scaleY = (float)WaterfallHeight / WaterfallScaledHeight;
-            unsafe
+
+            using (var scaledCanvas = new SKCanvas(_reusableScaledWaterfall))
             {
-                if (_reusableWaterfallImage.DangerousTryGetSinglePixelMemory(out var srcMemory) &&
-                    _reusableScaledWaterfall.DangerousTryGetSinglePixelMemory(out var destMemory))
-                {
-                    using var srcHandle = srcMemory.Pin();
-                    using var destHandle = destMemory.Pin();
-                    var srcPtr = (Rgba32*)srcHandle.Pointer;
-                    var destPtr = (Rgba32*)destHandle.Pointer;
-                    int srcWidth = WaterfallWidth;
-                    int srcHeight = WaterfallHeight;
-                    int destWidth = WaterfallScaledWidth;
-                    int destHeight = WaterfallScaledHeight;
-                    
-                    // 并行缩放每一行
-                    Parallel.For(0, destHeight, y =>
-                    {
-                        int srcY = (int)(y * scaleY);
-                        if (srcY >= srcHeight) srcY = srcHeight - 1;
-                        int destOffset = y * destWidth;
-                        int srcRowOffset = srcY * srcWidth;
-                        
-                        for (int x = 0; x < destWidth; x++)
-                        {
-                            int srcX = (int)(x * scaleX);
-                            if (srcX >= srcWidth) srcX = srcWidth - 1;
-                            destPtr[destOffset + x] = srcPtr[srcRowOffset + srcX];
-                        }
-                    });
-                }
+                scaledCanvas.Clear(SKColors.Transparent);
+                var srcRect = new SKRect(0, 0, WaterfallWidth, WaterfallHeight);
+                var dstRect = new SKRect(0, 0, WaterfallScaledWidth, WaterfallScaledHeight);
+                _imagePaint.FilterQuality = SKFilterQuality.None; // 保持像素风格
+                scaledCanvas.DrawBitmap(_reusableWaterfallImage, srcRect, dstRect, _imagePaint);
             }
-            
-            // 指向复用的缩放图像
+
             _viewportFramebuf = _reusableScaledWaterfall;
 
             // 计算当前帧覆盖到哪些子文件，并更新右侧列表窗位置
@@ -2016,206 +1625,177 @@ public class Generator
             }
 
             // 5. 实际绘制一帧：左侧瀑布 + 右侧上部列表 + 右下音频可视化 + 顶/底渐变 + 文字信息
-            _frameContent.Mutate(ctx =>
+            EnsureFrameCanvas();
+            _frameCanvas.Clear(new SKColor(16, 16, 16));
+
+            float s = ResolutionScale;
+            int rightPanelX1 = _videoFrameX2 + (int)(64 * s);
+            int rightPanelX2 = OutputVideoWidth - (int)(32 * s);
+            int subfileX1 = rightPanelX1;
+            int subfileX2 = rightPanelX2;
+            int audioVisX1 = rightPanelX1;
+            int audioVisX2 = rightPanelX2;
+
+            float subfileH = 48f * s;
+            float shadowY1 = (OutputVideoHeight / 2f) - subfileH * 8.5f;
+            float shadowY2 = (OutputVideoHeight / 2f) + subfileH * 8.5f; 
+            float rightPanelTop = shadowY1 + subfileH * 2f + 16f * s;
+            float rightPanelBottom = shadowY2 - 16f * s;
+            float rightPanelHeight = rightPanelBottom - rightPanelTop;
+            float listHeight = rightPanelHeight * 0.20f;
+            float listTop = rightPanelTop;
+            float listBottom = listTop + listHeight;
+
+            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
+            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)Math.Ceiling(subfileWindowIndex + 7));
+            float subfileRowH = 36f * s;
+            float subfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
+            float minSubfileY = rightPanelTop;
+
+            for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
             {
-                // 5.1 清屏
-                ctx.Clear(new Rgba32(16, 16, 16, 255));
-
-                // 分辨率缩放因子（所有布局常量都乘以此因子）
-                float s = ResolutionScale;
-
-                // 5.2 右侧整体面板：上部列表 + 下部音频可视化
-                int rightPanelX1 = _videoFrameX2 + (int)(64 * s);       // 瀑布右侧留出间距
-                int rightPanelX2 = OutputVideoWidth - (int)(32 * s);    // 靠右留边
-                int subfileX1 = rightPanelX1;
-                int subfileX2 = rightPanelX2;
-                int audioVisX1 = rightPanelX1;
-                int audioVisX2 = rightPanelX2;
-
-                float subfileH = 48f * s; // 每一行子文件条目的高度
-
-                // 顶部/底部淡出渐变以画面中线为基准
-                float shadowY1 = (OutputVideoHeight / 2f) - subfileH * 8.5f;
-                float shadowY2 = (OutputVideoHeight / 2f) + subfileH * 6.5f;
-
-                // 右侧面板整体垂直范围：放在两个淡出区域之间，避免列表/波形/频谱被淡出遮挡
-                float rightPanelTop = shadowY1 + subfileH * 2f + 16f * s;
-                float rightPanelBottom = shadowY2 - 16f * s;
-                float rightPanelHeight = rightPanelBottom - rightPanelTop;
-                float listHeight = rightPanelHeight * 0.20f; // 顶部 20% 用于列表
-                float listTop = rightPanelTop;
-                float listBottom = listTop + listHeight;
-
-                // 显示条目数
-                int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
-                int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)Math.Ceiling(subfileWindowIndex + 7));
-                float subfileRowH = 36f * s; // 行高
-
-                // 将列表居中位置下调2个条目
-                float subfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
-
-                // 绘制右上“歌曲/子文件列表”
-                // 限制上方条目显示（位于 rightPanelTop - 24f）
-                float minSubfileY = rightPanelTop;
-                for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
+                if (sfi < 0 || sfi >= _subfiles.Count)
                 {
-                    if (sfi < 0 || sfi >= _subfiles.Count)
-                    {
-                        subfileY += subfileRowH;
-                        continue;
-                    }
-                    
-                    // 跳过会遮挡专辑标题的条目（Y 坐标太小）
-                    if (subfileY < minSubfileY)
-                    {
-                        subfileY += subfileRowH;
-                        continue;
-                    }
-
-                    var subfile = _subfiles[sfi];
-                    bool isMainSubfile = sfi == currentSubfileKey;
-
-                    // 字体（_font24 to _font32）
-                    ctx.DrawText(_drawOpts, new RichTextOptions(_font24)
-                    {
-                        Origin = new Vector2(subfileX1, subfileY),
-                        VerticalAlignment = VerticalAlignment.Center,
-                    }, isMainSubfile ? "▶" : " ", new SolidBrush(Color.White), null)
-                    .DrawTextAndCache(_drawOpts, new RichTextOptions(_font24)
-                    {
-                        Origin = new Vector2(subfileX1 + 24 * s, subfileY),
-                        VerticalAlignment = VerticalAlignment.Center,
-                        FallbackFontFamilies = _emojiFontFamily.Name != null ? [_emojiFontFamily] : null,
-                    }, $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}", new SolidBrush(Color.White), null)
-                    .DrawTextAndCache(_drawOpts, new RichTextOptions(_font24)
-                    {
-                        Origin = new Vector2(subfileX2, subfileY),
-                        HorizontalAlignment = HorizontalAlignment.Right,
-                        VerticalAlignment = VerticalAlignment.Center,
-                    }, Utils.ToByteSizeString(subfile.Length), new SolidBrush(Color.DimGray), null);
-
-                    if (isMainSubfile)
-                    {
-                        // 使用子文件的音频时间信息计算进度
-                        double currentAudioTimeLocal = (double)frameNumber / OutputFps;
-                        float percentOfSubfile;
-                        
-                        if (subfile.AudioDuration > 0)
-                        {
-                            // 使用预计算的音频时间信息
-                            double timeInTrack = Math.Max(0, currentAudioTimeLocal - subfile.AudioStartTime);
-                            percentOfSubfile = (float)Math.Clamp(timeInTrack / subfile.AudioDuration, 0, 1);
-                        }
-                        else
-                        {
-                            // 降级：基于字节比例计算
-                            double totalAudioTimeLocal = (double)totalFrames / OutputFps;
-                            double subfileStartTime = (subfile.StartOffset / (double)totalByteLength) * totalAudioTimeLocal;
-                            double subfileDuration = (subfile.Length / (double)totalByteLength) * totalAudioTimeLocal;
-                            double timeInTrack = Math.Max(0, currentAudioTimeLocal - subfileStartTime);
-                            percentOfSubfile = (float)Math.Clamp(timeInTrack / subfileDuration, 0, 1);
-                        }
-                        float progressY = subfileY + 22 * s;
-
-                        ctx.DrawText(_drawOpts, new RichTextOptions(_font16)
-                        {
-                            Origin = new PointF(subfileX1 + 40 * s, progressY),
-                            HorizontalAlignment = HorizontalAlignment.Center,
-                            VerticalAlignment = VerticalAlignment.Center,
-                        }, $"{(int)(percentOfSubfile * 100)} %", new SolidBrush(Color.White), null)
-                        .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
-                    }
-
                     subfileY += subfileRowH;
+                    continue;
                 }
 
-                // 5.3 左侧瀑布视图
-                ctx.DrawImage(_viewportFramebuf, new Point(_videoFrameX1, _videoFrameY1), 1f)
-                .DrawText(new RichTextOptions(_font32)
+                if (subfileY < minSubfileY)
                 {
-                    Origin = new Vector2(32, (OutputVideoHeight / 2f) + (playHeadRelPos * (WaterfallScaledHeight / (float)WaterfallHeight))),
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, "▶", Color.White);
-
-                // 5.4 右下音频可视化（波形 + 频谱）
-                float audioVisTop = listBottom + 16f;
-                float audioVisBottom = rightPanelBottom;
-                if (audioVisBottom > audioVisTop + 16f && _outputAudioBuffer != null)
-                {
-                    var audioVisRegion = new RectangleF(audioVisX1, audioVisTop, audioVisX2 - audioVisX1, audioVisBottom - audioVisTop);
-                    DrawAudioVisualizer(ctx, audioVisRegion, _outputAudioBuffer);
+                    subfileY += subfileRowH;
+                    continue;
                 }
 
-                // 5.5 顶部/底部渐变遮罩 + 专辑/目录文字
-                string albumHeaderText;
+                var subfile = _subfiles[sfi];
+                bool isMainSubfile = sfi == currentSubfileKey;
+
+                DrawText(subfileX1, subfileY, _fontSize24, isMainSubfile ? "▶" : " ", SKColors.White, VerticalAlign.Center);
+                DrawText(subfileX1 + 24 * s, subfileY, _fontSize24,
+                    $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}",
+                    SKColors.White, VerticalAlign.Center);
+                DrawText(subfileX2, subfileY, _fontSize24, Utils.ToByteSizeString(subfile.Length),
+                    SKColors.DimGray, VerticalAlign.Center, HorizontalAlign.Right);
+
+                if (isMainSubfile)
                 {
-                    var sfValue = currentSubfileValue;
-                    if (sfValue != null && !string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
+                    double currentAudioTimeLocal = (double)frameNumber / OutputFps;
+                    float percentOfSubfile;
+
+                    if (subfile.AudioDuration > 0)
                     {
-                        albumHeaderText = sfValue.AlbumTitle;
-                        if (!string.IsNullOrWhiteSpace(sfValue.AlbumArtistName))
-                        {
-                            albumHeaderText += " // " + sfValue.AlbumArtistName;
-                        }
+                        double timeInTrack = Math.Max(0, currentAudioTimeLocal - subfile.AudioStartTime);
+                        percentOfSubfile = (float)Math.Clamp(timeInTrack / subfile.AudioDuration, 0, 1);
                     }
                     else
                     {
-                        albumHeaderText = sfValue?.FileDirectory ?? string.Empty;
+                        double totalAudioTimeLocal = (double)totalFrames / OutputFps;
+                        double subfileStartTime = (subfile.StartOffset / (double)totalByteLength) * totalAudioTimeLocal;
+                        double subfileDuration = (subfile.Length / (double)totalByteLength) * totalAudioTimeLocal;
+                        double timeInTrack = Math.Max(0, currentAudioTimeLocal - subfileStartTime);
+                        percentOfSubfile = (float)Math.Clamp(timeInTrack / subfileDuration, 0, 1);
+                    }
+
+                    float progressY = subfileY + 22 * s;
+                    DrawText(subfileX1 + 40 * s, progressY, _fontSize16,
+                        $"{(int)(percentOfSubfile * 100)} %", SKColors.White,
+                        VerticalAlign.Center, HorizontalAlign.Center);
+                    _frameCanvas.DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
+                }
+
+                subfileY += subfileRowH;
+            }
+
+            if (_viewportFramebuf != null)
+            {
+                _frameCanvas.DrawBitmap(_viewportFramebuf, _videoFrameX1, _videoFrameY1, _imagePaint);
+            }
+            DrawText(32, (OutputVideoHeight / 2f) + (playHeadRelPos * (WaterfallScaledHeight / (float)WaterfallHeight)),
+                _fontSize32, "▶", SKColors.White, VerticalAlign.Center);
+
+            // 音频可视化区域（在歌曲列表下方，限制在遮罩区域内）
+            float audioVisTop = listBottom + 8f * s;
+            // 底部限制：不能超过遮罩渐变开始位置（shadowY2 - gradientHeight）
+            float audioVisBottom = Math.Min(rightPanelBottom, shadowY2 - subfileH * 2.5f);
+            if (audioVisBottom > audioVisTop + 16f && _outputAudioBuffer != null)
+            {
+                var audioVisRect = SKRect.Create(audioVisX1, audioVisTop, audioVisX2 - audioVisX1, audioVisBottom - audioVisTop);
+                DrawAudioVisualizerSkia(audioVisRect, _outputAudioBuffer);
+            }
+
+            string albumHeaderText;
+            {
+                var sfValue = currentSubfileValue;
+                if (sfValue != null && !string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
+                {
+                    albumHeaderText = sfValue.AlbumTitle;
+                    if (!string.IsNullOrWhiteSpace(sfValue.AlbumArtistName))
+                    {
+                        albumHeaderText += " // " + sfValue.AlbumArtistName;
                     }
                 }
-
-                // 使用预渲染的渐变遮罩（避免每帧创建渐变画刷）
-                float gradientHeight = subfileH * 2f;
-                EnsureGradientMasksCached(shadowY1, shadowY2, gradientHeight);
-                if (_cachedTopGradientMask != null)
-                    ctx.DrawImage(_cachedTopGradientMask, new Point(0, (int)shadowY1), 1f);
-                if (_cachedBottomGradientMask != null)
-                    ctx.DrawImage(_cachedBottomGradientMask, new Point(0, (int)shadowY2), 1f);
-
-                ctx.DrawTextAndCache(new RichTextOptions(_font24)
+                else
                 {
-                    Origin = new Vector2(subfileX1 + 40, rightPanelTop - 24f),
-                    VerticalAlignment = VerticalAlignment.Center,
-                }, Utils.TruncateString(albumHeaderText ?? string.Empty, 72), Color.DimGray);
-
-                // 5.6 使用预渲染的静态 UI 图层（大幅减少 DrawText 调用）
-                if (_staticUILayer != null)
-                {
-                    ctx.DrawImage(_staticUILayer, Point.Empty, 1f);
+                    albumHeaderText = sfValue?.FileDirectory ?? string.Empty;
                 }
-                
-                // 只绘制动态变化的内容（偏移值）
-                ctx.DrawText(new RichTextOptions(_font32)
-                {
-                    Origin = new Vector2(OutputVideoWidth - 32, 32 + 24),
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                    TextAlignment = TextAlignment.End,
-                }, $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", Color.White)
-                .DrawText(new RichTextOptions(_font32)
-                {
-                    Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                }, readSpeedString, Color.White);
+            }
 
-                if (Author != null)
-                {
-                    ctx.DrawTextAndCache(new RichTextOptions(_font32)
-                    {
-                        Origin = new Vector2(OutputVideoWidth / 2f, 32 + 24),
-                        VerticalAlignment = VerticalAlignment.Center,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                    }, Author, Color.White);
-                }
+            // 淡出遮罩
+            float bottomPanelTop = OutputVideoHeight - 120f * s;
+            float correctedShadowY2 = Math.Min(shadowY2, bottomPanelTop);
+            
+            float gradientHeight = subfileH * 2f;
+            EnsureGradientShadersCached(shadowY1, correctedShadowY2, gradientHeight);
+            if (_cachedTopGradientShader != null)
+            {
+                using var gradientPaint = new SKPaint { Shader = _cachedTopGradientShader };
+                _frameCanvas.DrawRect(new SKRect(0, shadowY1, OutputVideoWidth, shadowY1 + gradientHeight), gradientPaint);
+            }
+            if (_cachedBottomGradientShader != null)
+            {
+                using var gradientPaint = new SKPaint { Shader = _cachedBottomGradientShader };
+                _frameCanvas.DrawRect(new SKRect(0, shadowY2 - gradientHeight, OutputVideoWidth, shadowY2), gradientPaint);
+            }
 
-                // 底部音乐播放器 UI（传入帧号和总帧数用于音频同步进度计算）
-                DrawBottomPlayerUI(ctx, s, currentOffset, currentSubfileKey, currentSubfileValue, frameNumber, totalFrames, totalByteLength);
-            });
+            DrawText(subfileX1 + 40, rightPanelTop - 24f, _fontSize24,
+                Utils.TruncateString(albumHeaderText ?? string.Empty, 72), new SKColor(105, 105, 105), VerticalAlign.Center);
+
+            // 确保静态UI层已缓存，然后绘制
+            EnsureStaticUILayerCached(avSettingsString, readSpeedString);
+            if (_staticUILayer != null)
+            {
+                _frameCanvas.DrawBitmap(_staticUILayer, 0, 0, _imagePaint);
+            }
+
+            // 动态绘制：数值位置在标签下方（标签高度 _fontSize16 + 间距 8）
+            float valueY = 32 + _fontSize16 + 8;
+            
+            // A/V SETTINGS 值（左上角）
+            DrawText(32, valueY, _fontSize24,
+                avSettingsString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
+            
+            // ABS. OFFSET 值（右上角）
+            DrawText(OutputVideoWidth - 32, valueY, _fontSize24,
+                $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", SKColors.White,
+                VerticalAlign.Top, HorizontalAlign.Right);
+            
+            // BITRATE 值（BITRATE 标签下方）
+            DrawText(OutputVideoWidth - 280, valueY, _fontSize24,
+                readSpeedString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+
+            // Author（居中显示）
+            if (!string.IsNullOrEmpty(Author))
+            {
+                DrawText(OutputVideoWidth / 2f, valueY + _fontSize24 / 2, _fontSize24,
+                    Author, SKColors.White, VerticalAlign.Center, HorizontalAlign.Center);
+            }
+
+            DrawBottomPlayerUISkia(s, currentOffset, currentSubfileKey, currentSubfileValue, frameNumber, totalFrames, totalByteLength);
 
             Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
 
             frameNumber++;
-            
+
             // 当视频数据播放完毕时，保持在最后位置
             // currentOffset 可以超过 InputFileStream.Length，但读取时会被限制
 
@@ -2235,11 +1815,13 @@ public class Generator
 
         Exporter.Finish();
     }
-
+    
     // 绘制底部音乐播放器 UI
     // totalFrames 和 totalByteLength 用于计算基于音频时间的进度（与实际播放同步）
-    private void DrawBottomPlayerUI(IImageProcessingContext ctx, float s, long currentOffset, int subfileIdx, SubFile subfile, long frameNumber, long totalFrames, long totalByteLength)
+    private void DrawBottomPlayerUISkia(float s, long currentOffset, int subfileIdx, SubFile subfile, long frameNumber, long totalFrames, long totalByteLength)
     {
+        if (_frameCanvas == null) return;
+        
         // 更新当前视频时间（基于帧号和帧率）
         _currentVideoTime = (double)frameNumber / OutputFps;
         
@@ -2262,7 +1844,7 @@ public class Generator
         TimeSpan currentTime = TimeSpan.Zero;
         TimeSpan totalTime = TimeSpan.Zero;
         float trackProgress = 0f;
-        Image coverImage = null;
+        SKBitmap coverImage = null;
         float[] waveformPeaks = null;
         
         if (subfile != null)
@@ -2311,14 +1893,20 @@ public class Generator
         float animT = 1f;
         
         // 计算当前封面哈希
-        int targetSize = (int)coverSize - 4;
+        int targetSize = Math.Max(8, (int)coverSize - 4);
         byte[] currentCoverHash = null;
         if (coverImage != null)
         {
             if (_cachedScaledCover == null || _cachedCoverSubfileIndex != subfileIdx || _cachedCoverSize != targetSize)
             {
                 _cachedScaledCover?.Dispose();
-                _cachedScaledCover = ((Image<Rgba32>)coverImage).Clone(imgCtx => imgCtx.Resize(targetSize, targetSize));
+                _cachedScaledCover = new SKBitmap(targetSize, targetSize, SKColorType.Bgra8888, SKAlphaType.Premul);
+                using (var coverCanvas = new SKCanvas(_cachedScaledCover))
+                {
+                    coverCanvas.Clear(SKColors.Transparent);
+                    using var coverPaint = new SKPaint { FilterQuality = SKFilterQuality.High, IsAntialias = true };
+                    coverCanvas.DrawBitmap(coverImage, new SKRect(0, 0, targetSize, targetSize), coverPaint);
+                }
                 _cachedCoverSubfileIndex = subfileIdx;
                 _cachedCoverSize = targetSize;
             }
@@ -2336,7 +1924,7 @@ public class Generator
             if (!coverSame && _cachedScaledCover != null)
             {
                 _prevScaledCover?.Dispose();
-                _prevScaledCover = _cachedScaledCover.Clone();
+                _prevScaledCover = _cachedScaledCover.Copy();
             }
             _prevCoverHash = currentCoverHash;
             
@@ -2372,10 +1960,13 @@ public class Generator
         float waveformX2 = timeX;
         float waveformHeight = 20f * s;
         
-        // 封面动画：/*封面相同不切换?*/
-        var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
-        ctx.Fill(Color.FromRgba(32, 32, 32, 255), coverRect);
-        ctx.Draw(Color.FromRgba(200, 200, 200, 255), 2f, coverRect);
+        // 封面底板与描边
+        var coverRect = SKRect.Create(coverX, coverY, coverSize, coverSize);
+        _fillPaint.Color = new SKColor(32, 32, 32);
+        _frameCanvas.DrawRect(coverRect, _fillPaint);
+        _strokePaint.Color = new SKColor(200, 200, 200);
+        _strokePaint.StrokeWidth = 2f;
+        _frameCanvas.DrawRect(coverRect, _strokePaint);
         
         bool coverSameAsPrev = HashEquals(_prevCoverHash, currentCoverHash);
         float coverSlideOffset = (isInTransition && !coverSameAsPrev) ? (1f - animT) * coverSize * 0.4f : 0f;
@@ -2385,7 +1976,9 @@ public class Generator
         {
             float prevAlpha = 1f - animT;
             float prevOffsetX = -coverSlideOffset;
-            ctx.DrawImage(_prevScaledCover, new Point((int)(coverX + 2 + prevOffsetX), (int)(coverY + 2)), prevAlpha);
+            var prevDest = SKRect.Create(coverX + 2 + prevOffsetX, coverY + 2, targetSize, targetSize);
+            using var prevPaint = new SKPaint { FilterQuality = SKFilterQuality.High, Color = SKColors.White.WithAlpha((byte)(255 * prevAlpha)) };
+            _frameCanvas.DrawBitmap(_prevScaledCover, prevDest, prevPaint);
         }
         
         // 绘制当前封面
@@ -2393,66 +1986,55 @@ public class Generator
         {
             float currAlpha = (isInTransition && !coverSameAsPrev) ? animT : 1f;
             float currOffsetX = (isInTransition && !coverSameAsPrev) ? coverSlideOffset : 0f;
-            ctx.DrawImage(_cachedScaledCover, new Point((int)(coverX + 2 + currOffsetX), (int)(coverY + 2)), currAlpha);
+            var currDest = SKRect.Create(coverX + 2 + currOffsetX, coverY + 2, targetSize, targetSize);
+            using var currPaint = new SKPaint { FilterQuality = SKFilterQuality.High, Color = SKColors.White.WithAlpha((byte)(255 * currAlpha)) };
+            _frameCanvas.DrawBitmap(_cachedScaledCover, currDest, currPaint);
         }
         else
         {
             byte noteAlpha = (byte)(255 * (isInTransition ? animT : 1f));
-            ctx.DrawText(new RichTextOptions(_font48)
-            {
-                Origin = new Vector2(coverX + coverSize / 2, coverY + coverSize / 2),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center,
-            }, "♪", Color.FromRgba(100, 100, 100, noteAlpha));
+            DrawText(coverX + coverSize / 2, coverY + coverSize / 2, _fontSize48, "♪",
+                new SKColor(100, 100, 100, noteAlpha), VerticalAlign.Center, HorizontalAlign.Center);
         }
         
-        //文字动画
-        Color labelColor = Color.FromRgba(105, 105, 105, 255);
+        // 文字与标签
+        var labelColor = new SKColor(105, 105, 105);
         
         // 绘制静态标签
-        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(infoX, labelY) }, "Title:", labelColor);
-        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(timeX, labelY), HorizontalAlignment = HorizontalAlignment.Right }, "Time:", labelColor);
+        DrawText(infoX, labelY, _fontSize16, "Title:", labelColor);
+        DrawText(timeX, labelY, _fontSize16, "Time:", labelColor, VerticalAlign.Top, HorizontalAlign.Right);
         
         // 曲目信息字符级动画
-        DrawTextWithCharacterAnimation(ctx, _font32, displayInfo, _prevDisplayInfo, infoX, valueY, timeX - infoX - 120f * s, animT, isInTransition);
+        DrawTextWithCharacterAnimationSkia(_fontSize32, displayInfo, _prevDisplayInfo, infoX, valueY, timeX - infoX - 120f * s, animT, isInTransition);
         
         // 时间显示：淡入淡出
         if (isInTransition && !string.IsNullOrEmpty(_prevTimeString))
         {
             // 淡出旧时间
             byte fadeOutAlpha = (byte)(255 * (1f - animT));
-            ctx.DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(timeX, valueY),
-                HorizontalAlignment = HorizontalAlignment.Right
-            }, _prevTimeString, Color.FromRgba(255, 255, 255, fadeOutAlpha));
+            DrawText(timeX, valueY, _fontSize32, _prevTimeString,
+                new SKColor(255, 255, 255, fadeOutAlpha), VerticalAlign.Top, HorizontalAlign.Right);
             
             // 淡入新时间
             byte fadeInAlpha = (byte)(255 * animT);
-            ctx.DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(timeX, valueY),
-                HorizontalAlignment = HorizontalAlignment.Right
-            }, timeString, Color.FromRgba(255, 255, 255, fadeInAlpha));
+            DrawText(timeX, valueY, _fontSize32, timeString,
+                new SKColor(255, 255, 255, fadeInAlpha), VerticalAlign.Top, HorizontalAlign.Right);
         }
         else
         {
             // 非过渡状态，直接绘制
-            ctx.DrawText(new RichTextOptions(_font32)
-            {
-                Origin = new Vector2(timeX, valueY),
-                HorizontalAlignment = HorizontalAlignment.Right
-            }, timeString, Color.White);
+            DrawText(timeX, valueY, _fontSize32, timeString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
         }
         
         // 波形动画：前一首从中间向上滑出+淡出，新波形从下向上滑入+淡入 
-        var waveformRect = new RectangleF(waveformX1, waveformY, waveformX2 - waveformX1, waveformHeight);
-        ctx.Fill(Color.FromRgba(40, 40, 40, 255), waveformRect);
+        var waveformRect = SKRect.Create(waveformX1, waveformY, Math.Max(0.1f, waveformX2 - waveformX1), waveformHeight);
+        _fillPaint.Color = new SKColor(40, 40, 40);
+        _frameCanvas.DrawRect(waveformRect, _fillPaint);
         
         float barWidth = 2f;
         float barSpacing = 1f;
         int totalBars = (int)(waveformRect.Width / (barWidth + barSpacing));
-        float progressX = waveformRect.X + waveformRect.Width * trackProgress;
+        float progressX = waveformRect.Left + waveformRect.Width * trackProgress;
         float gapWidth = 4f * s;
         
         // 波形滑动偏移（快到慢，animT 从 0 到 1）
@@ -2464,7 +2046,7 @@ public class Generator
         // 同时绘制前一首波形和当前波形
         for (int i = 0; i < totalBars; i++)
         {
-            float barX = waveformRect.X + i * (barWidth + barSpacing);
+            float barX = waveformRect.Left + i * (barWidth + barSpacing);
             if (barX > progressX - gapWidth && barX < progressX + gapWidth) continue;
             
             // 绘制前一首波形（从中间向上滑出 + 淡出）
@@ -2475,13 +2057,13 @@ public class Generator
                 float prevHeightRatio = 0.15f + _prevWaveformPeaks[prevPeakIndex] * 0.85f;
                 float prevBarHeight = waveformHeight * prevHeightRatio * 0.85f;
                 // 向上滑出：从中间位置向上移动（减去偏移）
-                float prevBarY = waveformRect.Y + (waveformHeight - prevBarHeight) / 2f - waveSlideOffset;
+                float prevBarY = waveformRect.Top + (waveformHeight - prevBarHeight) / 2f - waveSlideOffset;
                 
                 // 只在条形完全在区域内时绘制
-                if (prevBarY >= waveformRect.Y && prevBarY + prevBarHeight <= waveformRect.Y + waveformHeight)
+                if (prevBarY >= waveformRect.Top && prevBarY + prevBarHeight <= waveformRect.Top + waveformHeight)
                 {
-                    Color prevBarColor = Color.FromRgba(180, 180, 180, prevWaveAlpha);
-                    ctx.Fill(prevBarColor, new RectangleF(barX, prevBarY, barWidth, prevBarHeight));
+                    _fillPaint.Color = new SKColor(180, 180, 180, prevWaveAlpha);
+                    _frameCanvas.DrawRect(SKRect.Create(barX, prevBarY, barWidth, prevBarHeight), _fillPaint);
                 }
             }
             
@@ -2501,186 +2083,105 @@ public class Generator
             
             float barHeight = waveformHeight * heightRatio * 0.85f;
             // 从下滑入：从底部位置向上移动到中间（加上偏移，随着动画进行偏移减小）
-            float barY = waveformRect.Y + (waveformHeight - barHeight) / 2f + waveSlideOffset;
+            float barY = waveformRect.Top + (waveformHeight - barHeight) / 2f + waveSlideOffset;
             
             // 只在条形完全在区域内时绘制
-            if (barY >= waveformRect.Y && barY + barHeight <= waveformRect.Y + waveformHeight)
+            if (barY >= waveformRect.Top && barY + barHeight <= waveformRect.Top + waveformHeight)
             {
-                Color barColor = barX < progressX 
-                    ? Color.FromRgba(100, 100, 100, currWaveAlpha) 
-                    : Color.FromRgba(220, 220, 220, currWaveAlpha);
-                ctx.Fill(barColor, new RectangleF(barX, barY, barWidth, barHeight));
+                _fillPaint.Color = barX < progressX
+                    ? new SKColor(100, 100, 100, currWaveAlpha)
+                    : new SKColor(220, 220, 220, currWaveAlpha);
+                _frameCanvas.DrawRect(SKRect.Create(barX, barY, barWidth, barHeight), _fillPaint);
             }
         }
         
         // 播放头
         float headlineWidth = 2f;
         float borderWidth = 1f;
-        ctx.Fill(Color.FromRgba(30, 30, 30, 255), new RectangleF(progressX - headlineWidth / 2 - borderWidth, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
-        ctx.Fill(Color.FromRgba(255, 255, 255, 255), new RectangleF(progressX - headlineWidth / 2, waveformRect.Y - 2f, headlineWidth, waveformHeight + 4f));
-        ctx.Fill(Color.FromRgba(30, 30, 30, 255), new RectangleF(progressX + headlineWidth / 2, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
+        _fillPaint.Color = new SKColor(30, 30, 30);
+        _frameCanvas.DrawRect(SKRect.Create(progressX - headlineWidth / 2 - borderWidth, waveformRect.Top - 2f, borderWidth, waveformHeight + 4f), _fillPaint);
+        _fillPaint.Color = SKColors.White;
+        _frameCanvas.DrawRect(SKRect.Create(progressX - headlineWidth / 2, waveformRect.Top - 2f, headlineWidth, waveformHeight + 4f), _fillPaint);
+        _fillPaint.Color = new SKColor(30, 30, 30);
+        _frameCanvas.DrawRect(SKRect.Create(progressX + headlineWidth / 2, waveformRect.Top - 2f, borderWidth, waveformHeight + 4f), _fillPaint);
+        
+        if (!isInTransition)
+        {
+            _prevDisplayInfo = displayInfo;
+            _prevTimeString = timeString;
+        }
     }
 
-    // 绘制带字符级动画的文字（相同字符滑动，不同字符淡出/淡入）
-    // 使用 TextMeasurer.TryMeasureCharacterBounds 获取每个字符的精确位置（保持正确的 kerning）
-    private void DrawTextWithCharacterAnimation(IImageProcessingContext ctx, Font font, string newText, string oldText, 
+    // 绘制带动画的文字
+    // 使用 DrawText 确保 Y 坐标计算与非动画状态一致
+    private void DrawTextWithCharacterAnimationSkia(float fontSize, string newText, string oldText,
         float x, float y, float maxWidth, float animT, bool isInTransition, bool rightAlign = false)
     {
+        if (_frameCanvas == null) return;
+        newText ??= string.Empty;
+        oldText ??= string.Empty;
+        
+        // 裁剪文本
+        if (maxWidth > 0)
+        {
+            newText = ClampTextToWidth(newText, fontSize, maxWidth);
+            oldText = ClampTextToWidth(oldText, fontSize, maxWidth);
+        }
         if (string.IsNullOrEmpty(newText) && string.IsNullOrEmpty(oldText)) return;
         
-        // 非过渡状态，直接绘制
+        // 非动画状态：直接绘制新文本
         if (!isInTransition || string.IsNullOrEmpty(oldText))
         {
-            var opts = new RichTextOptions(font)
-            {
-                Origin = new Vector2(x, y),
-                HorizontalAlignment = rightAlign ? HorizontalAlignment.Right : HorizontalAlignment.Left
-            };
-            if (maxWidth > 0) opts.WrappingLength = maxWidth;
-            ctx.DrawText(opts, newText ?? "", Color.White);
+            DrawText(x, y, fontSize, newText, SKColors.White,
+                VerticalAlign.Top, rightAlign ? HorizontalAlign.Right : HorizontalAlign.Left);
             return;
         }
         
-        // 使用 TextMeasurer.TryMeasureCharacterBounds 获取每个字符的精确边界（包含 kerning）
-        var textOptions = new TextOptions(font);
-        var oldCharPositions = new List<(char c, float x, float width)>();
-        var newCharPositions = new List<(char c, float x, float width)>();
+        // 动画状态：使用 DrawText 确保 Y 坐标一致
+        float slideDistance = 30f * ResolutionScale;
+        var hAlign = rightAlign ? HorizontalAlign.Right : HorizontalAlign.Left;
         
-        // 获取旧文本每个字符的精确边界
-        if (TextMeasurer.TryMeasureCharacterBounds(oldText, textOptions, out var oldBounds))
-        {
-            var boundsArray = oldBounds.ToArray();
-            for (int i = 0; i < oldText.Length && i < boundsArray.Length; i++)
-            {
-                oldCharPositions.Add((oldText[i], boundsArray[i].Bounds.X, boundsArray[i].Bounds.Width));
-            }
-        }
-        else
-        {
-            // 降级：使用累积测量
-            for (int i = 0; i < oldText.Length; i++)
-            {
-                float charStartX = i > 0 ? MeasureTextWidth(oldText.Substring(0, i), font) : 0;
-                float charWidth = MeasureTextWidth(oldText[i].ToString(), font);
-                oldCharPositions.Add((oldText[i], charStartX, charWidth));
-            }
-        }
-        
-        // 获取新文本每个字符的精确边界
-        if (TextMeasurer.TryMeasureCharacterBounds(newText, textOptions, out var newBounds))
-        {
-            var boundsArray = newBounds.ToArray();
-            for (int i = 0; i < newText.Length && i < boundsArray.Length; i++)
-            {
-                newCharPositions.Add((newText[i], boundsArray[i].Bounds.X, boundsArray[i].Bounds.Width));
-            }
-        }
-        else
-        {
-            // 降级：使用累积测量
-            for (int i = 0; i < newText.Length; i++)
-            {
-                float charStartX = i > 0 ? MeasureTextWidth(newText.Substring(0, i), font) : 0;
-                float charWidth = MeasureTextWidth(newText[i].ToString(), font);
-                newCharPositions.Add((newText[i], charStartX, charWidth));
-            }
-        }
-        
-        // 计算基础 X 位置（处理右对齐）
-        float oldTextWidth = MeasureTextWidth(oldText, font);
-        float newTextWidth = MeasureTextWidth(newText, font);
-        float baseX = rightAlign ? x - newTextWidth : x;
-        float oldBaseX = rightAlign ? x - oldTextWidth : x;
-        
-        // 查找相同字符的映射（贪婪匹配，优先最左边）
-        var matchedOldIndices = new HashSet<int>();
-        var charMappings = new List<(int oldIdx, int newIdx)>();
-        
-        for (int newIdx = 0; newIdx < newText.Length; newIdx++)
-        {
-            char newChar = newText[newIdx];
-            // 在旧文本中查找第一个未匹配的相同字符
-            for (int oldIdx = 0; oldIdx < oldText.Length; oldIdx++)
-            {
-                if (!matchedOldIndices.Contains(oldIdx) && oldText[oldIdx] == newChar)
-                {
-                    matchedOldIndices.Add(oldIdx);
-                    charMappings.Add((oldIdx, newIdx));
-                    break;
-                }
-            }
-        }
-        
-        var mappedNewIndices = new HashSet<int>(charMappings.Select(m => m.newIdx));
-        
-        // 绘制匹配的字符（滑动动画）
-        foreach (var (oldIdx, newIdx) in charMappings)
-        {
-            char c = newText[newIdx];
-            float oldPosX = oldBaseX + oldCharPositions[oldIdx].x;
-            float newPosX = baseX + newCharPositions[newIdx].x;
-            
-            // 从旧位置滑动到新位置
-            float currentX = oldPosX + (newPosX - oldPosX) * EaseInOutQuad(animT);
-            
-            ctx.DrawText(new RichTextOptions(font) { Origin = new Vector2(currentX, y) }, c.ToString(), Color.White);
-        }
-        
-        // 绘制旧文本中未匹配的字符（淡出 + 向上滑出）
+        // 旧文本：向左滑动 + 淡出
         byte fadeOutAlpha = (byte)(255 * (1f - animT));
-        for (int oldIdx = 0; oldIdx < oldText.Length; oldIdx++)
-        {
-            if (!matchedOldIndices.Contains(oldIdx))
-            {
-                char c = oldText[oldIdx];
-                float charX = oldBaseX + oldCharPositions[oldIdx].x;
-                // 向上滑出（animT 从 0 到 1，slideY 从 y 到 y - 10）
-                float slideY = y - animT * 10f;
-                ctx.DrawText(new RichTextOptions(font) { Origin = new Vector2(charX, slideY) }, c.ToString(), Color.FromRgba(255, 255, 255, fadeOutAlpha));
-            }
-        }
+        float oldOffsetX = -slideDistance * animT;
+        DrawText(x + oldOffsetX, y, fontSize, oldText, 
+            new SKColor(255, 255, 255, fadeOutAlpha), VerticalAlign.Top, hAlign);
         
-        // 绘制新文本中未匹配的字符（淡入 + 从下滑入）
+        // 新文本：从右滑入 + 淡入
         byte fadeInAlpha = (byte)(255 * animT);
-        for (int newIdx = 0; newIdx < newText.Length; newIdx++)
-        {
-            if (!mappedNewIndices.Contains(newIdx))
-            {
-                char c = newText[newIdx];
-                float charX = baseX + newCharPositions[newIdx].x;
-                // 从下滑入（animT 从 0 到 1，slideY 从 y + 10 到 y）
-                float slideY = y + (1f - animT) * 10f;
-                ctx.DrawText(new RichTextOptions(font) { Origin = new Vector2(charX, slideY) }, c.ToString(), Color.FromRgba(255, 255, 255, fadeInAlpha));
-            }
-        }
+        float newOffsetX = slideDistance * (1f - animT);
+        DrawText(x + newOffsetX, y, fontSize, newText, 
+            new SKColor(255, 255, 255, fadeInAlpha), VerticalAlign.Top, hAlign);
     }
 
     // 生成结尾淡出画面
     private void GenerateOutro()
     {
         Logger.Info("Generating outro fade…");
-        int fadeFrames = (int)(OutroFadeDuration * OutputFps);
-        if (fadeFrames < 1) fadeFrames = 1;
+        int fadeFrames = Math.Max(1, (int)(OutroFadeDuration * OutputFps));
 
-        // 创建静音缓冲区用于结尾淡出（避免重复播放最后一帧的音频）
-        var silentBuffer = new AudioBuffer(_outputAudioBuffer.SampleCount, _outputAudioBuffer.ChannelCount);
+        int sampleCount = Math.Max(1, _outputAudioBuffer?.SampleCount ?? AudioOutputSamplesPerFramePerChannel);
+        int channelCount = Math.Max(1, _outputAudioBuffer?.ChannelCount ?? AudioOutputChannelCount);
+        var silentBuffer = new AudioBuffer(sampleCount, channelCount);
         silentBuffer.Clear();
+
+        EnsureFrameCanvas();
+        if (_frameCanvas == null)
+        {
+            Logger.Error("Frame canvas is not initialized; cannot render outro.");
+            return;
+        }
 
         for (int frameNum = 0; frameNum < fadeFrames; frameNum++)
         {
             float opacity = 1f - (frameNum / (float)fadeFrames);
             byte overlayAlpha = (byte)(255 * (1f - Math.Clamp(opacity, 0f, 1f)));
 
-            _frameContent.Mutate(ctx =>
-            {
-                ctx.Fill(Color.FromRgba(16, 16, 16, overlayAlpha),
-                    new RectangleF(0, 0, OutputVideoWidth, OutputVideoHeight));
-            });
+            _fillPaint.Color = new SKColor(16, 16, 16, overlayAlpha);
+            _frameCanvas.DrawRect(SKRect.Create(0, 0, OutputVideoWidth, OutputVideoHeight), _fillPaint);
 
-            // 使用静音缓冲区而不是最后一帧的音频
             Exporter.PushNewFrame(_frameContent, silentBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
-
             OnProgress?.Invoke(1f);
 
             if (_exitRequested)
@@ -2868,7 +2369,7 @@ public class Generator
     }
 
     // 音频可视化绘制
-    private void DrawAudioVisualizer(IImageProcessingContext ctx, RectangleF region, AudioBuffer audioBuffer)
+    private void DrawAudioVisualizerSkia(SKRect region, AudioBuffer audioBuffer)
     {
         if (audioBuffer == null || audioBuffer.TotalSampleCount == 0) return;
 
@@ -2908,14 +2409,14 @@ public class Generator
         float specTop = waveTop + waveH;
 
         // 绘制波形
-        DrawWaveform(ctx, new RectangleF(region.Left, waveTop, region.Width, waveH), _audioMonoBuffer);
+        DrawWaveformSkia(SKRect.Create(region.Left, waveTop, region.Width, waveH), _audioMonoBuffer);
 
         // 绘制频谱
-        DrawSpectrum(ctx, new RectangleF(region.Left, specTop, region.Width, specH), _audioMonoBuffer);
+        DrawSpectrumSkia(SKRect.Create(region.Left, specTop, region.Width, specH), _audioMonoBuffer);
     }
 
     // 波形（折线）
-    private void DrawWaveform(IImageProcessingContext ctx, RectangleF region, float[] samples)
+    private void DrawWaveformSkia(SKRect region, float[] samples)
     {
         if (samples.Length < 2) return;
 
@@ -2932,13 +2433,17 @@ public class Generator
             if (abs > maxAbs) maxAbs = abs;
         }
 
-        float centerY = region.Top + region.Height / 2f;
+        float centerY = region.MidY;
         float amplitude = region.Height * 0.45f;
         float lineWidth = Math.Max(1.5f, WaveformLineWidth * ResolutionScale);
 
         // 下采样点数（折线顶点数）
         int pointCount = Math.Min(512, windowSize);
-        var points = new PointF[pointCount];
+        if (_waveformPointCache == null || _waveformPointCache.Length < pointCount)
+        {
+            _waveformPointCache = new SKPoint[pointCount];
+        }
+        var points = _waveformPointCache;
 
         for (int i = 0; i < pointCount; i++)
         {
@@ -2948,13 +2453,15 @@ public class Generator
 
             float x = region.Left + (i / (float)(pointCount - 1)) * region.Width;
             float y = centerY - v * amplitude;
-            points[i] = new PointF(x, y);
+            points[i] = new SKPoint(x, y);
         }
-        ctx.DrawLine(Color.White, lineWidth, points);
+        _strokePaint.Color = SKColors.White;
+        _strokePaint.StrokeWidth = lineWidth;
+        _frameCanvas.DrawPoints(SKPointMode.Polygon, points.AsSpan(0, pointCount).ToArray(), _strokePaint);
     }
 
     // 频谱绘制：使用历史缓冲实现大 FFT 窗口 + 对数频率映射 + 时间平滑
-    private void DrawSpectrum(IImageProcessingContext ctx, RectangleF region, float[] samples)
+    private void DrawSpectrumSkia(SKRect region, float[] samples)
     {
         int fftSize = GetValidFftSize();
         
@@ -3046,13 +2553,14 @@ public class Generator
         float gap = barWidth * 0.15f;
         float actualWidth = barWidth - gap;
 
+        _fillPaint.Color = SKColors.White;
         for (int i = 0; i < barCount; i++)
         {
             float h = _smoothedSpectrum[i] * region.Height;
             if (h < 0.5f) continue;
             float x = region.Left + i * barWidth + gap / 2f;
-            float y = region.Top + region.Height - h;
-            ctx.Fill(Color.White, new RectangleF(x, y, actualWidth, h));
+            float y = region.Bottom - h;
+            _frameCanvas.DrawRect(SKRect.Create(x, y, actualWidth, h), _fillPaint);
         }
     }
 

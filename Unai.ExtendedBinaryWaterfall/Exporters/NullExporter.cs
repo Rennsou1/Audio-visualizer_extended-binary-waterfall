@@ -1,4 +1,4 @@
-using SixLabors.ImageSharp;
+using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
@@ -12,7 +12,8 @@ public class NullExporter : IExporter
 		
 	}
 
-	public void PushNewFrame(Image videoFrame, AudioBuffer audioFrame, double delta = 0.04)
+	// 空实现，不做任何处理
+	public void PushNewFrame(SKBitmap videoFrame, AudioBuffer audioFrame, double delta = 0.04)
 	{
 		
 	}

@@ -3,8 +3,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using SDL_Sharp;
 using SDL_Sharp.Loader;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
 
@@ -62,12 +61,8 @@ public class SdlExporter : IExporter
 		_init = true;
 	}
 
-	public void PushNewFrame(Image videoFrame, AudioBuffer audioFrame, double delta)
-	{
-		PushNewFrame((Image<Rgba32>)videoFrame, audioFrame, delta);
-	}
-
-	public void PushNewFrame(Image<Rgba32> videoFrame, AudioBuffer audioFrame, double delta)
+	// SKBitmap 版本的帧推送
+	public void PushNewFrame(SKBitmap videoFrame, AudioBuffer audioFrame, double delta)
 	{
 		if (!_init)
 		{
@@ -80,7 +75,9 @@ public class SdlExporter : IExporter
 		{
 			SDL.RenderClear(_ren);
 
-			videoFrame.CopyPixelDataTo(_framebuffer);
+			// 从 SKBitmap 复制像素数据到帧缓冲区
+			ReadOnlySpan<byte> pixels = videoFrame.GetPixelSpan();
+			pixels.CopyTo(_framebuffer);
 			SDL.SetRenderDrawColor(_ren, 0, 32, 0, 255);
 			Marshal.Copy(_framebuffer, 0, (nint)((Surface*)_surface)->Pixels, _framebuffer.Length);
 			

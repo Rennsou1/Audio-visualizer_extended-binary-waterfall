@@ -15,9 +15,9 @@
 			<PrivateAssets>all</PrivateAssets>
 		</PackageReference>
 		<!-- Used for rendering -->
-		<PackageReference Include="SixLabors.ImageSharp" Version="3.1.7" />
-		<PackageReference Include="SixLabors.Fonts" Version="2.0.3" />
-		<PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.2" />
+		<PackageReference Include="SkiaSharp" Version="2.88.9" />
+		<PackageReference Include="SkiaSharp.NativeAssets.Linux" Version="2.88.9" Condition="$([MSBuild]::IsOSPlatform('Linux'))" />
+		<PackageReference Include="SkiaSharp.HarfBuzz" Version="2.88.9" />
 		<!-- Used by format parsers -->
 		<PackageReference Include="PeNet" Version="4.1.1" />
 		<!-- Used by SdlExporter -->

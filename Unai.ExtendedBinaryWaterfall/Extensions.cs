@@ -1,20 +1,37 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Security.Cryptography;
 using System.Text;
-using SixLabors.Fonts;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Drawing.Processing;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Processing;
+using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
+// SKCanvas 扩展方法
 public static class Extensions
 {
+	// 可复用的 SKPaint 对象（避免每次调用创建新对象）
+	// 进度条画笔（使用方形端点）
+	private static readonly SKPaint _progressBarPaint = new()
+	{
+		IsAntialias = true,
+		Style = SKPaintStyle.Stroke,
+		StrokeCap = SKStrokeCap.Butt  // 方形端点
+	};
+	
+	// 文本渲染缓存（预渲染的文本位图）
+	private static readonly Dictionary<int, SKBitmap> _textRenderCache = new();
+	private const int MaxTextCacheSize = 256;
+	
+	// 可复用的文本绘制 Paint
+	private static readonly SKPaint _textPaint = new()
+	{
+		IsAntialias = true,
+		SubpixelText = true,
+		Style = SKPaintStyle.Fill
+	};
+
 	// 绘制进度条，支持可选的不透明度参数（用于淡入淡出效果）
-	public static void DrawProgressBar(this IImageProcessingContext ictx, float percent, int x1, int x2, float y, float opacity = 1f)
+	public static void DrawProgressBar(this SKCanvas canvas, float percent, int x1, int x2, float y, float opacity = 1f)
 	{
 		percent = Math.Clamp(percent, 0, 1);
 		opacity = Math.Clamp(opacity, 0f, 1f);
@@ -23,18 +40,128 @@ public static class Extensions
 		byte bgAlpha = (byte)(255 * opacity * 0.5f);  // 背景色半透明
 		byte fgAlpha = (byte)(255 * opacity);          // 前景色
 
-		var bgColor = Color.FromRgba(32, 32, 32, bgAlpha);
-		var fgColor = Color.FromRgba(192, 192, 192, fgAlpha); // Silver
-
-		ictx.DrawLine(new(), new SolidBrush(bgColor), 8,
-				new PointF(x1, y),
-				new PointF(x2, y)
-			).DrawLine(new(), new SolidBrush(fgColor), 8,
-				new PointF(x1, y),
-				new PointF(x1 + (x2 - x1) * percent, y)
-			);
+		_progressBarPaint.StrokeWidth = 8;
+		
+		// 绘制背景
+		_progressBarPaint.Color = new SKColor(32, 32, 32, bgAlpha);
+		canvas.DrawLine(x1, y, x2, y, _progressBarPaint);
+		
+		// 绘制前景（进度）
+		_progressBarPaint.Color = new SKColor(192, 192, 192, fgAlpha);
+		canvas.DrawLine(x1, y, x1 + (x2 - x1) * percent, y, _progressBarPaint);
 	}
 
+	// 绘制预缓存的文本（支持多行，增加\n分行）
+	public static void DrawTextAndCache(this SKCanvas canvas, SKTypeface typeface, float fontSize, 
+		string text, float x, float y, SKColor color, 
+		HorizontalAlign hAlign = HorizontalAlign.Left, 
+		VerticalAlign vAlign = VerticalAlign.Top)
+	{
+		if (string.IsNullOrEmpty(text)) return;
+		
+		// 处理多行文本：按 \n 分割
+		string[] lines = text.Split('\n');
+		if (lines.Length > 1)
+		{
+			// 多行文本：逐行绘制
+			float lineHeight = fontSize * 1.2f;
+			float totalHeight = lineHeight * lines.Length;
+			
+			// 根据垂直对齐计算起始 Y
+			float startY = y;
+			if (vAlign == VerticalAlign.Center)
+				startY -= totalHeight / 2f;
+			else if (vAlign == VerticalAlign.Bottom)
+				startY -= totalHeight;
+			
+			for (int i = 0; i < lines.Length; i++)
+			{
+				if (!string.IsNullOrEmpty(lines[i]))
+				{
+					DrawTextAndCacheSingleLine(canvas, typeface, fontSize, lines[i], x, startY + i * lineHeight, color, hAlign, VerticalAlign.Top);
+				}
+			}
+			return;
+		}
+		
+		// 单行文本
+		DrawTextAndCacheSingleLine(canvas, typeface, fontSize, text, x, y, color, hAlign, vAlign);
+	}
+	
+	// 绘制单行文本（内部方法）
+	private static void DrawTextAndCacheSingleLine(SKCanvas canvas, SKTypeface typeface, float fontSize, 
+		string text, float x, float y, SKColor color, 
+		HorizontalAlign hAlign, VerticalAlign vAlign)
+	{
+		if (string.IsNullOrEmpty(text)) return;
+		
+		// 计算缓存 key（基于文本、字体大小、颜色）
+		int hash = HashCode.Combine(text, typeface?.FamilyName ?? "", fontSize, (uint)color);
+		
+		if (!_textRenderCache.TryGetValue(hash, out var cachedBitmap))
+		{
+			// 缓存未命中，预渲染文本到位图
+			Logger.Trace($"Generating cached version of text '{text}'…");
+			
+			// 清理缓存（防止内存溢出）
+			if (_textRenderCache.Count >= MaxTextCacheSize)
+			{
+				foreach (var bmp in _textRenderCache.Values)
+					bmp.Dispose();
+				_textRenderCache.Clear();
+				Logger.Trace("Text cache cleared due to size limit.");
+			}
+			
+			// 配置画笔
+			_textPaint.Typeface = typeface;
+			_textPaint.TextSize = fontSize;
+			_textPaint.Color = color;
+			
+			// 测量文本边界
+			var bounds = new SKRect();
+			_textPaint.MeasureText(text, ref bounds);
+			
+			int width = (int)Math.Ceiling(bounds.Width) + 4;
+			int height = (int)Math.Ceiling(-bounds.Top + bounds.Bottom) + 4;
+			if (width < 1) width = 1;
+			if (height < 1) height = 1;
+			
+			// 创建位图并渲染文本
+			cachedBitmap = new SKBitmap(width, height, SKColorType.Rgba8888, SKAlphaType.Premul);
+			using var tempCanvas = new SKCanvas(cachedBitmap);
+			tempCanvas.Clear(SKColors.Transparent);
+			tempCanvas.DrawText(text, -bounds.Left + 2, -bounds.Top + 2, _textPaint);
+			
+			_textRenderCache[hash] = cachedBitmap;
+			Logger.Trace($"  Cached text bitmap: {width}x{height}");
+		}
+		
+		// 计算绘制位置（根据对齐方式）
+		float drawX = x;
+		float drawY = y;
+		
+		if (hAlign == HorizontalAlign.Center)
+			drawX -= cachedBitmap.Width / 2f;
+		else if (hAlign == HorizontalAlign.Right)
+			drawX -= cachedBitmap.Width;
+		
+		if (vAlign == VerticalAlign.Center)
+			drawY -= cachedBitmap.Height / 2f;
+		else if (vAlign == VerticalAlign.Bottom)
+			drawY -= cachedBitmap.Height;
+		
+		canvas.DrawBitmap(cachedBitmap, drawX, drawY);
+	}
+	
+	// 清理文本缓存（在需要时调用，如字体变化）
+	public static void ClearTextRenderCache()
+	{
+		foreach (var bmp in _textRenderCache.Values)
+			bmp.Dispose();
+		_textRenderCache.Clear();
+	}
+
+	// BinaryReader 扩展方法（保持不变）
 	public static string ReadString(this BinaryReader br, int length, Encoding textEncoding = null)
 	{
 		textEncoding ??= Encoding.ASCII;
@@ -63,68 +190,5 @@ public static class Extensions
 			if (br.ReadByte() == 0) skipCount++;
 		}
 		return br;
-	}
-
-	static Dictionary<int, Image<Rgba32>> _textRenderCache = [];
-
-	public static IImageProcessingContext DrawTextAndCache(this IImageProcessingContext ctx, DrawingOptions drawingOptions, RichTextOptions textOptions, string text, Brush brush, Pen pen)
-	{
-		if (string.IsNullOrEmpty(text)) return ctx;
-
-		int hash = 0x91f_c28a;
-		if (brush != null) hash ^= brush.GetHashCode();
-		if (pen != null) hash ^= pen.StrokeFill.GetHashCode();
-		foreach (var c in text) hash ^= c * 0xc10_48f1;
-		hash ^= 0x183 * (int)textOptions.Font.Size;
-
-		if (!_textRenderCache.TryGetValue(hash, out var cachedTextRender))
-		{
-			Logger.Trace($"Generating cached version of text '{text}'…");
-
-			// Avoiding an `ArgumentNullException` from `TextOptions..ctor`. Blame this line of code:
-			// https://github.com/SixLabors/Fonts/blob/d74f3fae7250cf3a76f43780abea6e15ec40b75e/src/SixLabors.Fonts/TextOptions.cs#L32C66-L32C86
-			textOptions.FallbackFontFamilies ??= [];
-
-			var newTextOpts = new RichTextOptions(textOptions)
-			{
-				Origin = new System.Numerics.Vector2(0, 0),
-				HorizontalAlignment = HorizontalAlignment.Left,
-				VerticalAlignment = VerticalAlignment.Top,
-			};
-
-			var imgBounds = TextMeasurer.MeasureBounds(text, newTextOpts);
-			Logger.Trace($"  Measured raster bounds: {imgBounds}");
-			cachedTextRender = new Image<Rgba32>((int)Math.Ceiling(imgBounds.Width + imgBounds.X), (int)Math.Ceiling(imgBounds.Height + imgBounds.Y));
-			cachedTextRender.Mutate(ctx2 => ctx2.DrawText(drawingOptions, newTextOpts, text, brush, pen));
-
-			_textRenderCache.Add(hash, cachedTextRender);
-		}
-
-		var x = textOptions.Origin.X;
-		var y = textOptions.Origin.Y;
-		
-		if (textOptions.HorizontalAlignment == HorizontalAlignment.Center)
-		{
-			x -= cachedTextRender.Width / 2;
-		}
-		else if (textOptions.HorizontalAlignment == HorizontalAlignment.Right)
-		{
-			x -= cachedTextRender.Width;
-		}
-		if (textOptions.VerticalAlignment == VerticalAlignment.Center)
-		{
-			y -= cachedTextRender.Height / 2;
-		}
-		else if (textOptions.VerticalAlignment == VerticalAlignment.Bottom)
-		{
-			y -= cachedTextRender.Height;
-		}
-
-		return ctx.DrawImage(cachedTextRender, new Point((int)x, (int)y), 1f);
-	}
-
-	public static IImageProcessingContext DrawTextAndCache(this IImageProcessingContext ctx, RichTextOptions textOptions, string text, Color color)
-	{
-		return ctx.DrawTextAndCache(new(), textOptions, text, new SolidBrush(color), null);
 	}
 }

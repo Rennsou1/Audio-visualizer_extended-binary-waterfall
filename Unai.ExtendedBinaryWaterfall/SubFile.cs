@@ -1,4 +1,4 @@
-using SixLabors.ImageSharp;
+using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
@@ -11,7 +11,7 @@ public class SubFile(string path, long startOffset, long length)
 	public long EndOffset { get => StartOffset + Length; set => Length = value - StartOffset; }
 	public string Description { get; set; } = null;
 	public string IconString { get; set; } = null;
-	public Image Icon { get; set; } = null;
+	public SKBitmap Icon { get; set; } = null;
 	// 可选的音频元数据字段：用于在右上文件列表中显示 Album/Album Artist/Track/Artist/Genre 信息
 	public string AlbumTitle { get; set; } = null;              // 专辑名
 	public string AlbumArtistName { get; set; } = null;        // 专辑作者/专辑艺术家名

@@ -4,8 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Processing;
+using SkiaSharp;
 using Unai.ExtendedBinaryWaterfall.Parsers.WindowsIcon;
 
 namespace Unai.ExtendedBinaryWaterfall;
@@ -14,9 +13,8 @@ public static class Utils
 {
 	public static string GetFileTypeEmoji(SubFile subFile)
 	{
-		if (subFile.IconString != null) return subFile.IconString;
-		if (subFile.IsDirectory) return "🗀";
-		return GetFileTypeEmojiFromExtension(subFile.Extension);
+		// 统一使用方块符号
+		return "▣";
 	}
 
 	public static string GetFileTypeEmojiFromExtension(string extension)
@@ -242,7 +240,7 @@ public static class Utils
 					target.Position = sf.StartOffset;
 					byte[] imageBuf = new byte[sf.Length];
 					target.ReadExactly(imageBuf);
-					sf.Icon = Image.Load(imageBuf);
+					sf.Icon = SKBitmap.Decode(imageBuf);
 				}
 				catch (Exception ex)
 				{
@@ -251,24 +249,33 @@ public static class Utils
 				break;
 		}
 					
-		sf.Icon?.Mutate(ctx => ctx.Resize(0, 128));
+		// 缩放图标到 128px 高度
+		if (sf.Icon != null)
+		{
+			int newHeight = 128;
+			int newWidth = (int)(sf.Icon.Width * (newHeight / (float)sf.Icon.Height));
+			var resized = sf.Icon.Resize(new SKImageInfo(newWidth, newHeight), SKFilterQuality.Medium);
+			sf.Icon.Dispose();
+			sf.Icon = resized;
+		}
 
 		return sf;
 	}
 
-	private static Image GetImageFromWindowsIconData(byte[] iconData)
+	// 从 Windows 图标数据加载 SKBitmap
+	private static SKBitmap GetImageFromWindowsIconData(byte[] iconData)
 	{
 		ArgumentNullException.ThrowIfNull(iconData);
 		
 		if (iconData[0] == 0x89 && iconData[1] == 0x50) // PNG
 		{
-			return Image.Load(iconData);
+			return SKBitmap.Decode(iconData);
 		}
 		
 		var iconParser = new WindowsIconParser();
 		iconParser.Load(iconData);
 
-		return Image.Load(iconParser.Entries.First().GetBitmap());
+		return SKBitmap.Decode(iconParser.Entries.First().GetBitmap());
 	}
 
 	internal static IEnumerable<float> NearestNeighborResample(this IList<float> input, int newSampleCount = 48000)

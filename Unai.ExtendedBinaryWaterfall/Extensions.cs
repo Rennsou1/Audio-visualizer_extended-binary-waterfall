@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading;
 using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall;
@@ -18,9 +20,11 @@ public static class Extensions
 		StrokeCap = SKStrokeCap.Butt  // 方形端点
 	};
 	
-	// 文本渲染缓存（预渲染的文本位图）
-	private static readonly Dictionary<int, SKBitmap> _textRenderCache = new();
-	private const int MaxTextCacheSize = 256;
+	// 文本渲染缓存（预渲染的文本位图）- 使用 LRU 策略
+	private static readonly Dictionary<int, (SKBitmap bitmap, long lastUsed)> _textRenderCache = new();
+	private const int MaxTextCacheSize = 1024;  // 增大缓存容量
+	private const int CacheCleanupBatch = 256;  // 每次清理的数量
+	private static long _cacheAccessCounter = 0;
 	
 	// 可复用的文本绘制 Paint
 	private static readonly SKPaint _textPaint = new()
@@ -98,18 +102,37 @@ public static class Extensions
 		// 计算缓存 key（基于文本、字体大小、颜色）
 		int hash = HashCode.Combine(text, typeface?.FamilyName ?? "", fontSize, (uint)color);
 		
-		if (!_textRenderCache.TryGetValue(hash, out var cachedBitmap))
+		SKBitmap bitmap;
+		long accessTime = Interlocked.Increment(ref _cacheAccessCounter);
+		
+		if (_textRenderCache.TryGetValue(hash, out var cached))
+		{
+			// 缓存命中，更新访问时间
+			bitmap = cached.bitmap;
+			_textRenderCache[hash] = (bitmap, accessTime);
+		}
+		else
 		{
 			// 缓存未命中，预渲染文本到位图
-			Logger.Trace($"Generating cached version of text '{text}'…");
 			
-			// 清理缓存（防止内存溢出）
+			// LRU 清理：只清理最旧的一批，而不是全部清空
 			if (_textRenderCache.Count >= MaxTextCacheSize)
 			{
-				foreach (var bmp in _textRenderCache.Values)
-					bmp.Dispose();
-				_textRenderCache.Clear();
-				Logger.Trace("Text cache cleared due to size limit.");
+				// 找出最旧的 CacheCleanupBatch 个条目并移除
+				var toRemove = _textRenderCache
+					.OrderBy(kv => kv.Value.lastUsed)
+					.Take(CacheCleanupBatch)
+					.Select(kv => kv.Key)
+					.ToList();
+				
+				foreach (var key in toRemove)
+				{
+					if (_textRenderCache.TryGetValue(key, out var entry))
+					{
+						entry.bitmap.Dispose();
+						_textRenderCache.Remove(key);
+					}
+				}
 			}
 			
 			// 配置画笔
@@ -127,13 +150,12 @@ public static class Extensions
 			if (height < 1) height = 1;
 			
 			// 创建位图并渲染文本
-			cachedBitmap = new SKBitmap(width, height, SKColorType.Rgba8888, SKAlphaType.Premul);
-			using var tempCanvas = new SKCanvas(cachedBitmap);
+			bitmap = new SKBitmap(width, height, SKColorType.Rgba8888, SKAlphaType.Premul);
+			using var tempCanvas = new SKCanvas(bitmap);
 			tempCanvas.Clear(SKColors.Transparent);
 			tempCanvas.DrawText(text, -bounds.Left + 2, -bounds.Top + 2, _textPaint);
 			
-			_textRenderCache[hash] = cachedBitmap;
-			Logger.Trace($"  Cached text bitmap: {width}x{height}");
+			_textRenderCache[hash] = (bitmap, accessTime);
 		}
 		
 		// 计算绘制位置（根据对齐方式）
@@ -141,23 +163,23 @@ public static class Extensions
 		float drawY = y;
 		
 		if (hAlign == HorizontalAlign.Center)
-			drawX -= cachedBitmap.Width / 2f;
+			drawX -= bitmap.Width / 2f;
 		else if (hAlign == HorizontalAlign.Right)
-			drawX -= cachedBitmap.Width;
+			drawX -= bitmap.Width;
 		
 		if (vAlign == VerticalAlign.Center)
-			drawY -= cachedBitmap.Height / 2f;
+			drawY -= bitmap.Height / 2f;
 		else if (vAlign == VerticalAlign.Bottom)
-			drawY -= cachedBitmap.Height;
+			drawY -= bitmap.Height;
 		
-		canvas.DrawBitmap(cachedBitmap, drawX, drawY);
+		canvas.DrawBitmap(bitmap, drawX, drawY);
 	}
 	
 	// 清理文本缓存（在需要时调用，如字体变化）
 	public static void ClearTextRenderCache()
 	{
-		foreach (var bmp in _textRenderCache.Values)
-			bmp.Dispose();
+		foreach (var entry in _textRenderCache.Values)
+			entry.bitmap.Dispose();
 		_textRenderCache.Clear();
 	}
 

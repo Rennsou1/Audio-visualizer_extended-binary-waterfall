@@ -79,7 +79,7 @@ public class Generator
     
     // 文本测量缓存（避免重复测量相同文本）
     private Dictionary<(string text, float fontSize), float> _textWidthCache = new();
-    private const int MaxTextCacheSize = 256;
+    private const int MaxTextCacheSize = 2048;  // 增大缓存容量
     
     // 预渲染的静态 UI 元素
     // 封面图片缓存（避免每帧 Clone + Resize）
@@ -100,6 +100,12 @@ public class Generator
     private double _animationStartTime = -1;      // 动画开始时间（秒）
     private double _currentVideoTime = 0;         // 当前视频时间（秒）
     private const double AnimationDurationSeconds = 0.5; // 动画持续时间（秒）
+    
+    // 灰色标签位置缓存（用于切换动画）
+    private float _prevComposerLabelX = 0;        // 前一首 Composer 标签 X 位置
+    private float _prevGenreLabelX = 0;           // 前一首 Genre 标签 X 位置
+    private bool _prevHasComposer = false;        // 前一首是否有 Composer
+    private bool _prevHasGenre = false;           // 前一首是否有 Genre
     
     // 字符动画缓存（避免每帧分配列表）
     private readonly List<(char c, float x, float width)> _oldCharPositions = new();
@@ -1839,7 +1845,7 @@ public class Generator
         
         // 获取当前歌曲信息
         string trackName = "";
-        string artistName = "";
+        string composerName = "";  
         string genreText = "";
         TimeSpan currentTime = TimeSpan.Zero;
         TimeSpan totalTime = TimeSpan.Zero;
@@ -1850,7 +1856,7 @@ public class Generator
         if (subfile != null)
         {
             trackName = !string.IsNullOrWhiteSpace(subfile.TrackTitle) ? subfile.TrackTitle : subfile.FileName;
-            artistName = subfile.ArtistName ?? subfile.AlbumArtistName ?? "";
+            composerName = subfile.ComposerName ?? subfile.ArtistName ?? "";
             genreText = subfile.Genre ?? "";
             coverImage = subfile.Icon;
             waveformPeaks = subfile.WaveformPeaks;
@@ -1858,7 +1864,6 @@ public class Generator
             // 使用子文件的音频时间信息计算进度（优先）或降级到字节比例计算
             if (subfile.AudioDuration > 0)
             {
-                // 使用预计算的音频时间信息（精确同步）
                 double timeInTrack = Math.Max(0, currentAudioTime - subfile.AudioStartTime);
                 
                 totalTime = TimeSpan.FromSeconds(subfile.AudioDuration);
@@ -1867,7 +1872,6 @@ public class Generator
             }
             else if (totalByteLength > 0 && totalAudioTime > 0)
             {
-                // 降级：基于字节比例计算（单文件模式）
                 double subfileStartTime = (subfile.StartOffset / (double)totalByteLength) * totalAudioTime;
                 double subfileDuration = (subfile.Length / (double)totalByteLength) * totalAudioTime;
                 double timeInTrack = Math.Max(0, currentAudioTime - subfileStartTime);
@@ -1880,11 +1884,22 @@ public class Generator
         
         // 构建显示文本
         string displayInfo = trackName;
-        bool hasArtist = !string.IsNullOrWhiteSpace(artistName);
+        bool hasComposer = !string.IsNullOrWhiteSpace(composerName);
         bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
-        if (hasArtist) displayInfo += $" // {artistName}";
+        if (hasComposer) displayInfo += $" // {composerName}";
         if (hasGenre) displayInfo += $" [{genreText}]";
         displayInfo = Utils.TruncateString(displayInfo, 55);
+        
+        // 计算各部分在显示文本中的位置（用于灰色标签对齐）
+        float titleEndX = infoX + MeasureTextWidth(trackName, _fontSize32);
+        float composerStartX = hasComposer ? titleEndX + MeasureTextWidth(" // ", _fontSize32) : 0;
+        float genreStartX = 0;
+        if (hasGenre)
+        {
+            string beforeGenre = trackName;
+            if (hasComposer) beforeGenre += $" // {composerName}";
+            genreStartX = infoX + MeasureTextWidth(beforeGenre + " ", _fontSize32);
+        }
         
         string timeString = $"{(int)currentTime.TotalMinutes}:{currentTime.Seconds:D2} / {(int)totalTime.TotalMinutes}:{totalTime.Seconds:D2}";
         
@@ -1992,6 +2007,7 @@ public class Generator
         }
         else
         {
+            // 没有封面时显示音符
             byte noteAlpha = (byte)(255 * (isInTransition ? animT : 1f));
             DrawText(coverX + coverSize / 2, coverY + coverSize / 2, _fontSize48, "♪",
                 new SKColor(100, 100, 100, noteAlpha), VerticalAlign.Center, HorizontalAlign.Center);
@@ -2000,9 +2016,87 @@ public class Generator
         // 文字与标签
         var labelColor = new SKColor(105, 105, 105);
         
-        // 绘制静态标签
+        // 绘制静态标签（Title 和 Time 位置固定）
         DrawText(infoX, labelY, _fontSize16, "Title:", labelColor);
         DrawText(timeX, labelY, _fontSize16, "Time:", labelColor, VerticalAlign.Top, HorizontalAlign.Right);
+        
+        // 绘制动态灰色标签（Composer 和 Genre，带滑动动画）
+        if (isInTransition)
+        {
+            // 计算插值位置
+            float currComposerX = hasComposer ? composerStartX : _prevComposerLabelX;
+            float currGenreX = hasGenre ? genreStartX : _prevGenreLabelX;
+            
+            // Composer 标签动画
+            if (_prevHasComposer || hasComposer)
+            {
+                float animComposerX;
+                byte composerAlpha;
+                if (_prevHasComposer && hasComposer)
+                {
+                    // 两首都有 Composer：滑动
+                    animComposerX = _prevComposerLabelX + (currComposerX - _prevComposerLabelX) * animT;
+                    composerAlpha = 255;
+                }
+                else if (hasComposer)
+                {
+                    // 新曲有 Composer：淡入
+                    animComposerX = composerStartX;
+                    composerAlpha = (byte)(255 * animT);
+                }
+                else
+                {
+                    // 旧曲有 Composer：淡出
+                    animComposerX = _prevComposerLabelX;
+                    composerAlpha = (byte)(255 * (1f - animT));
+                }
+                DrawText(animComposerX, labelY, _fontSize16, "Composer:", new SKColor(105, 105, 105, composerAlpha));
+            }
+            
+            // Genre 标签动画
+            if (_prevHasGenre || hasGenre)
+            {
+                float animGenreX;
+                byte genreAlpha;
+                if (_prevHasGenre && hasGenre)
+                {
+                    // 两首都有 Genre：滑动
+                    animGenreX = _prevGenreLabelX + (currGenreX - _prevGenreLabelX) * animT;
+                    genreAlpha = 255;
+                }
+                else if (hasGenre)
+                {
+                    // 新曲有 Genre：淡入
+                    animGenreX = genreStartX;
+                    genreAlpha = (byte)(255 * animT);
+                }
+                else
+                {
+                    // 旧曲有 Genre：淡出
+                    animGenreX = _prevGenreLabelX;
+                    genreAlpha = (byte)(255 * (1f - animT));
+                }
+                DrawText(animGenreX, labelY, _fontSize16, "Genre:", new SKColor(105, 105, 105, genreAlpha));
+            }
+        }
+        else
+        {
+            // 非过渡状态：直接绘制
+            if (hasComposer)
+            {
+                DrawText(composerStartX, labelY, _fontSize16, "Composer:", labelColor);
+            }
+            if (hasGenre)
+            {
+                DrawText(genreStartX, labelY, _fontSize16, "Genre:", labelColor);
+            }
+            
+            // 更新前一首标签位置
+            _prevComposerLabelX = hasComposer ? composerStartX : 0;
+            _prevGenreLabelX = hasGenre ? genreStartX : 0;
+            _prevHasComposer = hasComposer;
+            _prevHasGenre = hasGenre;
+        }
         
         // 曲目信息字符级动画
         DrawTextWithCharacterAnimationSkia(_fontSize32, displayInfo, _prevDisplayInfo, infoX, valueY, timeX - infoX - 120f * s, animT, isInTransition);
@@ -2383,8 +2477,8 @@ public class Generator
         {
             _audioInterleavedBuffer = new float[interleavedLen];
         }
-        var interleaved = audioBuffer.ToArray();
-        Array.Copy(interleaved, _audioInterleavedBuffer, Math.Min(interleaved.Length, interleavedLen));
+        // 直接复制到预分配缓冲区，避免 ToArray() 的内存分配
+        audioBuffer.CopyTo(_audioInterleavedBuffer);
 
         // 复用单声道数组（避免每帧分配）
         if (_audioMonoBuffer == null || _audioMonoBuffer.Length < sampleCount)
@@ -2450,14 +2544,22 @@ public class Generator
             // 每个点对应的样本索引
             int sampleIdx = startIdx + (i * windowSize / pointCount);
             float v = samples[sampleIdx] / maxAbs;
-
             float x = region.Left + (i / (float)(pointCount - 1)) * region.Width;
             float y = centerY - v * amplitude;
             points[i] = new SKPoint(x, y);
         }
         _strokePaint.Color = SKColors.White;
         _strokePaint.StrokeWidth = lineWidth;
-        _frameCanvas.DrawPoints(SKPointMode.Polygon, points.AsSpan(0, pointCount).ToArray(), _strokePaint);
+        // 使用 ArraySegment 避免额外分配（SkiaSharp 需要数组）
+        if (pointCount == points.Length)
+        {
+            _frameCanvas.DrawPoints(SKPointMode.Polygon, points, _strokePaint);
+        }
+        else
+        {
+            // 只有在点数不同时才需要创建子数组
+            _frameCanvas.DrawPoints(SKPointMode.Polygon, points[..pointCount], _strokePaint);
+        }
     }
 
     // 频谱绘制：使用历史缓冲实现大 FFT 窗口 + 对数频率映射 + 时间平滑

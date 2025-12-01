@@ -5,6 +5,9 @@ using System.IO;
 using System.Linq;
 using System.Numerics;
 using System.Reflection;
+using System.Runtime;
+using System.Threading;
+using System.Threading.Tasks;
 using CSCore;
 using CSCore.Codecs;
 using SixLabors.Fonts;
@@ -50,54 +53,233 @@ public class Generator
     // CSCore 音频解码相关字段：使用 CodecFactory 自动根据扩展名选择解码器
     private IWaveSource _audioWaveSource = null;
     private ISampleSource _audioSampleSource = null;
-    // 用于暂存每的 float PCM 数据
+    // 用于暂存每次渲染的 float PCM 数据
     private float[] _audioSampleBuffer = null;
-    // 频谱上一帧的柱状值，用于做简单的指数平滑，降低频谱动态速度
-    private float[] _lastSpectrumBins = null;
-    // 频谱峰值保持数组：记录每个柱的历史峰值，缓慢衰减
-    private float[] _spectrumPeakHold = null;
     private int _videoFrameX1, _videoFrameX2, _videoFrameY1, _videoFrameY2;
     internal bool _exitRequested = false;
     
-    // 歌曲切换过渡动画相关字段
+    // 歌曲切换动画状态
     private int _lastSubfileIndex = -1;
-    private long _transitionStartOffset = -1;
-    private long _transitionEndOffset = -1;
     
-    // 性能优化：预计算的布局参数缓存
-    private struct LayoutCache
-    {
-        public float Scale;
-        public int RightPanelX1, RightPanelX2;
-        public int SubfileX1, SubfileX2;
-        public int AudioVisX1, AudioVisX2;
-        public float SubfileH, SubfileRowH;
-        public float ShadowY1, ShadowY2;
-        public float RightPanelTop, RightPanelBottom;
-        public float ListTop, ListBottom;
-        public float BottomPanelHeight, BottomY;
-        public float CoverSize, CoverX, CoverY;
-        public float InfoX, TimeX;
-        public bool IsValid;
-    }
-    private LayoutCache _layoutCache;
+    // 音频可视化复用数组（避免每帧分配）
+    private float[] _audioMonoBuffer = null;
+    private float[] _audioInterleavedBuffer = null;
     
-    // 性能优化：预渲染的静态 UI 元素
-    private Image<Rgba32> _staticLabelsCache = null;
+    // 视频帧缓冲区复用（避免每帧分配）
+    private byte[] _reusableVideoBuffer = null;
+    
+    // 瀑布原始图像复用
+    private Image<Rgba32> _reusableWaterfallImage = null;
+    // 缩放后的瀑布图像复用（避免每帧 Clone+Resize 导致的内存分配）
+    private Image<Rgba32> _reusableScaledWaterfall = null;
+    
+    // 预渲染的渐变遮罩图像
+    private Image<Rgba32> _cachedTopGradientMask = null;
+    private Image<Rgba32> _cachedBottomGradientMask = null;
+    private float _cachedGradientY1 = -1;
+    private float _cachedGradientY2 = -1;
+    private float _cachedGradientHeight = -1;
+    
+    // 文本测量缓存（避免重复测量相同文本）
+    private Dictionary<(string text, int fontHash), float> _textWidthCache = new();
+    private const int MaxTextCacheSize = 256;
+    
+    // 预渲染的静态 UI 元素
+    // 封面图片缓存（避免每帧 Clone + Resize）
+    private Image<Rgba32> _cachedScaledCover = null;
+    private int _cachedCoverSubfileIndex = -1;
+    private int _cachedCoverSize = 0;
+    
+    // 静态 UI 图层缓存（包含不变的标签文本）
+    private Image<Rgba32> _staticUILayer = null;
+    private bool _staticUILayerValid = false;
+    
+    // 高级切换动画状态（基于时间）
+    private string _prevDisplayInfo = "";         // 前一首显示信息（用于字符动画）
+    private string _prevTimeString = "";          // 前一首时间字符串
+    private float[] _prevWaveformPeaks = null;    // 前一首波形数据
+    private Image<Rgba32> _prevScaledCover = null; // 前一首缩放后的封面
+    private byte[] _prevCoverHash = null;         // 前一首封面哈希（用于判断是否相同）
+    private double _animationStartTime = -1;      // 动画开始时间（秒）
+    private double _currentVideoTime = 0;         // 当前视频时间（秒）
+    private const double AnimationDurationSeconds = 0.5; // 动画持续时间（秒）
     
     // Ease-out 缓动函数（快到慢）
     private static float EaseOutCubic(float t) => 1f - MathF.Pow(1f - t, 3f);
+    
+    // Ease-in-out 缓动函数（适合字符动画）
+    private static float EaseInOutQuad(float t) => t < 0.5f ? 2f * t * t : 1f - MathF.Pow(-2f * t + 2f, 2f) / 2f;
+    
+    // 计算封面图像的简单哈希（用于比较是否相同）
+    private static byte[] ComputeImageHash(Image<Rgba32> image)
+    {
+        if (image == null) return null;
+        // 简单取样哈希：取四角和中心的像素值
+        int w = image.Width, h = image.Height;
+        var hash = new byte[20];
+        var positions = new[] { (0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1), (w / 2, h / 2) };
+        int idx = 0;
+        foreach (var (x, y) in positions)
+        {
+            var pixel = image[x, y];
+            hash[idx++] = pixel.R;
+            hash[idx++] = pixel.G;
+            hash[idx++] = pixel.B;
+            hash[idx++] = pixel.A;
+        }
+        return hash;
+    }
+    
+    // 比较两个哈希是否相同
+    private static bool HashEquals(byte[] a, byte[] b)
+    {
+        if (a == null && b == null) return true;
+        if (a == null || b == null) return false;
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+            if (a[i] != b[i]) return false;
+        return true;
+    }
     
     // 测量文本宽度
     private float MeasureTextWidth(string text, Font font)
     {
         if (string.IsNullOrEmpty(text)) return 0;
+        
+        // 使用缓存避免重复测量相同文本
+        var key = (text, font.GetHashCode());
+        if (_textWidthCache.TryGetValue(key, out float cachedWidth))
+        {
+            return cachedWidth;
+        }
+        
+        // 缓存未命中，执行测量
         var bounds = TextMeasurer.MeasureBounds(text, new TextOptions(font));
-        return bounds.Width;
+        float width = bounds.Width;
+        
+        // 缓存清理（别弄了我要死了）
+        if (_textWidthCache.Count >= MaxTextCacheSize)
+        {
+            _textWidthCache.Clear();
+        }
+        
+        _textWidthCache[key] = width;
+        return width;
+    }
+    
+    // 预渲染渐变遮罩图像
+    private void EnsureGradientMasksCached(float shadowY1, float shadowY2, float gradientHeight)
+    {
+        // 检查是否需要重新生成缓存
+        if (_cachedTopGradientMask != null && 
+            Math.Abs(_cachedGradientY1 - shadowY1) < 0.1f &&
+            Math.Abs(_cachedGradientY2 - shadowY2) < 0.1f &&
+            Math.Abs(_cachedGradientHeight - gradientHeight) < 0.1f)
+        {
+            return; // 缓存有效，直接返回
+        }
+        
+        // 释放旧缓存
+        _cachedTopGradientMask?.Dispose();
+        _cachedBottomGradientMask?.Dispose();
+        
+        int maskWidth = OutputVideoWidth;
+        int maskHeight = (int)gradientHeight;
+        if (maskHeight < 1) maskHeight = 1;
+        
+        // 创建顶部渐变遮罩（从不透明到透明）
+        _cachedTopGradientMask = new Image<Rgba32>(maskWidth, maskHeight);
+        _cachedTopGradientMask.Mutate(ctx => ctx.Fill(
+            new LinearGradientBrush(
+                new PointF(0, 0),
+                new PointF(0, maskHeight),
+                GradientRepetitionMode.None,
+                new ColorStop(0.5f, Color.FromRgba(16, 16, 16, 255)),
+                new ColorStop(1f, Color.FromRgba(16, 16, 16, 0))
+            ),
+            new RectangleF(0, 0, maskWidth, maskHeight)
+        ));
+        
+        // 创建底部渐变遮罩（从透明到不透明）
+        _cachedBottomGradientMask = new Image<Rgba32>(maskWidth, maskHeight);
+        _cachedBottomGradientMask.Mutate(ctx => ctx.Fill(
+            new LinearGradientBrush(
+                new PointF(0, 0),
+                new PointF(0, maskHeight),
+                GradientRepetitionMode.None,
+                new ColorStop(0f, Color.FromRgba(16, 16, 16, 0)),
+                new ColorStop(0.5f, Color.FromRgba(16, 16, 16, 255))
+            ),
+            new RectangleF(0, 0, maskWidth, maskHeight)
+        ));
+        
+        // 更新缓存标记
+        _cachedGradientY1 = shadowY1;
+        _cachedGradientY2 = shadowY2;
+        _cachedGradientHeight = gradientHeight;
     }
 
     // 公共方法：请求停止生成
     public void RequestStop() => _exitRequested = true;
+
+    // 预渲染静态 UI 图层（包含不变的标签文本）
+    private void EnsureStaticUILayerCached(string avSettingsString, string readSpeedString)
+    {
+        if (_staticUILayerValid && _staticUILayer != null) return;
+        
+        // 释放旧缓存
+        _staticUILayer?.Dispose();
+        
+        // 创建透明图层
+        _staticUILayer = new Image<Rgba32>(OutputVideoWidth, OutputVideoHeight);
+        
+        // 预渲染所有静态文本标签
+        _staticUILayer.Mutate(ctx =>
+        {
+            // A/V SETTINGS 标签
+            ctx.DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(32, 32),
+            }, "A/V SETTINGS", Color.DimGray)
+            // A/V SETTINGS 值
+            .DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(32, 32 + 24),
+            }, avSettingsString, Color.White)
+            // ABS. OFFSET 标签
+            .DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(OutputVideoWidth - 32, 32),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, "ABS. OFFSET", Color.DimGray)
+            // BITRATE 标签
+            .DrawText(new RichTextOptions(_font24)
+            {
+                Origin = new Vector2(OutputVideoWidth - 256, 32),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, "BITRATE", Color.DimGray)
+            // BITRATE 值（静态）
+            .DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            }, readSpeedString, Color.White);
+            
+            // Author（如果有）
+            if (Author != null)
+            {
+                ctx.DrawText(new RichTextOptions(_font32)
+                {
+                    Origin = new Vector2(OutputVideoWidth / 2f, 32 + 24),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                }, Author, Color.White);
+            }
+        });
+        
+        _staticUILayerValid = true;
+        Logger.Info("静态 UI 图层已预渲染");
+    }
 
     public byte[] GetCurrentFrameAsBgra()
     {
@@ -185,10 +367,10 @@ public class Generator
             frameStartByteOffset = InputFileStream.Length - WaterfallFrameLength;
         }
         
-        // 读取视频字节
+        // 读取视频字节（使用 ReadExactly 确保读取完整）
         InputFileStream.Position = frameStartByteOffset;
         byte[] currentVideoBuffer = new byte[WaterfallFrameLength];
-        InputFileStream.Read(currentVideoBuffer, 0, WaterfallFrameLength);
+        InputFileStream.ReadExactly(currentVideoBuffer, 0, WaterfallFrameLength);
         
         // 创建瀑布视图
         _viewportFramebuf?.Dispose();
@@ -260,7 +442,7 @@ public class Generator
             
             // 绘制右上歌曲/子文件列表
             int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
-            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 7));
+            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)(subfileWindowIndex + 2));
             float subfileRowH = 36f * s; // 行高
             float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
             
@@ -442,7 +624,8 @@ public class Generator
             {
                 var sf = currentSubfile.Value.Value;
                 trackName = !string.IsNullOrWhiteSpace(sf.TrackTitle) ? sf.TrackTitle : sf.FileName;
-                artistName = sf.ArtistName ?? sf.AlbumArtistName ?? "";
+                // 作曲家：优先使用 Composer，其次 Artist，最后 AlbumArtist
+                artistName = sf.ComposerName ?? sf.ArtistName ?? sf.AlbumArtistName ?? "";
                 genreText = sf.Genre ?? "";
                 coverImage = sf.Icon;
                 
@@ -455,30 +638,13 @@ public class Generator
                 }
             }
             
-            // 检测歌曲切换并计算过渡动画
-            int currSubIdx = currentSubfile?.Key ?? -1;
+            // 预览模式不需要过渡动画
             float transitionT = 1f;
             bool isInTransition = false;
-            long transitionBytes = InputBytesPerSecond;
-            
-            if (currSubIdx != _lastSubfileIndex && currSubIdx >= 0)
-            {
-                var currSf = currentSubfile.Value.Value;
-                _transitionStartOffset = currSf.StartOffset - transitionBytes;
-                _transitionEndOffset = currSf.StartOffset + transitionBytes;
-                _lastSubfileIndex = currSubIdx;
-            }
-            
-            if (_transitionStartOffset >= 0 && currentOffset >= _transitionStartOffset && currentOffset <= _transitionEndOffset)
-            {
-                isInTransition = true;
-                float rawT = (currentOffset - _transitionStartOffset) / (float)(_transitionEndOffset - _transitionStartOffset);
-                transitionT = EaseOutCubic(Math.Clamp(rawT, 0f, 1f));
-            }
-            
-            byte contentAlpha = (byte)(255 * transitionT);
-            Color labelColor = Color.FromRgba(105, 105, 105, contentAlpha);
-            Color textColor = Color.FromRgba(255, 255, 255, contentAlpha);
+            byte contentAlpha = 255;
+            int currSubIdx = currentSubfile?.Key ?? 0;
+            Color labelColor = Color.FromRgba(105, 105, 105, 255);
+            Color textColor = Color.FromRgba(255, 255, 255, 255);
             
             // 绘制封面
             var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
@@ -635,6 +801,10 @@ public class Generator
     #region General Parameters
 
     public string InputFilePath { get; set; } = null;
+    // 多文件队列：如果设置了此列表，将按顺序播放所有音频文件
+    public List<string> InputFilePaths { get; set; } = null;
+    // 当前播放的音频文件索引（用于 UI 显示）
+    public int CurrentAudioIndex { get; private set; } = 0;
     public string InputAuxiliaryFilePath { get; set; } = null;
     public string OutputFilePath { get; set; } = null;
     public string Title { get; set; } = null;
@@ -643,13 +813,29 @@ public class Generator
     public string ExporterId { get; set; } = null;
     // 硬件加速类型（仅适用于 FFmpeg 导出器）
     public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
-    // NVENC 编码配置（默认为最快速度）
-    public string NvencPreset { get; set; } = "p1";
-    public string NvencTune { get; set; } = "hq";
-    public string NvencRateControl { get; set; } = "vbr";
-    public bool NvencTemporalAQ { get; set; } = false;
-    public bool NvencSpatialAQ { get; set; } = false;
-    public int NvencLookahead { get; set; } = 0;
+    // NVENC 编码配置
+    public string NvencPreset { get; set; } = "p1";             // P1 最快速度
+    public string NvencTune { get; set; } = "ll";               // ll=低延迟模式
+    public string NvencRateControl { get; set; } = "vbr";       // vbr=可变比特率
+    public int NvencBFrames { get; set; } = 0;                  // B帧=0（禁用以提高速度）
+    public bool NvencTemporalAQ { get; set; } = false;          // 关闭时域AQ
+    public bool NvencSpatialAQ { get; set; } = false;           // 关闭空域AQ
+    public int NvencAQStrength { get; set; } = 0;               // AQ强度=0（已禁用）
+    public int NvencLookahead { get; set; } = 0;                // Lookahead=0（禁用前瞻）
+    public bool NvencZeroLatency { get; set; } = true;          // 零延迟模式
+    // 视频编码参数
+    public uint VideoBitrate { get; set; } = 20_000_000;        // 默认 20 Mbps
+    public int VideoCodecIndex { get; set; } = 0;               // 0=H.264, 1=H.265, 2=AV1, 3=VP9
+    public int RateControlMode { get; set; } = 0;               // 0=VBR, 1=CRF, 2=CBR
+    public int CrfValue { get; set; } = 23;                     // CRF值 0-51
+    public int VideoProfile { get; set; } = 0;                  // 0=auto, 1=baseline, 2=main, 3=high
+    public int VideoLevel { get; set; } = 0;                    // 0=auto
+    public int KeyframeInterval { get; set; } = 0;              // GOP大小，0=自动
+    // 音频编码参数
+    public uint AudioBitrate { get; set; } = 256_000;           // 默认 256 kbps
+    public int AudioCodecIndex { get; set; } = 0;               // 0=AAC
+    // 输出格式
+    public string OutputFormat { get; set; } = "matroska";      // matroska, mp4, webm, mov, avi
     public int InputBytesPerSecond { get; set; } = 48000 * 2;
     public string FontName { get; set; } = null;
     [CliParameter("Font Antialiasing", "font-antialiasing")]
@@ -720,13 +906,22 @@ public class Generator
     public float SpectrumSmoothing { get; set; } = 0.6f; // 频谱平滑系数，范围 0.1~1
 
     [CliParameter("FFT size for spectrum analysis (power of 2)", "fft-size")]
-    public int FftSize { get; set; } = 4096; // FFT 大小，必须是 2 的幂次方，范围 512~8192
+    public int FftSize { get; set; } = 2048; // FFT 大小，必须是 2 的幂次方，范围 512~8192
 
     [CliParameter("Intro fade duration in seconds", "intro-fade-duration")]
     public float IntroFadeDuration { get; set; } = 1.0f; // 开头免责声明的淡入淡出时长（秒）
 
     [CliParameter("Outro fade duration in seconds", "outro-fade-duration")]
     public float OutroFadeDuration { get; set; } = 2.0f; // 内容结束后的淡出时长（秒）
+
+    [CliParameter("Intro text content", "intro-text")]
+    public string IntroText { get; set; } = "声明\n\n本视频由\nextended-binary-waterfall\n项目进行生成\n\nhttps://github.com/unai-d/extended-binary-waterfall"; // 入场显示的文字内容
+
+    [CliParameter("Intro duration in seconds", "intro-duration")]
+    public float IntroDuration { get; set; } = 5.0f; // 开场持续时间（秒）
+
+    [CliParameter("Enable intro fade effect", "intro-fade-enabled")]
+    public bool IntroFadeEnabled { get; set; } = true; // 是否启用开场淡入淡出效果
 
     #endregion
 
@@ -740,10 +935,22 @@ public class Generator
 
     public void Initialize()
     {
+        // 验证输入文件路径
+        if (string.IsNullOrEmpty(InputFilePath))
+        {
+            throw new ArgumentException("InputFilePath 不能为空");
+        }
+        
         if (InputFileStream == null)
         {
             Logger.Info("Opening files…");
             Logger.Debug($"Opening file '{InputFilePath}'…");
+            
+            if (!System.IO.File.Exists(InputFilePath))
+            {
+                throw new System.IO.FileNotFoundException($"找不到输入文件: {InputFilePath}");
+            }
+            
             InputFileStream = System.IO.File.OpenRead(InputFilePath);
         }
 
@@ -784,52 +991,111 @@ public class Generator
         LogGeneratorStatus();
     }
 
-    // 使用 CSCore 初始化音频解码器：根据输入文件自动选择合适的解码器，
-    // 并让 AudioOutputSampleRate / AudioOutputChannelCount 直接跟随解码器参数。
-    // 如果初始化失败，则回退到原先基于字节流的伪音频配置。
+    // 多文件音频源（当 InputFilePaths 有多个文件时使用）
+    private MultiFileAudioSource _multiFileAudioSource;
+    
+    // 多文件二进制数据源（用于瀑布可视化）
+    private MultiFileBinarySource _multiFileBinarySource;
+    
+    // 音频解码器的原始采样率（用于 FFmpeg 重采样）
+    public int AudioDecoderSampleRate { get; private set; } = 48000;
+    
+    // 音频解码器的原始声道数（用于 FFmpeg 重采样）
+    public int AudioDecoderChannelCount { get; private set; } = 2;
+    
+    // 使用 CSCore 初始化音频解码器，支持多文件队列
     private void InitializeAudioDecoder()
     {
         try
         {
             Logger.Info("Initializing audio decoder (CSCore)…");
 
-            // 使用 CodecFactory 根据文件扩展名自动选择解码器
-            _audioWaveSource = CodecFactory.Instance.GetCodec(InputFilePath);
-            var wf = _audioWaveSource.WaveFormat;
-
-            // 直接跟随解码器的采样率和声道数
-            AudioOutputSampleRate = wf.SampleRate;
-            AudioOutputChannelCount = wf.Channels;
-
-            // 如果可以估算音频总时长，则重算 InputBytesPerSecond，使“字节时间轴”和音频时间轴大致对齐
-            long decodedBytes = _audioWaveSource.Length;
-            int bytesPerSecond = wf.BytesPerSecond;
-            if (decodedBytes > 0 && bytesPerSecond > 0 && InputFileStream != null && InputFileStream.Length > 0)
+            // 保存用户期望的输出设置（不要被解码器参数覆盖）
+            int targetOutputSampleRate = AudioOutputSampleRate;
+            int targetOutputChannelCount = AudioOutputChannelCount;
+            
+            // 如果有多文件队列，使用 MultiFileAudioSource
+            if (InputFilePaths != null && InputFilePaths.Count > 1)
             {
-                double durationSeconds = decodedBytes / (double)bytesPerSecond;
-                if (durationSeconds > 0.1)
+                Logger.Info($"Using multi-file audio source with {InputFilePaths.Count} files");
+                _multiFileAudioSource = new MultiFileAudioSource(InputFilePaths);
+                _audioSampleSource = _multiFileAudioSource;
+                
+                var wf = _multiFileAudioSource.WaveFormat;
+                // 保存解码器原始参数（用于 FFmpeg 重采样）
+                AudioDecoderSampleRate = wf.SampleRate;
+                AudioDecoderChannelCount = wf.Channels;
+                
+                // 计算总时长（采样数 / (采样率 × 声道数)）
+                double totalDuration = _multiFileAudioSource.Length / (double)(wf.SampleRate * wf.Channels);
+                Logger.Info($"Total audio duration: {TimeSpan.FromSeconds(totalDuration)}");
+                
+                // 计算所有文件的总大小
+                long totalFileSize = 0;
+                foreach (var path in InputFilePaths)
                 {
-                    InputBytesPerSecond = (int)(InputFileStream.Length / durationSeconds);
+                    if (System.IO.File.Exists(path))
+                        totalFileSize += new System.IO.FileInfo(path).Length;
                 }
+                
+                // 计算 InputBytesPerSecond（所有文件总大小 / 总时长）
+                if (totalDuration > 0.1)
+                {
+                    InputBytesPerSecond = (int)(totalFileSize / totalDuration);
+                    Logger.Info($"Multi-file InputBytesPerSecond: {InputBytesPerSecond} ({totalFileSize} bytes / {totalDuration:F2}s)");
+                }
+                
+                // 初始化多文件二进制源用于瀑布可视化
+                _multiFileBinarySource = new MultiFileBinarySource(InputFilePaths, InputBytesPerSecond);
+                Logger.Info($"Multi-file binary source initialized: total {_multiFileBinarySource.TotalLength} bytes");
             }
+            else
+            {
+                // 单文件模式
+                _audioWaveSource = CodecFactory.Instance.GetCodec(InputFilePath);
+                var wf = _audioWaveSource.WaveFormat;
 
-            // 转为浮点样本源，便于后续直接读取 float PCM
-            _audioSampleSource = _audioWaveSource.ToSampleSource();
+                // 保存解码器原始参数（用于 FFmpeg 重采样）
+                AudioDecoderSampleRate = wf.SampleRate;
+                AudioDecoderChannelCount = wf.Channels;
 
-            // 准备输出音频缓冲区（每帧 SamplesPerFramePerChannel × 通道数）
-            _outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
-            _audioSampleBuffer = new float[AudioOutputSamplesPerFrame];
+                // 计算 InputBytesPerSecond
+                long decodedBytes = _audioWaveSource.Length;
+                int bytesPerSecond = wf.BytesPerSecond;
+                if (decodedBytes > 0 && bytesPerSecond > 0 && InputFileStream != null && InputFileStream.Length > 0)
+                {
+                    double durationSeconds = decodedBytes / (double)bytesPerSecond;
+                    if (durationSeconds > 0.1)
+                    {
+                        InputBytesPerSecond = (int)(InputFileStream.Length / durationSeconds);
+                    }
+                }
 
-            // 输入缓冲区在新的流程中不再使用真实含义，这里仅保持大小一致以避免空引用
-            _inputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
+                _audioSampleSource = _audioWaveSource.ToSampleSource();
+            }
+            
+            // 恢复用户期望的输出设置
+            // FFmpeg 导出器会将音频从 AudioDecoderSampleRate/AudioDecoderChannelCount 重采样到 AudioOutputSampleRate/AudioOutputChannelCount
+            AudioOutputSampleRate = targetOutputSampleRate;
+            AudioOutputChannelCount = targetOutputChannelCount;
+            Logger.Info($"Audio: decoder={AudioDecoderSampleRate}Hz {AudioDecoderChannelCount}ch -> output={AudioOutputSampleRate}Hz {AudioOutputChannelCount}ch");
+
+            // 准备音频缓冲区（基于解码器参数，因为这是实际读取的数据）
+            int decoderSamplesPerChannel = AudioDecoderSampleRate / OutputFps;
+            _outputAudioBuffer = new(decoderSamplesPerChannel, AudioDecoderChannelCount);
+            _audioSampleBuffer = new float[decoderSamplesPerChannel * AudioDecoderChannelCount];
+            _inputAudioBuffer = new(decoderSamplesPerChannel, AudioDecoderChannelCount);
+            
+            Logger.Info($"Audio decoder initialized: {AudioDecoderSampleRate}Hz, {AudioDecoderChannelCount}ch, {decoderSamplesPerChannel} samples/ch/frame");
         }
         catch (Exception ex)
         {
-            // 出错时记录日志并回退到旧的“伪音频”逻辑，以保证程序仍可运行
-            Logger.Error($"Failed to initialize audio decoder with CSCore. Falling back to fake audio. {ex.Message}");
+            Logger.Error($"Failed to initialize audio decoder: {ex.Message}");
             _audioSampleSource = null;
             _audioWaveSource?.Dispose();
             _audioWaveSource = null;
+            _multiFileAudioSource?.Dispose();
+            _multiFileAudioSource = null;
 
             _inputAudioBuffer = new(AudioInputSamplesPerFramePerChannel, AudioInputChannelCount);
             _outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
@@ -928,17 +1194,39 @@ public class Generator
 
         Exporter.Generator = this;
 
-        // 如果是 FFmpeg 导出器，应用硬件加速设置和 NVENC 配置
+        // 如果是 FFmpeg 导出器，应用所有编码设置
         if (Exporter is FfmpegExporter ffmpegExporter)
         {
+            // 硬件加速设置
             ffmpegExporter.HardwareAccel = HardwareAccel;
+            
+            // NVENC 配置
             ffmpegExporter.NvencPreset = NvencPreset;
             ffmpegExporter.NvencTune = NvencTune;
             ffmpegExporter.NvencRateControl = NvencRateControl;
+            ffmpegExporter.NvencBFrames = NvencBFrames;
             ffmpegExporter.NvencTemporalAQ = NvencTemporalAQ;
             ffmpegExporter.NvencSpatialAQ = NvencSpatialAQ;
+            ffmpegExporter.NvencAQStrength = NvencAQStrength;
             ffmpegExporter.NvencLookahead = NvencLookahead;
-            Logger.Debug($"Hardware acceleration: {HardwareAccel}");
+            
+            // 视频编码参数
+            ffmpegExporter.OutputVideoBitRate = VideoBitrate;
+            ffmpegExporter.VideoCodecIndex = VideoCodecIndex;
+            ffmpegExporter.RateControlMode = RateControlMode;
+            ffmpegExporter.CrfValue = CrfValue;
+            ffmpegExporter.VideoProfile = VideoProfile;
+            ffmpegExporter.VideoLevel = VideoLevel;
+            ffmpegExporter.KeyframeInterval = KeyframeInterval;
+            
+            // 音频编码参数
+            ffmpegExporter.OutputAudioBitRate = AudioBitrate;
+            ffmpegExporter.AudioCodecIndex = AudioCodecIndex;
+            
+            // 输出容器格式
+            ffmpegExporter.OutputFormat = OutputFormat;
+            
+            Logger.Debug($"FFmpeg: Codec={VideoCodecIndex}, HW={HardwareAccel}, RC={RateControlMode}, CRF={CrfValue}, Bitrate={VideoBitrate/1_000_000}Mbps");
         }
 
         if (AdditionalCliArguments.Count > 0)
@@ -960,39 +1248,93 @@ public class Generator
         }
     }
 
-    // 解析子文件列表，如果解析不到则构造一个“覆盖整文件”的虚拟子文件
+    // 解析子文件列表，支持多文件队列
     private void ParseSubfiles()
     {
-        IEnumerable<SubFile> subFiles = null;
-
-        if (Parser != null)
+        // 如果有多文件队列（超过1个文件），为每个文件创建子文件条目
+        if (InputFilePaths != null && InputFilePaths.Count > 1)
         {
-            Logger.Info("Parsing subfiles…");
-
-            Parser.InputStream = InputFileStream;
-            Parser.AuxiliaryInputStream = InputAuxiliaryFileStream;
-
-            subFiles = Parser.GetSubFiles();
-
-            _subfiles =
-            [
-                .. subFiles
-                .OrderBy(sf => sf.StartOffset)
-                .Select(sf => Utils.ParseSubfile(InputFileStream, sf))
-            ];
+            Logger.Info($"Building subfiles from audio queue ({InputFilePaths.Count} files)…");
+            
+            _subfiles = new List<SubFile>();
+            long currentOffset = 0;
+            long actualByteOffset = 0;    // 实际文件字节偏移累加
+            double currentAudioTime = 0;  // 累积音频时间（秒）
+            
+            foreach (var filePath in InputFilePaths)
+            {
+                if (!System.IO.File.Exists(filePath)) continue;
+                
+                // 获取音频时长和实际文件大小
+                long fileLength = 0;
+                long actualFileSize = 0;
+                double durationSeconds = 0;
+                try
+                {
+                    actualFileSize = new System.IO.FileInfo(filePath).Length;
+                    using var tempSource = CodecFactory.Instance.GetCodec(filePath);
+                    durationSeconds = tempSource.Length / (double)tempSource.WaveFormat.BytesPerSecond;
+                    fileLength = (long)(durationSeconds * InputBytesPerSecond);
+                }
+                catch
+                {
+                    // 无法获取时长时使用文件大小估算
+                    actualFileSize = new System.IO.FileInfo(filePath).Length;
+                    fileLength = actualFileSize;
+                    durationSeconds = fileLength / (double)InputBytesPerSecond;
+                }
+                
+                var sf = SubFile.FromWholeFile(filePath, fileLength);
+                sf.StartOffset = currentOffset;
+                sf.EndOffset = currentOffset + fileLength;
+                // 设置音频时间信息（用于精确同步）
+                sf.AudioStartTime = currentAudioTime;
+                sf.AudioDuration = durationSeconds;
+                // 设置实际文件字节偏移（用于瀑布可视化）
+                sf.ActualByteOffset = actualByteOffset;
+                sf.ActualByteLength = actualFileSize;
+                _subfiles.Add(sf);
+                
+                currentOffset += fileLength;
+                actualByteOffset += actualFileSize;
+                currentAudioTime += durationSeconds;
+            }
+            
+            Logger.Debug($"Created {_subfiles.Count} subfiles from audio queue, total audio time: {currentAudioTime:F2}s, total actual bytes: {actualByteOffset}");
         }
-
-        Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
-
-        // 如果没有解析到任何子文件，则构造一个覆盖整个输入文件的虚拟子文件，
-        // 这样右上区域始终可以显示至少一条“歌曲/文件”记录
-        if (_subfiles.Count == 0 && InputFileStream != null && !string.IsNullOrEmpty(InputFilePath))
+        else
         {
-            _subfiles =
-            [
-                SubFile.FromWholeFile(InputFilePath, InputFileStream.Length)
-            ];
-            Logger.Debug("No subfiles parsed; created a virtual subfile covering the whole input file.");
+            // 原有的单文件解析逻辑
+            IEnumerable<SubFile> subFiles = null;
+
+            if (Parser != null)
+            {
+                Logger.Info("Parsing subfiles…");
+
+                Parser.InputStream = InputFileStream;
+                Parser.AuxiliaryInputStream = InputAuxiliaryFileStream;
+
+                subFiles = Parser.GetSubFiles();
+
+                _subfiles =
+                [
+                    .. subFiles
+                    .OrderBy(sf => sf.StartOffset)
+                    .Select(sf => Utils.ParseSubfile(InputFileStream, sf))
+                ];
+            }
+
+            Logger.Debug($"Total number of subfiles: {_subfiles.Count}");
+
+            // 如果没有解析到任何子文件，则构造一个覆盖整个输入文件的虚拟子文件
+            if (_subfiles.Count == 0 && InputFileStream != null && !string.IsNullOrEmpty(InputFilePath))
+            {
+                _subfiles =
+                [
+                    SubFile.FromWholeFile(InputFilePath, InputFileStream.Length)
+                ];
+                Logger.Debug("No subfiles parsed; created a virtual subfile covering the whole input file.");
+            }
         }
 
         if (LogAllSubfiles)
@@ -1003,7 +1345,7 @@ public class Generator
             }
         }
 
-        // 尝试为每个子文件填充音频元数据（如果对应路径是可由 TagLib 识别的音频文件）
+        // 尝试为每个子文件填充音频元数据
         PopulateSubfileMetadata();
     }
 
@@ -1065,16 +1407,21 @@ public class Generator
                     }
                 }
 
-                // 艺术家 / 作曲家
+                // 作曲家（Composer）- 优先用于显示
+                if (string.IsNullOrWhiteSpace(sf.ComposerName))
+                {
+                    if (tag.Composers != null && tag.Composers.Length > 0)
+                    {
+                        sf.ComposerName = string.Join(", ", tag.Composers);
+                    }
+                }
+                
+                // 艺术家 Artist 作为备选
                 if (string.IsNullOrWhiteSpace(sf.ArtistName))
                 {
                     if (tag.Performers != null && tag.Performers.Length > 0)
                     {
                         sf.ArtistName = string.Join(", ", tag.Performers);
-                    }
-                    else if (tag.Composers != null && tag.Composers.Length > 0)
-                    {
-                        sf.ArtistName = string.Join(", ", tag.Composers);
                     }
                 }
 
@@ -1093,13 +1440,15 @@ public class Generator
     }
 
     // 预计算所有子文件的波形 RMS 值（用于底部进度条显示）
-    // 使用 CSCore 解码音频文件获取真正的 PCM 采样数据，然后计算 RMS
+    // 使用流式读取 + 完整采样计算，生成准确的波形数据
     private void PrecomputeSubfileWaveforms()
     {
         Logger.Info("Precomputing waveform RMS for subfiles…");
         
         // 每个子文件生成固定数量的 RMS 值
         const int rmsCount = 256;
+        // 流式读取缓冲区大小（64KB 采样数据）
+        const int readBufferSize = 65536;
         
         foreach (var sf in _subfiles)
         {
@@ -1112,53 +1461,58 @@ public class Generator
                 using var waveSource = CodecFactory.Instance.GetCodec(sf.Path);
                 using var sampleSource = waveSource.ToSampleSource();
                 
-                // 获取音频总采样数（单声道）
-                long totalSamples = sampleSource.Length / sampleSource.WaveFormat.Channels;
+                // 获取音频总采样数
+                long totalSamples = sampleSource.Length;
                 if (totalSamples <= 0) continue;
                 
-                // 计算每个 RMS 段的采样数
-                long samplesPerSegment = totalSamples / rmsCount;
-                if (samplesPerSegment < 64) samplesPerSegment = 64;
+                int channelCount = sampleSource.WaveFormat.Channels;
+                if (channelCount <= 0) channelCount = 2;
                 
+                // 计算每个 RMS 段对应的采样数
+                long samplesPerSegment = totalSamples / rmsCount;
+                if (samplesPerSegment < 1) samplesPerSegment = 1;
+                
+                // RMS 累加器：每个段的平方和与采样计数
+                double[] sumSquares = new double[rmsCount];
+                long[] sampleCounts = new long[rmsCount];
+                
+                // 流式读取整个音频文件
+                float[] buffer = new float[readBufferSize];
+                long currentPosition = 0;
+                int totalRead;
+                
+                while ((totalRead = sampleSource.Read(buffer, 0, readBufferSize)) > 0)
+                {
+                    // 处理每个采样，累加到对应的 RMS 段
+                    for (int i = 0; i < totalRead; i++)
+                    {
+                        // 计算当前采样属于哪个 RMS 段
+                        int segmentIndex = (int)((currentPosition + i) / samplesPerSegment);
+                        if (segmentIndex >= rmsCount) segmentIndex = rmsCount - 1;
+                        
+                        // 累加平方值
+                        double sample = buffer[i];
+                        sumSquares[segmentIndex] += sample * sample;
+                        sampleCounts[segmentIndex]++;
+                    }
+                    currentPosition += totalRead;
+                }
+                
+                // 计算每个段的 RMS 值
                 float[] rmsValues = new float[rmsCount];
                 float globalMaxRms = 0f;
                 
-                // 读取缓冲区
-                int channelCount = sampleSource.WaveFormat.Channels;
-                int bufferSize = (int)Math.Min(samplesPerSegment * channelCount, 65536);
-                float[] buffer = new float[bufferSize];
-                
                 for (int i = 0; i < rmsCount; i++)
                 {
-                    // 计算该段的 RMS（均方根）值
-                    double sumSquares = 0.0;
-                    int sampleCount = 0;
-                    long samplesToRead = samplesPerSegment * channelCount;
-                    
-                    while (samplesToRead > 0)
+                    if (sampleCounts[i] > 0)
                     {
-                        int toRead = (int)Math.Min(samplesToRead, bufferSize);
-                        int read = sampleSource.Read(buffer, 0, toRead);
-                        if (read <= 0) break;
-                        
-                        // 累加平方和（混合所有声道）
-                        for (int j = 0; j < read; j++)
-                        {
-                            double sample = buffer[j];
-                            sumSquares += sample * sample;
-                            sampleCount++;
-                        }
-                        
-                        samplesToRead -= read;
+                        float rms = (float)Math.Sqrt(sumSquares[i] / sampleCounts[i]);
+                        rmsValues[i] = rms;
+                        if (rms > globalMaxRms) globalMaxRms = rms;
                     }
-                    
-                    // 计算 RMS 值
-                    float rms = sampleCount > 0 ? (float)Math.Sqrt(sumSquares / sampleCount) : 0f;
-                    rmsValues[i] = rms;
-                    if (rms > globalMaxRms) globalMaxRms = rms;
                 }
                 
-                // 峰值归一化：找到全局最大 RMS，然后将所有值按此缩放到 0-1 范围
+                // 峰值归一化：将所有值按全局最大 RMS 缩放到 0-1 范围
                 if (globalMaxRms > 0.0001f)
                 {
                     for (int i = 0; i < rmsCount; i++)
@@ -1168,7 +1522,7 @@ public class Generator
                 }
                 
                 sf.WaveformPeaks = rmsValues;
-                Logger.Debug($"Waveform computed for '{sf.FileName}': max RMS = {globalMaxRms:F4}");
+                Logger.Debug($"Waveform computed for '{sf.FileName}': {currentPosition} samples, max RMS = {globalMaxRms:F4}");
             }
             catch (Exception ex)
             {
@@ -1240,50 +1594,15 @@ public class Generator
             if (_videoFrameX2 == 0) _videoFrameX2 = _videoFrameX1 + WaterfallScaledWidth;
             _videoFrameY1 = OutputVideoHeight / 2 - WaterfallScaledHeight / 2;
             if (_videoFrameY2 == 0) _videoFrameY2 = _videoFrameY1 + WaterfallScaledHeight;
-            
-            // 初始化布局缓存
-            InitializeLayoutCache();
         }
     }
     
-    // 初始化布局参数缓存，避免每帧重复计算
-    private void InitializeLayoutCache()
-    {
-        float s = ResolutionScale;
-        _layoutCache = new LayoutCache
-        {
-            Scale = s,
-            RightPanelX1 = _videoFrameX2 + (int)(64 * s),
-            RightPanelX2 = OutputVideoWidth - (int)(32 * s),
-            SubfileH = 48f * s,
-            SubfileRowH = 36f * s,
-            IsValid = true
-        };
-        _layoutCache.SubfileX1 = _layoutCache.RightPanelX1;
-        _layoutCache.SubfileX2 = _layoutCache.RightPanelX2;
-        _layoutCache.AudioVisX1 = _layoutCache.RightPanelX1;
-        _layoutCache.AudioVisX2 = _layoutCache.RightPanelX2;
-        _layoutCache.ShadowY1 = (OutputVideoHeight / 2f) - _layoutCache.SubfileH * 8.5f;
-        _layoutCache.ShadowY2 = (OutputVideoHeight / 2f) + _layoutCache.SubfileH * 6.5f;
-        _layoutCache.RightPanelTop = _layoutCache.ShadowY1 + _layoutCache.SubfileH * 2f + 16f * s;
-        _layoutCache.RightPanelBottom = _layoutCache.ShadowY2 - 16f * s;
-        float rightPanelHeight = _layoutCache.RightPanelBottom - _layoutCache.RightPanelTop;
-        _layoutCache.ListTop = _layoutCache.RightPanelTop;
-        _layoutCache.ListBottom = _layoutCache.ListTop + rightPanelHeight * 0.20f;
-        _layoutCache.BottomPanelHeight = 100f * s;
-        _layoutCache.BottomY = OutputVideoHeight - _layoutCache.BottomPanelHeight - 16f * s;
-        _layoutCache.CoverSize = 72f * s;
-        _layoutCache.CoverX = 32f * s;
-        _layoutCache.CoverY = _layoutCache.BottomY + (_layoutCache.BottomPanelHeight - _layoutCache.CoverSize) / 2f;
-        _layoutCache.InfoX = _layoutCache.CoverX + _layoutCache.CoverSize + 16f * s;
-        _layoutCache.TimeX = OutputVideoWidth - 32f * s;
-        
-        Logger.Info("Layout cache initialized for performance optimization.");
-    }
-
     // 总生成流程
     public void Generate()
     {
+        // 极端性能优化：配置运行时和线程池
+        ConfigureHighPerformanceMode();
+        
         _timer.Start();
 
         GenerateIntro();
@@ -1297,35 +1616,68 @@ public class Generator
 
         OnFinish?.Invoke();
     }
+    
+    // 配置高性能模式：调整线程池、GC 和运行时设置
+    private static void ConfigureHighPerformanceMode()
+    {
+        // 大幅增加线程池线程数（完全利用多核 CPU）
+        int processorCount = Environment.ProcessorCount;
+        int minWorkerThreads = processorCount * 8;
+        int minIOThreads = processorCount * 4;
+        int maxWorkerThreads = processorCount * 16;
+        int maxIOThreads = processorCount * 8;
+        
+        ThreadPool.SetMinThreads(minWorkerThreads, minIOThreads);
+        ThreadPool.SetMaxThreads(maxWorkerThreads, maxIOThreads);
+        
+        // 配置 GC 为低延迟模式（减少 GC 暂停）
+        GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+        
+        // 尝试使用服务器 GC（如果可用会更高效）
+        // 注意：服务器 GC 需要在 csproj 中配置 <ServerGarbageCollection>true</ServerGarbageCollection>
+        
+        Logger.Info($"高性能模式已启用: {processorCount} 核心, 线程池 min={minWorkerThreads}/{minIOThreads} max={maxWorkerThreads}/{maxIOThreads}, GC={GCSettings.LatencyMode}");
+    }
 
-    // 生成开头的免责声明画面（带淡入淡出效果）
+    // 生成开头的免责声明画面（可配置淡入淡出效果）
     private void GenerateIntro()
     {
         Logger.Info("Generating introduction…");
 
-        var totalFrames = 5 * OutputFps;
-        // 淡入淡出的帧数（由 IntroFadeDuration 参数控制）
-        int fadeFrames = (int)(IntroFadeDuration * OutputFps);
-        fadeFrames = Math.Clamp(fadeFrames, 1, (int)(totalFrames / 3)); // 最多占总时长的 1/3
+        // 使用 IntroDuration 参数控制开场持续时间
+        var totalFrames = (int)(IntroDuration * OutputFps);
+        
+        // 淡入淡出的帧数（由 IntroFadeDuration 参数控制，可选）
+        int fadeFrames = IntroFadeEnabled ? (int)(IntroFadeDuration * OutputFps) : 0;
+        if (fadeFrames > 0)
+        {
+            fadeFrames = Math.Clamp(fadeFrames, 1, (int)(totalFrames / 3)); // 最多占总时长的 1/3
+        }
+
+        // 创建静音音频缓冲区（intro 阶段不播放音频）
+        // 重要：必须使用解码器的采样率和声道数，因为 FFmpeg 导出器期望输入格式与主视频阶段一致
+        int introSamplesPerChannel = AudioDecoderSampleRate / OutputFps;
+        var silentAudioBuffer = new AudioBuffer(introSamplesPerChannel, AudioDecoderChannelCount);
+        silentAudioBuffer.Clear();
 
         for (long frameNumber = 0; frameNumber < totalFrames; frameNumber++)
         {
-            // 计算当前帧的不透明度
-            // 淡入：前 fadeFrames 帧从 0 渐变到 1
-            // 淡出：后 fadeFrames 帧从 1 渐变到 0
-            // 中间：保持 1
+            // 计算当前帧的不透明度（如果启用淡入淡出效果）
             float opacity = 1f;
-            if (frameNumber < fadeFrames)
+            if (IntroFadeEnabled && fadeFrames > 0)
             {
-                // 淡入阶段
-                opacity = frameNumber / (float)fadeFrames;
+                if (frameNumber < fadeFrames)
+                {
+                    // 淡入阶段
+                    opacity = frameNumber / (float)fadeFrames;
+                }
+                else if (frameNumber >= totalFrames - fadeFrames)
+                {
+                    // 淡出阶段
+                    opacity = (totalFrames - frameNumber) / (float)fadeFrames;
+                }
+                opacity = Math.Clamp(opacity, 0f, 1f);
             }
-            else if (frameNumber >= totalFrames - fadeFrames)
-            {
-                // 淡出阶段
-                opacity = (totalFrames - frameNumber) / (float)fadeFrames;
-            }
-            opacity = Math.Clamp(opacity, 0f, 1f);
 
             // 背景色
             _frameContent.Mutate(ctx => ctx.Clear(new Rgba32(16, 16, 16, 255)));
@@ -1334,13 +1686,14 @@ public class Generator
             byte alpha = (byte)(255 * opacity);
             var textColor = Color.FromRgba(255, 255, 255, alpha);
 
+            // 使用 IntroText 参数显示自定义入场文字
             _frameContent.Mutate(av => av
                 .DrawText(new RichTextOptions(_font48)
                 {
                     Origin = new Vector2(OutputVideoWidth / 2f, OutputVideoHeight / 2f),
                     HorizontalAlignment = HorizontalAlignment.Center,
                     TextAlignment = TextAlignment.Center,
-                }, "声明\n\n本视频由\nAudio-visualizer_extended-binary-waterfall\n项目进行生成", textColor)
+                }, IntroText ?? "", textColor)
                 .DrawText(new RichTextOptions(_font24)
                 {
                     Origin = new Vector2(OutputVideoWidth / 2f, OutputVideoHeight - 128),
@@ -1352,7 +1705,8 @@ public class Generator
                     OutputVideoHeight - 64,
                     opacity)); // 传递 opacity 给进度条
 
-            Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
+            // 使用静音缓冲区，不在 intro 阶段播放音频
+            Exporter.PushNewFrame(_frameContent, silentAudioBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
 
             OnProgress?.Invoke(frameNumber / (float)totalFrames);
@@ -1378,44 +1732,153 @@ public class Generator
         float subfileWindowIndex = 0f;
         long currentOffset = 0;
         int playHeadRelPos = 0;
+        long frameNumber = 0;
+
+        // 计算总帧数：优先基于音频源长度，否则基于文件长度
+        long totalFrames;
+        
+        // 使用浮点数精确计算每帧采样数，避免整数除法的精度丢失
+        // 注意：使用解码器声道数，因为我们读取的是解码器的数据
+        double exactSamplesPerFrame = (double)AudioDecoderSampleRate / OutputFps * AudioDecoderChannelCount;
+        // 用于整数计算的近似值
+        int decoderSamplesPerFrame = (int)Math.Ceiling(exactSamplesPerFrame);
+        // 音频采样位置累积器（使用 double 保持精度）
+        double audioSamplePosition = 0;
+        
+        if (_audioSampleSource != null)
+        {
+            // 音频源长度（采样数）/ 每帧精确采样数 = 总帧数
+            long audioLength = _audioSampleSource.Length;
+            totalFrames = (long)(audioLength / exactSamplesPerFrame);
+            Logger.Info($"Total frames based on audio: {totalFrames} (audio length: {audioLength} samples, exact samples/frame: {exactSamplesPerFrame:F3})");
+        }
+        else
+        {
+            // 基于文件长度
+            totalFrames = InputFileStream.Length / InputBytesPerFrame;
+        }
+        
+        // 计算总字节长度（用于瀑布数据边界检查）
+        long totalByteLength = _multiFileBinarySource != null 
+            ? _multiFileBinarySource.TotalLength 
+            : InputFileStream.Length;
 
         using var targetFileReader = new BinaryReader(InputFileStream);
 
-        while (currentOffset < InputFileStream.Length)
+        // 循环基于总帧数（音频驱动）
+        while (frameNumber < totalFrames)
         {
+            // 根据当前音频时间计算正确的字节偏移（解决多文件不同比特率导致的同步问题）
+            double currentAudioTime = (double)frameNumber / OutputFps;
+            
+            // waterfallOffset: 用于瀑布读取的实际文件字节偏移
+            // currentOffset: 用于 UI 显示的虚拟字节偏移
+            long waterfallOffset = 0;
+            
+            // 多文件模式：根据音频时间找到对应子文件，计算正确的字节偏移
+            if (_subfiles.Count > 0 && _subfiles[0].AudioDuration > 0)
+            {
+                bool found = false;
+                foreach (var sf in _subfiles)
+                {
+                    // 找到当前时间所在的子文件
+                    if (currentAudioTime >= sf.AudioStartTime && 
+                        currentAudioTime < sf.AudioStartTime + sf.AudioDuration)
+                    {
+                        // 在子文件内的相对进度（0-1）
+                        double relativeProgress = (currentAudioTime - sf.AudioStartTime) / sf.AudioDuration;
+                        // 虚拟字节偏移（用于 UI 显示）
+                        currentOffset = sf.StartOffset + (long)(sf.Length * relativeProgress);
+                        // 实际字节偏移（用于瀑布读取）
+                        waterfallOffset = sf.ActualByteOffset + (long)(sf.ActualByteLength * relativeProgress);
+                        found = true;
+                        break;
+                    }
+                }
+                // 如果超出所有子文件（播放结束），使用最后位置
+                if (!found && _subfiles.Count > 0)
+                {
+                    var lastSf = _subfiles[_subfiles.Count - 1];
+                    currentOffset = lastSf.EndOffset - 1;
+                    waterfallOffset = lastSf.ActualByteOffset + lastSf.ActualByteLength - 1;
+                }
+            }
+            else
+            {
+                // 单文件模式或无音频时间信息：使用传统线性计算
+                currentOffset = frameNumber * InputBytesPerFrame;
+                waterfallOffset = currentOffset;
+            }
+            
             playHeadRelPos = 0;
-            long frameStartByteOffset = currentOffset.Align(WaterfallWidth * 4) - (WaterfallFrameLength / 2);
+            // 使用实际字节偏移计算瀑布读取位置
+            int bytesPerLine = WaterfallWidth * 4;
+            long alignedOffset = waterfallOffset.Align(bytesPerLine);
+            long frameStartByteOffset = alignedOffset - (WaterfallFrameLength / 2);
             if (frameStartByteOffset < 0)
             {
-                playHeadRelPos = (int)-(frameStartByteOffset / (WaterfallWidth * 4));
+                // 开头：播放头向下移动（正值）
+                playHeadRelPos = (int)-(frameStartByteOffset / bytesPerLine);
                 frameStartByteOffset = 0;
             }
-            else if (frameStartByteOffset + WaterfallFrameLength >= InputFileStream.Length)
+            else if (frameStartByteOffset + WaterfallFrameLength >= totalByteLength)
             {
-                playHeadRelPos = (int)((InputFileStream.Length - (frameStartByteOffset + WaterfallFrameLength)) / (WaterfallWidth * 4));
-                frameStartByteOffset = InputFileStream.Length - WaterfallFrameLength;
+                // 末尾：瀑布停止后，播放头继续向上移动（负值）
+                long maxAlignedStart = ((totalByteLength - WaterfallFrameLength) / bytesPerLine) * bytesPerLine;
+                if (maxAlignedStart < 0) maxAlignedStart = 0;
+                // 计算播放位置超出瀑布中心的行数（负值表示向上）
+                long playPositionInFrame = (alignedOffset - maxAlignedStart) / bytesPerLine;
+                playHeadRelPos = (int)(playPositionInFrame - WaterfallHeight / 2);
+                // 取反使其向上移动
+                playHeadRelPos = -playHeadRelPos;
+                frameStartByteOffset = maxAlignedStart;
             }
 
-            InputFileStream.Position = frameStartByteOffset;
-            byte[] currentVideoBuffer = targetFileReader.ReadBytes(WaterfallFrameLength);
+            // 读取瀑布数据：复用视频缓冲区避免每帧分配
+            if (_reusableVideoBuffer == null || _reusableVideoBuffer.Length < WaterfallFrameLength)
+            {
+                _reusableVideoBuffer = new byte[WaterfallFrameLength];
+            }
+            // 清零缓冲区（确保读取不足时剩余部分为黑色像素）
+            Array.Clear(_reusableVideoBuffer, 0, WaterfallFrameLength);
+            
+            int bytesRead;
+            if (_multiFileBinarySource != null)
+            {
+                // 多文件模式：从多文件二进制源读取实际文件数据
+                bytesRead = _multiFileBinarySource.ReadAt(frameStartByteOffset, _reusableVideoBuffer, 0, WaterfallFrameLength);
+            }
+            else
+            {
+                // 单文件模式：从 InputFileStream 读取
+                InputFileStream.Position = frameStartByteOffset;
+                bytesRead = targetFileReader.Read(_reusableVideoBuffer, 0, WaterfallFrameLength);
+            }
 
             // 获取音频缓冲
             if (_audioSampleSource != null)
             {
-                int samplesPerFrame = AudioOutputSamplesPerFrame;
-                if (_audioSampleBuffer == null || _audioSampleBuffer.Length < samplesPerFrame)
+                // 精确计算本帧需要读取的采样数（使用浮点累积避免精度丢失）
+                // 下一帧的采样位置
+                double nextSamplePosition = audioSamplePosition + exactSamplesPerFrame;
+                // 本帧实际需要读取的采样数（向下取整到整数）
+                int samplesThisFrame = (int)nextSamplePosition - (int)audioSamplePosition;
+                // 更新累积器
+                audioSamplePosition = nextSamplePosition;
+                
+                if (_audioSampleBuffer == null || _audioSampleBuffer.Length < samplesThisFrame)
                 {
-                    _audioSampleBuffer = new float[samplesPerFrame];
+                    _audioSampleBuffer = new float[decoderSamplesPerFrame + 16]; // 留一点余量
                 }
 
-                int readSamples = _audioSampleSource.Read(_audioSampleBuffer, 0, samplesPerFrame);
-                if (readSamples < samplesPerFrame)
+                int readSamples = _audioSampleSource.Read(_audioSampleBuffer, 0, samplesThisFrame);
+                if (readSamples < samplesThisFrame)
                 {
-                    Array.Clear(_audioSampleBuffer, readSamples, samplesPerFrame - readSamples);
+                    Array.Clear(_audioSampleBuffer, readSamples, samplesThisFrame - readSamples);
                 }
 
                 // 将float PCM 写入输出缓冲供可视化使用
-                _outputAudioBuffer.LoadFromInterleavedFloats(_audioSampleBuffer, AudioOutputChannelCount);
+                _outputAudioBuffer.LoadFromInterleavedFloats(_audioSampleBuffer, AudioDecoderChannelCount);
             }
             else
             {
@@ -1432,42 +1895,124 @@ public class Generator
 
                 InputFileStream.Position = audioFrameStartByteOffset;
                 byte[] currentAudioBuffer = targetFileReader.ReadBytes(InputBytesPerFrame);
-
                 _inputAudioBuffer.LoadFromByteArray(currentAudioBuffer, AudioInputSampleFormat);
                 _outputAudioBuffer = new AudioBuffer(_inputAudioBuffer)
                     .Resample(AudioOutputSamplesPerFramePerChannel)
                     .RemixChannels(AudioOutputChannelCount);
             }
 
-            // 3. 将视频字节缓冲转换为 Image，并翻转+缩放成用于绘制的瀑布视图
-            _viewportFramebuf?.Dispose();
-            _viewportFramebuf = Image.LoadPixelData<Rgba32>(currentVideoBuffer, WaterfallWidth, WaterfallHeight);
-            _viewportFramebuf.ProcessPixelRows(pa =>
+            // 将视频字节缓冲转换为 Image，并翻转+缩放成用于绘制的瀑布视图
+            // 复用临时 Image 对象 + Parallel.For 并行处理像素
+            if (_reusableWaterfallImage == null || 
+                _reusableWaterfallImage.Width != WaterfallWidth || 
+                _reusableWaterfallImage.Height != WaterfallHeight)
             {
-                for (int y = 0; y < pa.Height; y++)
+                _reusableWaterfallImage?.Dispose();
+                _reusableWaterfallImage = new Image<Rgba32>(WaterfallWidth, WaterfallHeight);
+            }
+            
+            // 高效像素处理（使用 unsafe 指针 + 并行处理）
+            int srcBytesPerRow = WaterfallWidth * 4;
+            int imageHeight = WaterfallHeight;
+            var videoBuffer = _reusableVideoBuffer;
+            
+            // 使用 unsafe 指针直接操作内存
+            unsafe
+            {
+                // 锁定图像内存并并行处理
+                if (_reusableWaterfallImage.DangerousTryGetSinglePixelMemory(out var pixelMemory))
                 {
-                    var row = pa.GetRowSpan(y);
-                    for (int x = 0; x < row.Length; x++)
+                    using var handle = pixelMemory.Pin();
+                    var pixelPtr = (Rgba32*)handle.Pointer;
+                    int width = WaterfallWidth;
+                    int height = WaterfallHeight;
+                    
+                    // 并行处理每一行（利用多核 CPU）
+                    Parallel.For(0, height, y =>
                     {
-                        row[x].A = 255;
-                    }
+                        // 垂直翻转：从缓冲区底部开始读取
+                        int srcY = height - 1 - y;
+                        int srcOffset = srcY * srcBytesPerRow;
+                        int destOffset = y * width;
+                        
+                        for (int x = 0; x < width; x++)
+                        {
+                            int pixelOffset = srcOffset + x * 4;
+                            pixelPtr[destOffset + x] = new Rgba32(
+                                videoBuffer[pixelOffset],
+                                videoBuffer[pixelOffset + 1],
+                                videoBuffer[pixelOffset + 2],
+                                255);
+                        }
+                    });
                 }
-            });
-            _viewportFramebuf.Mutate(vctx => vctx
-                .Flip(FlipMode.Vertical)
-                .Resize(WaterfallScaledWidth, WaterfallScaledHeight, new NearestNeighborResampler()));
-
-            // 4. 计算当前帧覆盖到哪些子文件，并更新右侧列表窗位置
-            var subfilesInFrame = _subfiles
-                .Select((sf, i) => new { key = i, value = sf })
-                .Where(kvp => kvp.value.Intersects(currentOffset - (InputBytesPerFrame / 2),
-                    currentOffset + (InputBytesPerFrame / 2)))
-                .ToList();
-            var currentSubfile = subfilesInFrame.LastOrDefault();
-
-            if (currentSubfile != null)
+            }
+            
+            // 复用缩放后的图像
+            if (_reusableScaledWaterfall == null ||
+                _reusableScaledWaterfall.Width != WaterfallScaledWidth ||
+                _reusableScaledWaterfall.Height != WaterfallScaledHeight)
             {
-                subfileWindowIndex = 0.2f * subfileWindowIndex + 0.8f * currentSubfile.key;
+                _reusableScaledWaterfall?.Dispose();
+                _reusableScaledWaterfall = new Image<Rgba32>(WaterfallScaledWidth, WaterfallScaledHeight);
+            }
+            
+            // 使用 unsafe 指针并行缩放像素
+            float scaleX = (float)WaterfallWidth / WaterfallScaledWidth;
+            float scaleY = (float)WaterfallHeight / WaterfallScaledHeight;
+            unsafe
+            {
+                if (_reusableWaterfallImage.DangerousTryGetSinglePixelMemory(out var srcMemory) &&
+                    _reusableScaledWaterfall.DangerousTryGetSinglePixelMemory(out var destMemory))
+                {
+                    using var srcHandle = srcMemory.Pin();
+                    using var destHandle = destMemory.Pin();
+                    var srcPtr = (Rgba32*)srcHandle.Pointer;
+                    var destPtr = (Rgba32*)destHandle.Pointer;
+                    int srcWidth = WaterfallWidth;
+                    int srcHeight = WaterfallHeight;
+                    int destWidth = WaterfallScaledWidth;
+                    int destHeight = WaterfallScaledHeight;
+                    
+                    // 并行缩放每一行
+                    Parallel.For(0, destHeight, y =>
+                    {
+                        int srcY = (int)(y * scaleY);
+                        if (srcY >= srcHeight) srcY = srcHeight - 1;
+                        int destOffset = y * destWidth;
+                        int srcRowOffset = srcY * srcWidth;
+                        
+                        for (int x = 0; x < destWidth; x++)
+                        {
+                            int srcX = (int)(x * scaleX);
+                            if (srcX >= srcWidth) srcX = srcWidth - 1;
+                            destPtr[destOffset + x] = srcPtr[srcRowOffset + srcX];
+                        }
+                    });
+                }
+            }
+            
+            // 指向复用的缩放图像
+            _viewportFramebuf = _reusableScaledWaterfall;
+
+            // 计算当前帧覆盖到哪些子文件，并更新右侧列表窗位置
+            int currentSubfileKey = -1;
+            SubFile currentSubfileValue = null;
+            long halfFrame = InputBytesPerFrame / 2;
+            for (int i = _subfiles.Count - 1; i >= 0; i--)
+            {
+                var sf = _subfiles[i];
+                if (sf.Intersects(currentOffset - halfFrame, currentOffset + halfFrame))
+                {
+                    currentSubfileKey = i;
+                    currentSubfileValue = sf;
+                    break;
+                }
+            }
+
+            if (currentSubfileKey >= 0)
+            {
+                subfileWindowIndex = 0.2f * subfileWindowIndex + 0.8f * currentSubfileKey;
             }
 
             // 5. 实际绘制一帧：左侧瀑布 + 右侧上部列表 + 右下音频可视化 + 顶/底渐变 + 文字信息
@@ -1506,9 +2051,12 @@ public class Generator
                 int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)Math.Ceiling(subfileWindowIndex + 7));
                 float subfileRowH = 36f * s; // 行高
 
-                float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
+                // 将列表居中位置下调2个条目
+                float subfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
 
                 // 绘制右上“歌曲/子文件列表”
+                // 限制上方条目显示（位于 rightPanelTop - 24f）
+                float minSubfileY = rightPanelTop;
                 for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
                 {
                     if (sfi < 0 || sfi >= _subfiles.Count)
@@ -1516,11 +2064,18 @@ public class Generator
                         subfileY += subfileRowH;
                         continue;
                     }
+                    
+                    // 跳过会遮挡专辑标题的条目（Y 坐标太小）
+                    if (subfileY < minSubfileY)
+                    {
+                        subfileY += subfileRowH;
+                        continue;
+                    }
 
                     var subfile = _subfiles[sfi];
-                    bool isMainSubfile = sfi == (currentSubfile?.key ?? -1);
+                    bool isMainSubfile = sfi == currentSubfileKey;
 
-                    // 使用更小的字体（_font24 代替 _font32）
+                    // 字体（_font24 to _font32）
                     ctx.DrawText(_drawOpts, new RichTextOptions(_font24)
                     {
                         Origin = new Vector2(subfileX1, subfileY),
@@ -1541,15 +2096,33 @@ public class Generator
 
                     if (isMainSubfile)
                     {
-                        float percentOfSubfile = (currentOffset - subfile.StartOffset) / (float)subfile.Length;
-                        float progressY = subfileY + 22 * s; // 进度条间距调整（噢噢噢噢）
+                        // 使用子文件的音频时间信息计算进度
+                        double currentAudioTimeLocal = (double)frameNumber / OutputFps;
+                        float percentOfSubfile;
+                        
+                        if (subfile.AudioDuration > 0)
+                        {
+                            // 使用预计算的音频时间信息
+                            double timeInTrack = Math.Max(0, currentAudioTimeLocal - subfile.AudioStartTime);
+                            percentOfSubfile = (float)Math.Clamp(timeInTrack / subfile.AudioDuration, 0, 1);
+                        }
+                        else
+                        {
+                            // 降级：基于字节比例计算
+                            double totalAudioTimeLocal = (double)totalFrames / OutputFps;
+                            double subfileStartTime = (subfile.StartOffset / (double)totalByteLength) * totalAudioTimeLocal;
+                            double subfileDuration = (subfile.Length / (double)totalByteLength) * totalAudioTimeLocal;
+                            double timeInTrack = Math.Max(0, currentAudioTimeLocal - subfileStartTime);
+                            percentOfSubfile = (float)Math.Clamp(timeInTrack / subfileDuration, 0, 1);
+                        }
+                        float progressY = subfileY + 22 * s;
 
                         ctx.DrawText(_drawOpts, new RichTextOptions(_font16)
                         {
                             Origin = new PointF(subfileX1 + 40 * s, progressY),
                             HorizontalAlignment = HorizontalAlignment.Center,
                             VerticalAlignment = VerticalAlignment.Center,
-                        }, $"{(int)Math.Clamp(percentOfSubfile * 100, 0, 100)} %", new SolidBrush(Color.White), null)
+                        }, $"{(int)(percentOfSubfile * 100)} %", new SolidBrush(Color.White), null)
                         .DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
                     }
 
@@ -1573,10 +2146,10 @@ public class Generator
                     DrawAudioVisualizer(ctx, audioVisRegion, _outputAudioBuffer);
                 }
 
-                // 5.5 顶部/底部渐变遮罩 + 专辑/目录抬头文字
+                // 5.5 顶部/底部渐变遮罩 + 专辑/目录文字
                 string albumHeaderText;
                 {
-                    var sfValue = currentSubfile?.value;
+                    var sfValue = currentSubfileValue;
                     if (sfValue != null && !string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
                     {
                         albumHeaderText = sfValue.AlbumTitle;
@@ -1591,58 +2164,33 @@ public class Generator
                     }
                 }
 
-                ctx.Fill(
-                    new LinearGradientBrush(
-                        new PointF(0, shadowY1),
-                        new PointF(0, shadowY1 + subfileH * 2f),
-                        GradientRepetitionMode.None,
-                        new(0.5f, Color.FromRgba(16, 16, 16, 255)),
-                        new(1, Color.FromRgba(16, 16, 16, 0))
-                    ),
-                    new RectangleF(0, shadowY1, OutputVideoWidth, subfileH * 2f)
-                )
-                .Fill(
-                    new LinearGradientBrush(
-                        new PointF(0, shadowY2),
-                        new PointF(0, shadowY2 + subfileH * 2f),
-                        GradientRepetitionMode.None,
-                        new(0, Color.FromRgba(16, 16, 16, 0)),
-                        new(0.5f, Color.FromRgba(16, 16, 16, 255))
-                    ),
-                    new RectangleF(0, shadowY2, OutputVideoWidth, subfileH * 2f)
-                )
-                .DrawTextAndCache(new RichTextOptions(_font24)
+                // 使用预渲染的渐变遮罩（避免每帧创建渐变画刷）
+                float gradientHeight = subfileH * 2f;
+                EnsureGradientMasksCached(shadowY1, shadowY2, gradientHeight);
+                if (_cachedTopGradientMask != null)
+                    ctx.DrawImage(_cachedTopGradientMask, new Point(0, (int)shadowY1), 1f);
+                if (_cachedBottomGradientMask != null)
+                    ctx.DrawImage(_cachedBottomGradientMask, new Point(0, (int)shadowY2), 1f);
+
+                ctx.DrawTextAndCache(new RichTextOptions(_font24)
                 {
-                    // 将专辑/目录文字放在右侧面板顶部附近，避免被顶部淡出渐变盖住
                     Origin = new Vector2(subfileX1 + 40, rightPanelTop - 24f),
                     VerticalAlignment = VerticalAlignment.Center,
                 }, Utils.TruncateString(albumHeaderText ?? string.Empty, 72), Color.DimGray);
 
-                // 5.6 状态信息 / 标题 / 作者等
-                ctx.DrawTextAndCache(new RichTextOptions(_font24)
+                // 5.6 使用预渲染的静态 UI 图层（大幅减少 DrawText 调用）
+                if (_staticUILayer != null)
                 {
-                    Origin = new Vector2(32, 32),
-                }, "A/V SETTINGS", Color.DimGray)
-                .DrawText(new RichTextOptions(_font32)
-                {
-                    Origin = new Vector2(32, 32 + 24),
-                }, avSettingsString, Color.White)
-                .DrawTextAndCache(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(OutputVideoWidth - 32, 32),
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                }, "ABS. OFFSET", Color.DimGray)
-                .DrawText(new RichTextOptions(_font32)
+                    ctx.DrawImage(_staticUILayer, Point.Empty, 1f);
+                }
+                
+                // 只绘制动态变化的内容（偏移值）
+                ctx.DrawText(new RichTextOptions(_font32)
                 {
                     Origin = new Vector2(OutputVideoWidth - 32, 32 + 24),
                     HorizontalAlignment = HorizontalAlignment.Right,
                     TextAlignment = TextAlignment.End,
                 }, $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", Color.White)
-                .DrawTextAndCache(new RichTextOptions(_font24)
-                {
-                    Origin = new Vector2(OutputVideoWidth - 256, 32),
-                    HorizontalAlignment = HorizontalAlignment.Right,
-                }, "BITRATE", Color.DimGray)
                 .DrawText(new RichTextOptions(_font32)
                 {
                     Origin = new Vector2(OutputVideoWidth - 256, 32 + 24),
@@ -1659,16 +2207,19 @@ public class Generator
                     }, Author, Color.White);
                 }
 
-                // 底部音乐播放器 UI
-                DrawBottomPlayerUI(ctx, s, currentOffset, currentSubfile?.key ?? -1, currentSubfile?.value);
+                // 底部音乐播放器 UI（传入帧号和总帧数用于音频同步进度计算）
+                DrawBottomPlayerUI(ctx, s, currentOffset, currentSubfileKey, currentSubfileValue, frameNumber, totalFrames, totalByteLength);
             });
 
             Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
 
-            currentOffset += InputBytesPerFrame;
+            frameNumber++;
+            
+            // 当视频数据播放完毕时，保持在最后位置
+            // currentOffset 可以超过 InputFileStream.Length，但读取时会被限制
 
-            OnProgress?.Invoke(currentOffset / (float)InputFileStream.Length);
+            OnProgress?.Invoke(frameNumber / (float)totalFrames);
 
             if (_exitRequested)
             {
@@ -1686,8 +2237,16 @@ public class Generator
     }
 
     // 绘制底部音乐播放器 UI
-    private void DrawBottomPlayerUI(IImageProcessingContext ctx, float s, long currentOffset, int subfileIdx, SubFile subfile)
+    // totalFrames 和 totalByteLength 用于计算基于音频时间的进度（与实际播放同步）
+    private void DrawBottomPlayerUI(IImageProcessingContext ctx, float s, long currentOffset, int subfileIdx, SubFile subfile, long frameNumber, long totalFrames, long totalByteLength)
     {
+        // 更新当前视频时间（基于帧号和帧率）
+        _currentVideoTime = (double)frameNumber / OutputFps;
+        
+        // 计算总音频时长和当前音频时间（基于帧号，与实际播放同步）
+        double totalAudioTime = (double)totalFrames / OutputFps;
+        double currentAudioTime = (double)frameNumber / OutputFps;
+        
         float bottomPanelHeight = 100f * s;
         float bottomY = OutputVideoHeight - bottomPanelHeight - 16f * s;
         float coverSize = 72f * s;
@@ -1696,6 +2255,7 @@ public class Generator
         float infoX = coverX + coverSize + 16f * s;
         float timeX = OutputVideoWidth - 32f * s;
         
+        // 获取当前歌曲信息
         string trackName = "";
         string artistName = "";
         string genreText = "";
@@ -1703,6 +2263,7 @@ public class Generator
         TimeSpan totalTime = TimeSpan.Zero;
         float trackProgress = 0f;
         Image coverImage = null;
+        float[] waveformPeaks = null;
         
         if (subfile != null)
         {
@@ -1710,96 +2271,183 @@ public class Generator
             artistName = subfile.ArtistName ?? subfile.AlbumArtistName ?? "";
             genreText = subfile.Genre ?? "";
             coverImage = subfile.Icon;
+            waveformPeaks = subfile.WaveformPeaks;
             
-            if (InputBytesPerSecond > 0)
+            // 使用子文件的音频时间信息计算进度（优先）或降级到字节比例计算
+            if (subfile.AudioDuration > 0)
             {
-                totalTime = TimeSpan.FromSeconds(subfile.Length / (double)InputBytesPerSecond);
-                long offsetInTrack = currentOffset - subfile.StartOffset;
-                currentTime = TimeSpan.FromSeconds(Math.Max(0, offsetInTrack) / (double)InputBytesPerSecond);
-                trackProgress = Math.Clamp((float)offsetInTrack / subfile.Length, 0f, 1f);
+                // 使用预计算的音频时间信息（精确同步）
+                double timeInTrack = Math.Max(0, currentAudioTime - subfile.AudioStartTime);
+                
+                totalTime = TimeSpan.FromSeconds(subfile.AudioDuration);
+                currentTime = TimeSpan.FromSeconds(Math.Min(timeInTrack, subfile.AudioDuration));
+                trackProgress = (float)Math.Clamp(timeInTrack / subfile.AudioDuration, 0, 1);
+            }
+            else if (totalByteLength > 0 && totalAudioTime > 0)
+            {
+                // 降级：基于字节比例计算（单文件模式）
+                double subfileStartTime = (subfile.StartOffset / (double)totalByteLength) * totalAudioTime;
+                double subfileDuration = (subfile.Length / (double)totalByteLength) * totalAudioTime;
+                double timeInTrack = Math.Max(0, currentAudioTime - subfileStartTime);
+                
+                totalTime = TimeSpan.FromSeconds(subfileDuration);
+                currentTime = TimeSpan.FromSeconds(Math.Min(timeInTrack, subfileDuration));
+                trackProgress = (float)Math.Clamp(timeInTrack / subfileDuration, 0, 1);
             }
         }
         
-        int currSubIdx = subfileIdx;
-        float transitionT = 1f;
+        // 构建显示文本
+        string displayInfo = trackName;
+        bool hasArtist = !string.IsNullOrWhiteSpace(artistName);
+        bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
+        if (hasArtist) displayInfo += $" // {artistName}";
+        if (hasGenre) displayInfo += $" [{genreText}]";
+        displayInfo = Utils.TruncateString(displayInfo, 55);
+        
+        string timeString = $"{(int)currentTime.TotalMinutes}:{currentTime.Seconds:D2} / {(int)totalTime.TotalMinutes}:{totalTime.Seconds:D2}";
+        
+        // 检测歌曲切换，触发动画（基于时间）
         bool isInTransition = false;
-        long transitionBytes = InputBytesPerSecond;
+        float animT = 1f;
         
-        if (currSubIdx != _lastSubfileIndex && currSubIdx >= 0 && subfile != null)
-        {
-            _transitionStartOffset = subfile.StartOffset - transitionBytes;
-            _transitionEndOffset = subfile.StartOffset + transitionBytes;
-            _lastSubfileIndex = currSubIdx;
-        }
-        
-        if (_transitionStartOffset >= 0 && currentOffset >= _transitionStartOffset && currentOffset <= _transitionEndOffset)
-        {
-            isInTransition = true;
-            float rawT = (currentOffset - _transitionStartOffset) / (float)(_transitionEndOffset - _transitionStartOffset);
-            transitionT = EaseOutCubic(Math.Clamp(rawT, 0f, 1f));
-        }
-        
-        byte contentAlpha = (byte)(255 * transitionT);
-        Color labelColor = Color.FromRgba(105, 105, 105, contentAlpha);
-        Color textColor = Color.FromRgba(255, 255, 255, contentAlpha);
-        
-        var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
-        ctx.Fill(Color.FromRgba(32, 32, 32, 255), coverRect);
-        ctx.Draw(Color.FromRgba(200, 200, 200, 255), 2f, coverRect);
-        
+        // 计算当前封面哈希
+        int targetSize = (int)coverSize - 4;
+        byte[] currentCoverHash = null;
         if (coverImage != null)
         {
-            using var scaledCover = coverImage.Clone(imgCtx => imgCtx.Resize((int)coverSize - 4, (int)coverSize - 4));
-            ctx.DrawImage(scaledCover, new Point((int)(coverX + 2), (int)(coverY + 2)), transitionT);
+            if (_cachedScaledCover == null || _cachedCoverSubfileIndex != subfileIdx || _cachedCoverSize != targetSize)
+            {
+                _cachedScaledCover?.Dispose();
+                _cachedScaledCover = ((Image<Rgba32>)coverImage).Clone(imgCtx => imgCtx.Resize(targetSize, targetSize));
+                _cachedCoverSubfileIndex = subfileIdx;
+                _cachedCoverSize = targetSize;
+            }
+            currentCoverHash = ComputeImageHash(_cachedScaledCover);
+        }
+        
+        // 检测歌曲切换（注意：这里 displayInfo/timeString 已经是新歌曲的信息）
+        if (subfileIdx != _lastSubfileIndex && subfileIdx >= 0)
+        {
+            // _prevDisplayInfo 和 _prevTimeString 保持上一帧的旧值（已在上一帧设置）
+            // 这里不更新它们，让它们在动画结束后更新
+            
+            // 判断封面是否相同
+            bool coverSame = HashEquals(_prevCoverHash, currentCoverHash);
+            if (!coverSame && _cachedScaledCover != null)
+            {
+                _prevScaledCover?.Dispose();
+                _prevScaledCover = _cachedScaledCover.Clone();
+            }
+            _prevCoverHash = currentCoverHash;
+            
+            // 保存前一首波形
+            if (_prevWaveformPeaks == null || waveformPeaks == null || _prevWaveformPeaks.Length != waveformPeaks?.Length)
+            {
+                _prevWaveformPeaks = waveformPeaks?.ToArray();
+            }
+            
+            // 开始动画（基于时间）
+            _animationStartTime = _currentVideoTime;
+            _lastSubfileIndex = subfileIdx;
+        }
+        
+        // 计算动画进度（基于时间，帧率无关）
+        if (_animationStartTime >= 0 && _currentVideoTime < _animationStartTime + AnimationDurationSeconds)
+        {
+            isInTransition = true;
+            float rawT = (float)((_currentVideoTime - _animationStartTime) / AnimationDurationSeconds);
+            animT = EaseOutCubic(Math.Clamp(rawT, 0f, 1f));
         }
         else
         {
-            ctx.DrawText(new RichTextOptions(_font48)
-            {
-                Origin = new Vector2(coverX + coverSize / 2, coverY + coverSize / 2),
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center,
-            }, "♪", Color.FromRgba(100, 100, 100, contentAlpha));
+            // 动画结束后，更新 prev 值为当前值
+            _prevDisplayInfo = displayInfo;
+            _prevTimeString = timeString;
         }
         
         float labelY = bottomY + 4f * s;
         float valueY = labelY + 18f * s;
         float waveformY = valueY + 32f * s;
-        
-        float trackNameWidth = MeasureTextWidth(trackName, _font32);
-        float separatorWidth = MeasureTextWidth(" // ", _font32);
-        float artistNameWidth = MeasureTextWidth(artistName, _font32);
-        float bracketWidth = MeasureTextWidth(" [", _font32);
-        
-        bool hasArtist = !string.IsNullOrWhiteSpace(artistName);
-        bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
-        
-        float titleLabelX = infoX;
-        // Composer: 标签对齐到 artistName 首字符（即 " // " 之后）
-        float composerLabelX = infoX + trackNameWidth + separatorWidth;
-        // Genre: 标签对齐到 "[" 符号（即 " [" 位置）
-        float genreValueStartX = infoX + trackNameWidth + (hasArtist ? separatorWidth + artistNameWidth : 0) + bracketWidth;
-        float labelOffsetX = isInTransition ? (1f - transitionT) * 50f * s : 0f;
-        
-        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(titleLabelX + labelOffsetX, labelY) }, "Title:", labelColor);
-        if (hasArtist) ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(composerLabelX + labelOffsetX, labelY) }, "Composer:", labelColor);
-        if (hasGenre) ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(genreValueStartX + labelOffsetX, labelY) }, "Genre:", labelColor);
-        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(timeX, labelY), HorizontalAlignment = HorizontalAlignment.Right }, "Time:", labelColor);
-        
-        string displayInfo = trackName;
-        if (hasArtist) displayInfo += $" // {artistName}";
-        if (hasGenre) displayInfo += $" [{genreText}]";
-        
-        ctx.DrawText(new RichTextOptions(_font32) { Origin = new Vector2(infoX, valueY), WrappingLength = timeX - infoX - 120f * s }, Utils.TruncateString(displayInfo, 55), textColor);
-        
-        string timeString = $"{(int)currentTime.TotalMinutes}:{currentTime.Seconds:D2} / {(int)totalTime.TotalMinutes}:{totalTime.Seconds:D2}";
-        ctx.DrawText(new RichTextOptions(_font32) { Origin = new Vector2(timeX, valueY), HorizontalAlignment = HorizontalAlignment.Right }, timeString, textColor);
-        
         float waveformX1 = infoX;
         float waveformX2 = timeX;
         float waveformHeight = 20f * s;
+        
+        // 封面动画：/*封面相同不切换?*/
+        var coverRect = new RectangleF(coverX, coverY, coverSize, coverSize);
+        ctx.Fill(Color.FromRgba(32, 32, 32, 255), coverRect);
+        ctx.Draw(Color.FromRgba(200, 200, 200, 255), 2f, coverRect);
+        
+        bool coverSameAsPrev = HashEquals(_prevCoverHash, currentCoverHash);
+        float coverSlideOffset = (isInTransition && !coverSameAsPrev) ? (1f - animT) * coverSize * 0.4f : 0f;
+        
+        // 绘制前一首封面（向左滑出，仅当封面不同）
+        if (isInTransition && _prevScaledCover != null && !coverSameAsPrev)
+        {
+            float prevAlpha = 1f - animT;
+            float prevOffsetX = -coverSlideOffset;
+            ctx.DrawImage(_prevScaledCover, new Point((int)(coverX + 2 + prevOffsetX), (int)(coverY + 2)), prevAlpha);
+        }
+        
+        // 绘制当前封面
+        if (_cachedScaledCover != null)
+        {
+            float currAlpha = (isInTransition && !coverSameAsPrev) ? animT : 1f;
+            float currOffsetX = (isInTransition && !coverSameAsPrev) ? coverSlideOffset : 0f;
+            ctx.DrawImage(_cachedScaledCover, new Point((int)(coverX + 2 + currOffsetX), (int)(coverY + 2)), currAlpha);
+        }
+        else
+        {
+            byte noteAlpha = (byte)(255 * (isInTransition ? animT : 1f));
+            ctx.DrawText(new RichTextOptions(_font48)
+            {
+                Origin = new Vector2(coverX + coverSize / 2, coverY + coverSize / 2),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+            }, "♪", Color.FromRgba(100, 100, 100, noteAlpha));
+        }
+        
+        //文字动画
+        Color labelColor = Color.FromRgba(105, 105, 105, 255);
+        
+        // 绘制静态标签
+        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(infoX, labelY) }, "Title:", labelColor);
+        ctx.DrawText(new RichTextOptions(_font16) { Origin = new Vector2(timeX, labelY), HorizontalAlignment = HorizontalAlignment.Right }, "Time:", labelColor);
+        
+        // 曲目信息字符级动画
+        DrawTextWithCharacterAnimation(ctx, _font32, displayInfo, _prevDisplayInfo, infoX, valueY, timeX - infoX - 120f * s, animT, isInTransition);
+        
+        // 时间显示：淡入淡出
+        if (isInTransition && !string.IsNullOrEmpty(_prevTimeString))
+        {
+            // 淡出旧时间
+            byte fadeOutAlpha = (byte)(255 * (1f - animT));
+            ctx.DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(timeX, valueY),
+                HorizontalAlignment = HorizontalAlignment.Right
+            }, _prevTimeString, Color.FromRgba(255, 255, 255, fadeOutAlpha));
+            
+            // 淡入新时间
+            byte fadeInAlpha = (byte)(255 * animT);
+            ctx.DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(timeX, valueY),
+                HorizontalAlignment = HorizontalAlignment.Right
+            }, timeString, Color.FromRgba(255, 255, 255, fadeInAlpha));
+        }
+        else
+        {
+            // 非过渡状态，直接绘制
+            ctx.DrawText(new RichTextOptions(_font32)
+            {
+                Origin = new Vector2(timeX, valueY),
+                HorizontalAlignment = HorizontalAlignment.Right
+            }, timeString, Color.White);
+        }
+        
+        // 波形动画：前一首从中间向上滑出+淡出，新波形从下向上滑入+淡入 
         var waveformRect = new RectangleF(waveformX1, waveformY, waveformX2 - waveformX1, waveformHeight);
-        ctx.Fill(Color.FromRgba(40, 40, 40, contentAlpha), waveformRect);
+        ctx.Fill(Color.FromRgba(40, 40, 40, 255), waveformRect);
         
         float barWidth = 2f;
         float barSpacing = 1f;
@@ -1807,41 +2455,204 @@ public class Generator
         float progressX = waveformRect.X + waveformRect.Width * trackProgress;
         float gapWidth = 4f * s;
         
-        // 获取预计算的波形峰值数据
-        float[] waveformPeaks = subfile?.WaveformPeaks;
-        bool hasRealWaveform = waveformPeaks != null && waveformPeaks.Length > 0;
+        // 波形滑动偏移（快到慢，animT 从 0 到 1）
+        // waveSlideOffset 在动画开始时最大，结束时为 0
+        float waveSlideOffset = isInTransition ? (1f - animT) * waveformHeight * 1.2f : 0f;
+        byte currWaveAlpha = (byte)(255 * (isInTransition ? animT : 1f));
+        byte prevWaveAlpha = (byte)(255 * (1f - animT));
         
+        // 同时绘制前一首波形和当前波形
         for (int i = 0; i < totalBars; i++)
         {
             float barX = waveformRect.X + i * (barWidth + barSpacing);
+            if (barX > progressX - gapWidth && barX < progressX + gapWidth) continue;
             
+            // 绘制前一首波形（从中间向上滑出 + 淡出）
+            if (isInTransition && _prevWaveformPeaks != null && _prevWaveformPeaks.Length > 0)
+            {
+                int prevPeakIndex = (int)((float)i / totalBars * _prevWaveformPeaks.Length);
+                prevPeakIndex = Math.Clamp(prevPeakIndex, 0, _prevWaveformPeaks.Length - 1);
+                float prevHeightRatio = 0.15f + _prevWaveformPeaks[prevPeakIndex] * 0.85f;
+                float prevBarHeight = waveformHeight * prevHeightRatio * 0.85f;
+                // 向上滑出：从中间位置向上移动（减去偏移）
+                float prevBarY = waveformRect.Y + (waveformHeight - prevBarHeight) / 2f - waveSlideOffset;
+                
+                // 只在条形完全在区域内时绘制
+                if (prevBarY >= waveformRect.Y && prevBarY + prevBarHeight <= waveformRect.Y + waveformHeight)
+                {
+                    Color prevBarColor = Color.FromRgba(180, 180, 180, prevWaveAlpha);
+                    ctx.Fill(prevBarColor, new RectangleF(barX, prevBarY, barWidth, prevBarHeight));
+                }
+            }
+            
+            // 绘制当前波形（从下向上滑入 + 淡入）
             float heightRatio;
+            bool hasRealWaveform = waveformPeaks != null && waveformPeaks.Length > 0;
             if (hasRealWaveform)
             {
-                // 使用真实波形数据，映射到当前柱状图位置
                 int peakIndex = (int)((float)i / totalBars * waveformPeaks.Length);
                 peakIndex = Math.Clamp(peakIndex, 0, waveformPeaks.Length - 1);
-                // 波形峰值已归一化到 0-1 范围，添加最小高度保证可见性
                 heightRatio = 0.15f + waveformPeaks[peakIndex] * 0.85f;
             }
             else
             {
-                // 无真实波形数据时使用伪随机波形
-                heightRatio = 0.3f + 0.6f * (float)Math.Abs(Math.Sin(i * 0.4 + currSubIdx * 0.1));
+                heightRatio = 0.3f + 0.6f * (float)Math.Abs(Math.Sin(i * 0.4 + subfileIdx * 0.1));
             }
             
             float barHeight = waveformHeight * heightRatio * 0.85f;
-            float barY = waveformRect.Y + (waveformHeight - barHeight) / 2f;
-            if (barX > progressX - gapWidth && barX < progressX + gapWidth) continue;
-            Color barColor = barX < progressX ? Color.FromRgba(100, 100, 100, contentAlpha) : Color.FromRgba(220, 220, 220, contentAlpha);
-            ctx.Fill(barColor, new RectangleF(barX, barY, barWidth, barHeight));
+            // 从下滑入：从底部位置向上移动到中间（加上偏移，随着动画进行偏移减小）
+            float barY = waveformRect.Y + (waveformHeight - barHeight) / 2f + waveSlideOffset;
+            
+            // 只在条形完全在区域内时绘制
+            if (barY >= waveformRect.Y && barY + barHeight <= waveformRect.Y + waveformHeight)
+            {
+                Color barColor = barX < progressX 
+                    ? Color.FromRgba(100, 100, 100, currWaveAlpha) 
+                    : Color.FromRgba(220, 220, 220, currWaveAlpha);
+                ctx.Fill(barColor, new RectangleF(barX, barY, barWidth, barHeight));
+            }
         }
         
+        // 播放头
         float headlineWidth = 2f;
         float borderWidth = 1f;
-        ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(progressX - headlineWidth / 2 - borderWidth, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
-        ctx.Fill(Color.FromRgba(255, 255, 255, contentAlpha), new RectangleF(progressX - headlineWidth / 2, waveformRect.Y - 2f, headlineWidth, waveformHeight + 4f));
-        ctx.Fill(Color.FromRgba(30, 30, 30, contentAlpha), new RectangleF(progressX + headlineWidth / 2, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
+        ctx.Fill(Color.FromRgba(30, 30, 30, 255), new RectangleF(progressX - headlineWidth / 2 - borderWidth, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
+        ctx.Fill(Color.FromRgba(255, 255, 255, 255), new RectangleF(progressX - headlineWidth / 2, waveformRect.Y - 2f, headlineWidth, waveformHeight + 4f));
+        ctx.Fill(Color.FromRgba(30, 30, 30, 255), new RectangleF(progressX + headlineWidth / 2, waveformRect.Y - 2f, borderWidth, waveformHeight + 4f));
+    }
+
+    // 绘制带字符级动画的文字（相同字符滑动，不同字符淡出/淡入）
+    // 使用 TextMeasurer.TryMeasureCharacterBounds 获取每个字符的精确位置（保持正确的 kerning）
+    private void DrawTextWithCharacterAnimation(IImageProcessingContext ctx, Font font, string newText, string oldText, 
+        float x, float y, float maxWidth, float animT, bool isInTransition, bool rightAlign = false)
+    {
+        if (string.IsNullOrEmpty(newText) && string.IsNullOrEmpty(oldText)) return;
+        
+        // 非过渡状态，直接绘制
+        if (!isInTransition || string.IsNullOrEmpty(oldText))
+        {
+            var opts = new RichTextOptions(font)
+            {
+                Origin = new Vector2(x, y),
+                HorizontalAlignment = rightAlign ? HorizontalAlignment.Right : HorizontalAlignment.Left
+            };
+            if (maxWidth > 0) opts.WrappingLength = maxWidth;
+            ctx.DrawText(opts, newText ?? "", Color.White);
+            return;
+        }
+        
+        // 使用 TextMeasurer.TryMeasureCharacterBounds 获取每个字符的精确边界（包含 kerning）
+        var textOptions = new TextOptions(font);
+        var oldCharPositions = new List<(char c, float x, float width)>();
+        var newCharPositions = new List<(char c, float x, float width)>();
+        
+        // 获取旧文本每个字符的精确边界
+        if (TextMeasurer.TryMeasureCharacterBounds(oldText, textOptions, out var oldBounds))
+        {
+            var boundsArray = oldBounds.ToArray();
+            for (int i = 0; i < oldText.Length && i < boundsArray.Length; i++)
+            {
+                oldCharPositions.Add((oldText[i], boundsArray[i].Bounds.X, boundsArray[i].Bounds.Width));
+            }
+        }
+        else
+        {
+            // 降级：使用累积测量
+            for (int i = 0; i < oldText.Length; i++)
+            {
+                float charStartX = i > 0 ? MeasureTextWidth(oldText.Substring(0, i), font) : 0;
+                float charWidth = MeasureTextWidth(oldText[i].ToString(), font);
+                oldCharPositions.Add((oldText[i], charStartX, charWidth));
+            }
+        }
+        
+        // 获取新文本每个字符的精确边界
+        if (TextMeasurer.TryMeasureCharacterBounds(newText, textOptions, out var newBounds))
+        {
+            var boundsArray = newBounds.ToArray();
+            for (int i = 0; i < newText.Length && i < boundsArray.Length; i++)
+            {
+                newCharPositions.Add((newText[i], boundsArray[i].Bounds.X, boundsArray[i].Bounds.Width));
+            }
+        }
+        else
+        {
+            // 降级：使用累积测量
+            for (int i = 0; i < newText.Length; i++)
+            {
+                float charStartX = i > 0 ? MeasureTextWidth(newText.Substring(0, i), font) : 0;
+                float charWidth = MeasureTextWidth(newText[i].ToString(), font);
+                newCharPositions.Add((newText[i], charStartX, charWidth));
+            }
+        }
+        
+        // 计算基础 X 位置（处理右对齐）
+        float oldTextWidth = MeasureTextWidth(oldText, font);
+        float newTextWidth = MeasureTextWidth(newText, font);
+        float baseX = rightAlign ? x - newTextWidth : x;
+        float oldBaseX = rightAlign ? x - oldTextWidth : x;
+        
+        // 查找相同字符的映射（贪婪匹配，优先最左边）
+        var matchedOldIndices = new HashSet<int>();
+        var charMappings = new List<(int oldIdx, int newIdx)>();
+        
+        for (int newIdx = 0; newIdx < newText.Length; newIdx++)
+        {
+            char newChar = newText[newIdx];
+            // 在旧文本中查找第一个未匹配的相同字符
+            for (int oldIdx = 0; oldIdx < oldText.Length; oldIdx++)
+            {
+                if (!matchedOldIndices.Contains(oldIdx) && oldText[oldIdx] == newChar)
+                {
+                    matchedOldIndices.Add(oldIdx);
+                    charMappings.Add((oldIdx, newIdx));
+                    break;
+                }
+            }
+        }
+        
+        var mappedNewIndices = new HashSet<int>(charMappings.Select(m => m.newIdx));
+        
+        // 绘制匹配的字符（滑动动画）
+        foreach (var (oldIdx, newIdx) in charMappings)
+        {
+            char c = newText[newIdx];
+            float oldPosX = oldBaseX + oldCharPositions[oldIdx].x;
+            float newPosX = baseX + newCharPositions[newIdx].x;
+            
+            // 从旧位置滑动到新位置
+            float currentX = oldPosX + (newPosX - oldPosX) * EaseInOutQuad(animT);
+            
+            ctx.DrawText(new RichTextOptions(font) { Origin = new Vector2(currentX, y) }, c.ToString(), Color.White);
+        }
+        
+        // 绘制旧文本中未匹配的字符（淡出 + 向上滑出）
+        byte fadeOutAlpha = (byte)(255 * (1f - animT));
+        for (int oldIdx = 0; oldIdx < oldText.Length; oldIdx++)
+        {
+            if (!matchedOldIndices.Contains(oldIdx))
+            {
+                char c = oldText[oldIdx];
+                float charX = oldBaseX + oldCharPositions[oldIdx].x;
+                // 向上滑出（animT 从 0 到 1，slideY 从 y 到 y - 10）
+                float slideY = y - animT * 10f;
+                ctx.DrawText(new RichTextOptions(font) { Origin = new Vector2(charX, slideY) }, c.ToString(), Color.FromRgba(255, 255, 255, fadeOutAlpha));
+            }
+        }
+        
+        // 绘制新文本中未匹配的字符（淡入 + 从下滑入）
+        byte fadeInAlpha = (byte)(255 * animT);
+        for (int newIdx = 0; newIdx < newText.Length; newIdx++)
+        {
+            if (!mappedNewIndices.Contains(newIdx))
+            {
+                char c = newText[newIdx];
+                float charX = baseX + newCharPositions[newIdx].x;
+                // 从下滑入（animT 从 0 到 1，slideY 从 y + 10 到 y）
+                float slideY = y + (1f - animT) * 10f;
+                ctx.DrawText(new RichTextOptions(font) { Origin = new Vector2(charX, slideY) }, c.ToString(), Color.FromRgba(255, 255, 255, fadeInAlpha));
+            }
+        }
     }
 
     // 生成结尾淡出画面
@@ -1851,9 +2662,13 @@ public class Generator
         int fadeFrames = (int)(OutroFadeDuration * OutputFps);
         if (fadeFrames < 1) fadeFrames = 1;
 
-        for (int frameNumber = 0; frameNumber < fadeFrames; frameNumber++)
+        // 创建静音缓冲区用于结尾淡出（避免重复播放最后一帧的音频）
+        var silentBuffer = new AudioBuffer(_outputAudioBuffer.SampleCount, _outputAudioBuffer.ChannelCount);
+        silentBuffer.Clear();
+
+        for (int frameNum = 0; frameNum < fadeFrames; frameNum++)
         {
-            float opacity = 1f - (frameNumber / (float)fadeFrames);
+            float opacity = 1f - (frameNum / (float)fadeFrames);
             byte overlayAlpha = (byte)(255 * (1f - Math.Clamp(opacity, 0f, 1f)));
 
             _frameContent.Mutate(ctx =>
@@ -1862,7 +2677,8 @@ public class Generator
                     new RectangleF(0, 0, OutputVideoWidth, OutputVideoHeight));
             });
 
-            Exporter.PushNewFrame(_frameContent, _outputAudioBuffer, _timer.Elapsed.TotalSeconds);
+            // 使用静音缓冲区而不是最后一帧的音频
+            Exporter.PushNewFrame(_frameContent, silentBuffer, _timer.Elapsed.TotalSeconds);
             _timer.Restart();
 
             OnProgress?.Invoke(1f);
@@ -2051,7 +2867,7 @@ public class Generator
         }
     }
 
-    // 音频可视化绘制：简洁专业的设计
+    // 音频可视化绘制
     private void DrawAudioVisualizer(IImageProcessingContext ctx, RectangleF region, AudioBuffer audioBuffer)
     {
         if (audioBuffer == null || audioBuffer.TotalSampleCount == 0) return;
@@ -2060,18 +2876,29 @@ public class Generator
         int sampleCount = audioBuffer.SampleCount;
         if (channelCount <= 0 || sampleCount <= 0) return;
 
-        // 提取单声道音频数据
-        float[] interleaved = audioBuffer.ToArray();
-        float[] mono = new float[sampleCount];
+        // 复用数组（避免每帧分配）
+        int interleavedLen = sampleCount * channelCount;
+        if (_audioInterleavedBuffer == null || _audioInterleavedBuffer.Length < interleavedLen)
+        {
+            _audioInterleavedBuffer = new float[interleavedLen];
+        }
+        var interleaved = audioBuffer.ToArray();
+        Array.Copy(interleaved, _audioInterleavedBuffer, Math.Min(interleaved.Length, interleavedLen));
+
+        // 复用单声道数组（避免每帧分配）
+        if (_audioMonoBuffer == null || _audioMonoBuffer.Length < sampleCount)
+        {
+            _audioMonoBuffer = new float[sampleCount];
+        }
         for (int i = 0; i < sampleCount; i++)
         {
             float sum = 0f;
             for (int ch = 0; ch < channelCount; ch++)
             {
                 int idx = i * channelCount + ch;
-                if (idx < interleaved.Length) sum += interleaved[idx];
+                if (idx < interleavedLen) sum += _audioInterleavedBuffer[idx];
             }
-            mono[i] = sum / channelCount;
+            _audioMonoBuffer[i] = sum / channelCount;
         }
 
         // 布局：上 55% 波形，下 45% 频谱
@@ -2081,10 +2908,10 @@ public class Generator
         float specTop = waveTop + waveH;
 
         // 绘制波形
-        DrawWaveform(ctx, new RectangleF(region.Left, waveTop, region.Width, waveH), mono);
+        DrawWaveform(ctx, new RectangleF(region.Left, waveTop, region.Width, waveH), _audioMonoBuffer);
 
         // 绘制频谱
-        DrawSpectrum(ctx, new RectangleF(region.Left, specTop, region.Width, specH), mono);
+        DrawSpectrum(ctx, new RectangleF(region.Left, specTop, region.Width, specH), _audioMonoBuffer);
     }
 
     // 波形（折线）
@@ -2214,7 +3041,7 @@ public class Generator
             bars[i] = Math.Clamp((db + 60f) / 60f, 0f, 1f);
         }
 
-        // 时间平滑（快攻慢放）
+        // 时间平滑 (attack!!!!!release~~~~)
         if (_smoothedSpectrum == null || _smoothedSpectrum.Length != barCount)
         {
             _smoothedSpectrum = new float[barCount];
@@ -2239,6 +3066,7 @@ public class Generator
         float gap = barWidth * 0.15f;
         float actualWidth = barWidth - gap;
 
+        // 每隔几个柱形批量绘制
         for (int i = 0; i < barCount; i++)
         {
             float x = region.Left + i * barWidth + gap / 2f;
@@ -2284,10 +3112,11 @@ public class Generator
             : subfile.FileName;
         line += title;
 
-        // 艺术家：存在时添加 " // Artist"
-        if (!string.IsNullOrWhiteSpace(subfile.ArtistName))
+        // 作曲家：优先使用 Composer，其次 Artist
+        string composer = subfile.ComposerName ?? subfile.ArtistName;
+        if (!string.IsNullOrWhiteSpace(composer))
         {
-            line += " // " + subfile.ArtistName;
+            line += " // " + composer;
         }
 
         // 风格：存在时添加 " [Genre]"

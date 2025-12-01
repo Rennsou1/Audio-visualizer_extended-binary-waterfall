@@ -18,9 +18,18 @@ public class SubFile(string path, long startOffset, long length)
 	public int? DiscNumber { get; set; } = null;               // 第几碟
 	public int? TrackNumber { get; set; } = null;              // 第几首
 	public string TrackTitle { get; set; } = null;             // 曲名
-	public string ArtistName { get; set; } = null;             // 艺术家/作曲家
-	public string Genre { get; set; } = null;                  // 曲目风格
+	public string ArtistName { get; set; } = null;             // 艺术家
+	public string ComposerName { get; set; } = null;           // 作曲家（这个优先显示而不是ArtistName）
+	public string Genre { get; set; } = null;                  // 曲风
 	public float[] WaveformPeaks { get; set; } = null;        // 预计算的波形峰值数组（用于底部进度条显示）
+
+	// 音频时间信息（用于进度条同步，单位：秒）
+	public double AudioStartTime { get; set; } = 0;           // 该子文件音频在总时间线中的开始时间
+	public double AudioDuration { get; set; } = 0;            // 该子文件的音频时长
+	
+	// 实际文件字节偏移（用于瀑布可视化读取）
+	public long ActualByteOffset { get; set; } = 0;           // 该子文件在实际二进制流中的起始偏移
+	public long ActualByteLength { get; set; } = 0;           // 该子文件的实际字节大小
 
 	public string FileName => System.IO.Path.GetFileName(Path);
 	public string FileDirectory => System.IO.Path.GetDirectoryName(Path);

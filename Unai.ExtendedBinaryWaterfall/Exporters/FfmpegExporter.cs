@@ -20,6 +20,10 @@ public enum HardwareAccelType
 public class FfmpegExporter : IExporter
 {
 	private bool _init = false;
+	// 标记音频编码是否可用
+	private bool _audioEnabled = true;
+	// 实际使用的音频采样率（AAC 标准采样率）
+	private int _actualAudioSampleRate = 48000;
 
 	private unsafe AVFormatContext* _fmtCtx;
 
@@ -35,8 +39,16 @@ public class FfmpegExporter : IExporter
 	private unsafe AVPacket* _audioAvPacket;
 
 	private unsafe SwsContext* _swsCtx;
+	// 音频重采样上下文（从原始采样率重采样到 AAC 标准采样率）
+	private unsafe SwrContext* _swrCtx;
+	// 重采样后的音频帧
+	private unsafe AVFrame* _resampledAudioFrame;
 	// 复用的像素数据缓冲区，避免每帧分配
 	private byte[] _pixelDataBuffer = null;
+	// 输入音频的原始采样率
+	private int _inputAudioSampleRate = 48000;
+	// 是否需要重采样
+	private bool _needResample = false;
 
 	private readonly AudioFrameResizer<float> _audioQueue = new();
 
@@ -59,15 +71,54 @@ public class FfmpegExporter : IExporter
 	[CliParameter("Hardware Acceleration", "hwaccel")]
 	public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
 
-	// NVENC 编码配置（默认为最快速度）
-	public string NvencPreset { get; set; } = "p1";         // p1-p7, 默认 p1 最快
-	public string NvencTune { get; set; } = "hq";           // hq, ll, ull, lossless
-	public string NvencRateControl { get; set; } = "vbr";   // vbr, cbr, cq
-	public bool NvencTemporalAQ { get; set; } = false;      // 时域自适应量化（关闭更快）
-	public bool NvencSpatialAQ { get; set; } = false;       // 空域自适应量化（关闭更快）
-	public int NvencLookahead { get; set; } = 0;            // lookahead 帧数（0=最快）
+	// NVENC 编码配置（基于 NVIDIA Video Codec SDK 10 最佳实践）
+	// P1=最快/低质量, P4=平衡, P7=最慢/高质量
+	public string NvencPreset { get; set; } = "p4";      // P4 平衡速度和质量
+	public string NvencTune { get; set; } = "hq";        // hq=高质量, ll=低延迟, ull=超低延迟
+	public string NvencRateControl { get; set; } = "vbr"; // vbr=可变比特率
+	public int NvencBFrames { get; set; } = 2;           // B帧数量（减少以提高速度）
+	public bool NvencTemporalAQ { get; set; } = true;    // 时域自适应量化（改善动态场景）
+	public bool NvencSpatialAQ { get; set; } = false;    // 空域AQ关闭以提高速度
+	public int NvencAQStrength { get; set; } = 8;        // AQ强度（1-15, 8=默认）
+	public int NvencLookahead { get; set; } = 8;         // Lookahead帧数（8帧平衡质量和速度）
+	
+	// 视频编码参数
+	public int VideoCodecIndex { get; set; } = 0;
+	public int RateControlMode { get; set; } = 0;
+	public int CrfValue { get; set; } = 23;
+	public int VideoProfile { get; set; } = 0;
+	public int VideoLevel { get; set; } = 0;
+	public int KeyframeInterval { get; set; } = 0;
+	
+	// 音频编码参数
+	public uint OutputAudioBitRate { get; set; } = 256_000;
+	public int AudioCodecIndex { get; set; } = 0;
+	
+	// 输出格式
+	public string OutputFormat { get; set; } = "matroska";
 
 	#endregion
+
+	// AAC 支持的标准采样率
+	private static readonly int[] SupportedSampleRates = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000 };
+	
+	// 获取最接近的 AAC 支持采样率
+	private static int GetNearestSupportedSampleRate(int inputRate)
+	{
+		int nearest = 48000; // 默认使用 48kHz
+		int minDiff = int.MaxValue;
+		
+		foreach (var rate in SupportedSampleRates)
+		{
+			int diff = Math.Abs(rate - inputRate);
+			if (diff < minDiff)
+			{
+				minDiff = diff;
+				nearest = rate;
+			}
+		}
+		return nearest;
+	}
 
 	// 尝试查找可用的硬件编码器，返回编码器名称
 	private unsafe AVCodec* FindVideoEncoder()
@@ -105,9 +156,11 @@ public class FfmpegExporter : IExporter
 
 	public void InitializeFfmpeg()
 	{
+		Generator.DebugLog("[FFmpeg] 开始初始化...");
 		unsafe
 		{
 			// 获取 FFmpeg 库路径
+			Generator.DebugLog("[FFmpeg] 查找库路径...");
 			var ffmpegPath = FfmpegUtils.GetFfmpegLibraryPath();
 			if (string.IsNullOrEmpty(ffmpegPath))
 			{
@@ -118,9 +171,11 @@ public class FfmpegExporter : IExporter
 					"2. 或下载 FFmpeg 并放到 C:\\ffmpeg 目录\n" +
 					"3. 重启应用程序");
 			}
+			Generator.DebugLog($"[FFmpeg] 库路径: {ffmpegPath}");
 			ffmpeg.RootPath = ffmpegPath;
 			Logger.Debug($"FFmpeg library path: '{ffmpeg.RootPath}'.");
 			
+			Generator.DebugLog("[FFmpeg] 加载 FFmpeg 库...");
 			ffmpeg.av_log_set_level(LogLevel);
 			av_log_set_callback_callback logCb = (p0, level, format, v1) =>
 			{
@@ -133,16 +188,33 @@ public class FfmpegExporter : IExporter
 				Console.Error.Write(message);
 			};
 			ffmpeg.av_log_set_callback(logCb);
+			Generator.DebugLog("[FFmpeg] 日志回调设置完成");
 
 			// format
 			// ======
-
+			Generator.DebugLog("[FFmpeg] 创建输出格式上下文...");
 			{
 				AVFormatContext* fmtCtx = null;
-				ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, "matroska", Generator.OutputFilePath ?? "/dev/stdout");
-				if (fmtCtx == null) Console.Error.WriteLine("cannot allocate AVFormatContext");
+				// 根据输出格式选择正确的 FFmpeg 格式名称
+				string formatName = OutputFormat switch
+				{
+					"mp4" => "mp4",
+					"mkv" or "matroska" => "matroska",
+					"webm" => "webm",
+					"mov" => "mov",
+					"avi" => "avi",
+					_ => "matroska"
+				};
+				Generator.DebugLog($"[FFmpeg] 输出格式: {formatName}, 文件: {Generator.OutputFilePath}");
+				ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, formatName, Generator.OutputFilePath ?? "/dev/stdout");
+				if (fmtCtx == null)
+				{
+					Generator.DebugLog("[FFmpeg] 错误: 无法分配 AVFormatContext");
+					Console.Error.WriteLine("cannot allocate AVFormatContext");
+				}
 				_fmtCtx = fmtCtx;
 			}
+			Generator.DebugLog("[FFmpeg] 输出格式上下文创建完成");
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
 				Logger.Debug("Format requested global stream headers.");
@@ -150,19 +222,27 @@ public class FfmpegExporter : IExporter
 
 			// encoders
 			// ========
+			Generator.DebugLog("[FFmpeg] 查找视频编码器...");
 
 			AVRational videoFps; videoFps.num = Generator.OutputFps; videoFps.den = 1;
-			// 使用音频采样率作为视频 time_base，确保音视频完美同步
-			// 视频 PTS = 帧号 × (采样率 / fps)
-			int videoTimeBaseDen = Generator.AudioOutputSampleRate;
+			// 先计算实际使用的音频采样率（AAC 支持的标准采样率）
+			_actualAudioSampleRate = GetNearestSupportedSampleRate(Generator.AudioOutputSampleRate);
+			// 视频 time_base = 1/fps，PTS 直接使用帧号
+			int videoTimeBaseDen = Generator.OutputFps;
 
 			// 使用硬件加速编码器（如果可用）
 			var videoEnc = FindVideoEncoder();
 			if (videoEnc == null)
 			{
+				Generator.DebugLog("[FFmpeg] 错误: 找不到视频编码器！");
 				throw new InvalidOperationException("找不到可用的视频编码器！");
 			}
+			string vEncName = Marshal.PtrToStringAnsi((nint)videoEnc->name);
+			Generator.DebugLog($"[FFmpeg] 视频编码器: {vEncName}");
+			
+			Generator.DebugLog("[FFmpeg] 查找音频编码器...");
 			var audioEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_AAC);
+			Generator.DebugLog($"[FFmpeg] 音频编码器: {(audioEnc != null ? "AAC" : "null")}");
 
 			_videoCtx = ffmpeg.avcodec_alloc_context3(videoEnc);
 			_videoCtx->codec_type = AVMediaType.AVMEDIA_TYPE_VIDEO;
@@ -194,24 +274,48 @@ public class FfmpegExporter : IExporter
 			string encoderName = Marshal.PtrToStringAnsi((nint)videoEnc->name);
 			if (encoderName == "h264_nvenc" || encoderName == "hevc_nvenc")
 			{
-				// NVENC 预设：使用 GUI 配置的值
-				ffmpeg.av_dict_set(&videoEncOpts, "preset", NvencPreset, 0);
-				// 调优模式
-				ffmpeg.av_dict_set(&videoEncOpts, "tune", NvencTune, 0);
+				// 预设名称（某些 FFmpeg 版本好像不支持 p1-p7？！）
+				string preset = NvencPreset switch
+				{
+					"p1" => "fastest",
+					"p2" => "faster",
+					"p3" => "fast",
+					"p4" => "medium",
+					"p5" => "slow",
+					"p6" => "slower",
+					"p7" => "slowest",
+					_ => NvencPreset
+				};
+				ffmpeg.av_dict_set(&videoEncOpts, "preset", preset, 0);
+				
 				// 码率控制
-				ffmpeg.av_dict_set(&videoEncOpts, "rc", NvencRateControl, 0);
-				// 启用 B 帧以提高压缩效率
-				ffmpeg.av_dict_set(&videoEncOpts, "b_ref_mode", "middle", 0);
-				// 时域自适应量化
-				ffmpeg.av_dict_set(&videoEncOpts, "temporal-aq", NvencTemporalAQ ? "1" : "0", 0);
-				// 空域自适应量化
-				ffmpeg.av_dict_set(&videoEncOpts, "spatial-aq", NvencSpatialAQ ? "1" : "0", 0);
-				// lookahead 帧数
-				ffmpeg.av_dict_set(&videoEncOpts, "rc-lookahead", NvencLookahead.ToString(), 0);
-				// 设置 GPU 设备
+				string rc = NvencRateControl switch
+				{
+					"vbr_hq" => "vbr",
+					"cbr_hq" => "cbr",
+					_ => NvencRateControl
+				};
+				ffmpeg.av_dict_set(&videoEncOpts, "rc", rc, 0);
+				
+				// B帧数量
+				ffmpeg.av_dict_set(&videoEncOpts, "bf", NvencBFrames.ToString(), 0);
+				
+				// 自适应量化
+				if (NvencSpatialAQ)
+					ffmpeg.av_dict_set(&videoEncOpts, "spatial-aq", "1", 0);
+				if (NvencTemporalAQ)
+					ffmpeg.av_dict_set(&videoEncOpts, "temporal-aq", "1", 0);
+				if (NvencSpatialAQ || NvencTemporalAQ)
+					ffmpeg.av_dict_set(&videoEncOpts, "aq-strength", NvencAQStrength.ToString(), 0);
+				
+				// Lookahead
+				if (NvencLookahead > 0)
+					ffmpeg.av_dict_set(&videoEncOpts, "rc-lookahead", NvencLookahead.ToString(), 0);
+				
+				// GPU设备选择
 				ffmpeg.av_dict_set(&videoEncOpts, "gpu", "0", 0);
 				
-				Logger.Info($"NVENC 选项: preset={NvencPreset}, tune={NvencTune}, rc={NvencRateControl}, lookahead={NvencLookahead}");
+				Logger.Info($"NVENC 配置: preset={preset}, rc={rc}, bf={NvencBFrames}, lookahead={NvencLookahead}");
 			}
 			else if (encoderName == "h264_qsv" || encoderName == "hevc_qsv")
 			{
@@ -226,31 +330,46 @@ public class FfmpegExporter : IExporter
 				Logger.Info($"AMF 选项已配置: quality=balanced");
 			}
 			
+			Generator.DebugLog("[FFmpeg] 打开视频编码器...");
 			var ret = ffmpeg.avcodec_open2(_videoCtx, videoEnc, &videoEncOpts);
-			FfmpegUtils.LogIfAvError(ret, "cannot open video codec");
+			Generator.DebugLog($"[FFmpeg] 视频编码器结果: {ret}");
+			if (ret < 0)
+			{
+				FfmpegUtils.LogIfAvError(ret, "cannot open video codec");
+				throw new InvalidOperationException($"无法打开视频编码器 {encoderName}，错误码: {ret}");
+			}
 
+			Generator.DebugLog("[FFmpeg] 配置音频编码器...");
 			_audioCtx = ffmpeg.avcodec_alloc_context3(audioEnc);
+			Generator.DebugLog("[FFmpeg] 音频上下文已分配");
 			_audioCtx->codec_type = AVMediaType.AVMEDIA_TYPE_AUDIO;
 			_audioCtx->sample_fmt = AVSampleFormat.AV_SAMPLE_FMT_FLTP;
-			_audioCtx->sample_rate = Generator.AudioOutputSampleRate;
+			// AAC 不支持任意采样率！！！！！使用已计算的标准采样率o(*￣▽￣*)ブ
+			_audioCtx->sample_rate = _actualAudioSampleRate;
 			_audioCtx->time_base.num = 1;
-			_audioCtx->time_base.den = Generator.AudioOutputSampleRate;
-			_audioCtx->ch_layout.nb_channels = 2;
-			_audioCtx->ch_layout.order = AVChannelOrder.AV_CHANNEL_ORDER_NATIVE;
-			_audioCtx->ch_layout.u.mask = ffmpeg.AV_CH_LAYOUT_STEREO;
-			_audioCtx->bit_rate = 128_000;
-			_audioCtx->extradata = (byte*)ffmpeg.av_mallocz(32);
-			_audioCtx->extradata_size = 24;
+			_audioCtx->time_base.den = _actualAudioSampleRate;
+			// 输出声道数使用用户设置
+			ffmpeg.av_channel_layout_default(&_audioCtx->ch_layout, Generator.AudioOutputChannelCount);
+			_audioCtx->bit_rate = OutputAudioBitRate > 0 ? OutputAudioBitRate : 128_000;
+			// AAC 编码器会自动处理 extradata，不需要手动设置
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
 				_audioCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
 			}
+			Generator.DebugLog($"[FFmpeg] 音频参数: 解码器{Generator.AudioDecoderSampleRate}Hz {Generator.AudioDecoderChannelCount}ch -> 输出{_actualAudioSampleRate}Hz {Generator.AudioOutputChannelCount}ch, {_audioCtx->bit_rate}bps");
+			Generator.DebugLog("[FFmpeg] 打开音频编码器...");
 			ret = ffmpeg.avcodec_open2(_audioCtx, audioEnc, null);
+			Generator.DebugLog($"[FFmpeg] 音频编码器结果: {ret}");
+			if (ret < 0)
+			{
+				Generator.DebugLog("[FFmpeg] 警告: 音频编码器打开失败，将跳过音频");
+				_audioEnabled = false;
+			}
 			FfmpegUtils.LogIfAvError(ret, "cannot open audio codec");
 
 			// streams
 			// =======
-
+			Generator.DebugLog("[FFmpeg] 创建视频流...");
 			_videoStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
 			if (_videoStream == null) Logger.Error("cannot allocate video output stream");
 			_videoStream->index = (int)(_fmtCtx->nb_streams - 1);
@@ -260,25 +379,38 @@ public class FfmpegExporter : IExporter
 			ret = ffmpeg.avcodec_parameters_from_context(_videoStream->codecpar, _videoCtx);
 			FfmpegUtils.LogIfAvError(ret, "cannot set video codec params from codec context");
 
-			_audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
-			if (_videoStream == null) Logger.Error("cannot allocate audio output stream");
-			_audioStream->index = (int)(_fmtCtx->nb_streams - 1);
-			_audioStream->time_base = FfmpegUtils.GetRational(1, _audioCtx->sample_rate);
-			
-			ret = ffmpeg.avcodec_parameters_from_context(_audioStream->codecpar, _audioCtx);
-			FfmpegUtils.LogIfAvError(ret, "cannot set audio codec params from codec context");
-			if (_audioStream->codecpar->extradata == null)
+			// 只在音频编码器可用时创建音频流
+			if (_audioEnabled)
 			{
-				Logger.Error("audio codec did not create extradata buffer");
+				Generator.DebugLog("[FFmpeg] 创建音频流...");
+				_audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
+				if (_audioStream == null) Logger.Error("cannot allocate audio output stream");
+				_audioStream->index = (int)(_fmtCtx->nb_streams - 1);
+				_audioStream->time_base = FfmpegUtils.GetRational(1, _audioCtx->sample_rate);
+				
+				ret = ffmpeg.avcodec_parameters_from_context(_audioStream->codecpar, _audioCtx);
+				FfmpegUtils.LogIfAvError(ret, "cannot set audio codec params from codec context");
+				if (_audioStream->codecpar->extradata == null)
+				{
+					Logger.Error("audio codec did not create extradata buffer");
+				}
 			}
+			else
+			{
+				Generator.DebugLog("[FFmpeg] 跳过音频流创建（音频编码器不可用）");
+			}
+			Generator.DebugLog("[FFmpeg] 流创建完成");
 
 			// output file/stream
 			// ==================
-
+			Generator.DebugLog($"[FFmpeg] 打开输出文件: {Generator.OutputFilePath}");
 			ret = ffmpeg.avio_open(&_fmtCtx->pb, Generator.OutputFilePath ?? "pipe:", Generator.OutputFilePath != null ? ffmpeg.AVIO_FLAG_READ_WRITE : ffmpeg.AVIO_FLAG_WRITE);
+			Generator.DebugLog($"[FFmpeg] avio_open 结果: {ret}");
 			FfmpegUtils.LogIfAvError(ret, "cannot open stdout");
+			Generator.DebugLog("[FFmpeg] 写入文件头...");
 			AVDictionary* fmtOpts;
 			ret = ffmpeg.avformat_write_header(_fmtCtx, &fmtOpts);
+			Generator.DebugLog($"[FFmpeg] 写入头结果: {ret}");
 			FfmpegUtils.LogIfAvError(ret, "cannot write header");
 
 			byte* dictBuf = (byte*)ffmpeg.av_malloc(1024);
@@ -286,7 +418,7 @@ public class FfmpegExporter : IExporter
 
 			// video frames
 			// ============
-
+			Generator.DebugLog("[FFmpeg] 分配视频帧缓冲...");
 			_videoAvFrame = ffmpeg.av_frame_alloc();
 			_videoAvFrame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
 			_videoAvFrame->width = Generator.OutputVideoWidth;
@@ -305,56 +437,275 @@ public class FfmpegExporter : IExporter
 			ret = ffmpeg.av_frame_get_buffer(_videoAvFramePre, 0);
 			FfmpegUtils.LogIfAvError(ret, "cannot allocate video pixel buffer");
 
-			// audio frames
+			// audio frames (只在音频编码器可用时初始化)
 			// ============
-
-			_audioAvFrame = ffmpeg.av_frame_alloc();
-			_audioAvFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
-			ffmpeg.av_channel_layout_copy(&_audioAvFrame->ch_layout, &_audioCtx->ch_layout);
-			_audioAvFrame->sample_rate = _audioCtx->sample_rate;
-			_audioAvFrame->nb_samples = _audioCtx->frame_size;
-			_audioAvFrame->ch_layout.nb_channels = 2;
-			_audioAvFrame->ch_layout.u.mask = 3;
-			_audioAvFrame->time_base.num = _audioCtx->time_base.num;
-			_audioAvFrame->time_base.den = _audioCtx->time_base.den;
-
-			if ((_audioCtx->codec->capabilities & ffmpeg.AV_CODEC_CAP_VARIABLE_FRAME_SIZE) == 0)
+			if (_audioEnabled)
 			{
-				Logger.Warning("audio codec does not support variable frame size");
-			}
-
-			ret = ffmpeg.av_frame_get_buffer(_audioAvFrame, 0);
-			FfmpegUtils.LogIfAvError(ret, "cannot allocate audio sample buffer");
-			_audioQueue.BufferLength = _audioAvFrame->nb_samples * _audioAvFrame->ch_layout.nb_channels;
-			_audioQueue.OutputCallback = (buf) =>
-			{
-				// 设置正确的音频 PTS（基于已编码的样本数）
-				_audioAvFrame->pts = _audioSampleCount;
+				Generator.DebugLog("[FFmpeg] 分配音频帧缓冲...");
 				
-				float* ab0 = (float*)_audioAvFrame->data[0];
-				float* ab1 = (float*)_audioAvFrame->data[1];
-				int samplesPerChannel = _audioAvFrame->nb_samples;
-				for (int i = 0; i < samplesPerChannel; i++)
+				// 输入采样率是音频解码器的原始采样率
+				_inputAudioSampleRate = Generator.AudioDecoderSampleRate;
+				// 输出采样率是用户期望的目标采样率（已经过 AAC 兼容性检查）
+				_actualAudioSampleRate = GetNearestSupportedSampleRate(Generator.AudioOutputSampleRate);
+				// 当输入和输出采样率不同时需要重采样
+				_needResample = (_inputAudioSampleRate != _actualAudioSampleRate);
+				Generator.DebugLog($"[FFmpeg] 音频重采样: {_inputAudioSampleRate}Hz (解码器) -> {_actualAudioSampleRate}Hz (输出), 需要重采样: {_needResample}");
+				
+				// Generator 每帧产生的采样数（基于解码器采样率）
+				// 解码器每帧产生: AudioDecoderSampleRate / OutputFps 个采样（每通道）
+				int inputSamplesPerChannel = Generator.AudioDecoderSampleRate / Generator.OutputFps;
+				Generator.DebugLog($"[FFmpeg] Generator 每帧采样数(每通道): {inputSamplesPerChannel} (基于解码器 {Generator.AudioDecoderSampleRate}Hz)");
+				
+				// 输入音频帧缓冲区大小需要足够容纳 AAC 帧（通常 1024 采样）
+				int audioFrameBufferSize = Math.Max(inputSamplesPerChannel, _audioCtx->frame_size);
+				Generator.DebugLog($"[FFmpeg] 音频帧缓冲区大小: {audioFrameBufferSize} (AAC帧: {_audioCtx->frame_size})");
+				
+				// 输入音频帧（使用解码器的实际声道数）
+				int inputChannels = Generator.AudioDecoderChannelCount;
+				// 输出声道数（用户设置的目标）
+				int outputChannels = Generator.AudioOutputChannelCount;
+				_audioAvFrame = ffmpeg.av_frame_alloc();
+				_audioAvFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
+				ffmpeg.av_channel_layout_default(&_audioAvFrame->ch_layout, inputChannels);
+				_audioAvFrame->sample_rate = _inputAudioSampleRate;
+				_audioAvFrame->nb_samples = audioFrameBufferSize;
+				_audioAvFrame->time_base.num = 1;
+				_audioAvFrame->time_base.den = _actualAudioSampleRate;
+				Generator.DebugLog($"[FFmpeg] 输入帧配置: {inputChannels}ch, {_inputAudioSampleRate}Hz, {audioFrameBufferSize}samples");
+
+				ret = ffmpeg.av_frame_get_buffer(_audioAvFrame, 0);
+				FfmpegUtils.LogIfAvError(ret, "cannot allocate input audio sample buffer");
+				
+				if (_needResample)
 				{
-					ab0[i] = buf[i * 2];
-					ab1[i] = buf[i * 2 + 1];
+					// 初始化重采样上下文
+					Generator.DebugLog("[FFmpeg] 初始化音频重采样上下文...");
+					
+					// 初始化重采样上下文（在 unsafe 上下文中局部变量已固定）
+					// 输入：使用解码器的声道数
+					// 输出：使用用户设置的输出声道数，重采样器会自动上混/下混
+					SwrContext* swrCtx = null;
+					AVChannelLayout inLayout = new AVChannelLayout();
+					AVChannelLayout outLayout = new AVChannelLayout();
+					ffmpeg.av_channel_layout_default(&inLayout, inputChannels);
+					ffmpeg.av_channel_layout_default(&outLayout, outputChannels);
+					
+					ret = ffmpeg.swr_alloc_set_opts2(
+						&swrCtx,
+						&outLayout, AVSampleFormat.AV_SAMPLE_FMT_FLTP, _actualAudioSampleRate,
+						&inLayout, AVSampleFormat.AV_SAMPLE_FMT_FLTP, _inputAudioSampleRate,
+						0, null);
+					_swrCtx = swrCtx;
+					FfmpegUtils.LogIfAvError(ret, "cannot set swr options");
+					
+					ret = ffmpeg.swr_init(_swrCtx);
+					FfmpegUtils.LogIfAvError(ret, "cannot init swr context");
+					Generator.DebugLog($"[FFmpeg] 重采样上下文初始化完成: {_inputAudioSampleRate}Hz {inputChannels}ch -> {_actualAudioSampleRate}Hz {outputChannels}ch");
+					
+					// 分配重采样后的输出帧
+					_resampledAudioFrame = ffmpeg.av_frame_alloc();
+					_resampledAudioFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
+					ffmpeg.av_channel_layout_default(&_resampledAudioFrame->ch_layout, outputChannels);
+					_resampledAudioFrame->sample_rate = _actualAudioSampleRate;
+					_resampledAudioFrame->nb_samples = _audioCtx->frame_size;
+					_resampledAudioFrame->time_base.num = 1;
+					_resampledAudioFrame->time_base.den = _actualAudioSampleRate;
+					
+					ret = ffmpeg.av_frame_get_buffer(_resampledAudioFrame, 0);
+					FfmpegUtils.LogIfAvError(ret, "cannot allocate resampled audio buffer");
 				}
-				DoEncode(_audioCtx, _audioStream, _audioAvFrame, _audioAvPacket);
+
+				// 检查音频编码器是否支持可变帧大小
+				if (_audioCtx->codec != null && (_audioCtx->codec->capabilities & ffmpeg.AV_CODEC_CAP_VARIABLE_FRAME_SIZE) == 0)
+				{
+					Logger.Warning("audio codec does not support variable frame size");
+				}
+
+				// 音频队列缓冲长度 = 每通道采样数 × 实际声道数
+				int audioQueueLength = inputSamplesPerChannel * inputChannels;
+				_audioQueue.BufferLength = audioQueueLength;
+				Generator.DebugLog($"[FFmpeg] 音频队列长度: {audioQueueLength}, AAC帧大小: {_audioCtx->frame_size}, 输入帧采样数(每通道): {inputSamplesPerChannel}, 输入声道数: {inputChannels}");
 				
-				// 更新音频样本计数
-				_audioSampleCount += samplesPerChannel;
-			};
+				int aacFrameSize = _audioCtx->frame_size; // AAC 通常是 1024
+				
+				// 重采样后的输出累积缓冲区（累积到 AAC 帧大小后再编码）
+				// 需要足够大的缓冲区来存储重采样后的数据
+				int resampleRatio = _needResample ? (_actualAudioSampleRate / _inputAudioSampleRate + 2) : 1;
+				int outputBufferSize = aacFrameSize * resampleRatio * 2;
+				float[] outputAccumL = new float[outputBufferSize];
+				float[] outputAccumR = new float[outputBufferSize];
+				int outputAccumCount = 0;
+				
+				// 临时缓冲区用于重采样输出
+				float[] tempResampleL = new float[inputSamplesPerChannel * resampleRatio + 1024];
+				float[] tempResampleR = new float[inputSamplesPerChannel * resampleRatio + 1024];
+				
+				Generator.DebugLog($"[FFmpeg] 重采样比率: {resampleRatio}, 输出缓冲区大小: {outputBufferSize}");
+				
+				_audioQueue.OutputCallback = (buf) =>
+				{
+					// 根据输入声道数计算每通道采样数
+					int samplesPerChannel = buf.Length / inputChannels;
+					
+					if (_needResample && _swrCtx != null)
+					{
+						// 填充输入帧（支持单声道或双声道输入）
+						float* ab0 = (float*)_audioAvFrame->data[0];
+						if (inputChannels == 1)
+						{
+							// 单声道：所有数据在 data[0]
+							for (int i = 0; i < samplesPerChannel; i++)
+							{
+								ab0[i] = buf[i];
+							}
+						}
+						else
+						{
+							// 双声道：格式 -> planar 格式
+							float* ab1 = (float*)_audioAvFrame->data[1];
+							for (int i = 0; i < samplesPerChannel; i++)
+							{
+								ab0[i] = buf[i * 2];
+								ab1[i] = buf[i * 2 + 1];
+							}
+						}
+						_audioAvFrame->nb_samples = samplesPerChannel;
+						
+						// 使用 swr_convert 进行重采样（不是 swr_convert_frame）
+						// 计算预期输出采样数
+						int maxOutputSamples = (int)((long)samplesPerChannel * _actualAudioSampleRate / _inputAudioSampleRate) + 256;
+						
+						// 确保重采样输出帧有足够空间
+						if (_resampledAudioFrame->nb_samples < maxOutputSamples)
+						{
+							// 重新分配缓冲区（使用用户设置的输出声道数）
+							ffmpeg.av_frame_unref(_resampledAudioFrame);
+							_resampledAudioFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
+							ffmpeg.av_channel_layout_default(&_resampledAudioFrame->ch_layout, outputChannels);
+							_resampledAudioFrame->sample_rate = _actualAudioSampleRate;
+							_resampledAudioFrame->nb_samples = maxOutputSamples;
+							ffmpeg.av_frame_get_buffer(_resampledAudioFrame, 0);
+						}
+						
+						// 执行重采样
+						byte** outData = (byte**)&_resampledAudioFrame->data;
+						byte** inData = (byte**)&_audioAvFrame->data;
+						int convertedSamples = ffmpeg.swr_convert(
+							_swrCtx,
+							outData,
+							maxOutputSamples,
+							inData,
+							samplesPerChannel);
+						
+						if (convertedSamples < 0)
+						{
+							FfmpegUtils.LogIfAvError(convertedSamples, "swr_convert failed");
+							return;
+						}
+						
+						// 将重采样后的数据累积到输出缓冲区（支持单声道或双声道输出）
+						float* outL = (float*)_resampledAudioFrame->data[0];
+						if (outputChannels == 1)
+						{
+							// 单声道输出
+							for (int i = 0; i < convertedSamples && outputAccumCount < outputBufferSize; i++)
+							{
+								outputAccumL[outputAccumCount] = outL[i];
+								outputAccumR[outputAccumCount] = outL[i]; // 复制到 R 以保持一致性
+								outputAccumCount++;
+							}
+						}
+						else
+						{
+							// 双声道输出
+							float* outR = (float*)_resampledAudioFrame->data[1];
+							for (int i = 0; i < convertedSamples && outputAccumCount < outputBufferSize; i++)
+							{
+								outputAccumL[outputAccumCount] = outL[i];
+								outputAccumR[outputAccumCount] = outR[i];
+								outputAccumCount++;
+							}
+						}
+					}
+					else
+					{
+						// 无需重采样，直接累积（处理输入/输出声道不匹配的情况）
+						if (inputChannels == 1)
+						{
+							// 单声道输入
+							for (int i = 0; i < samplesPerChannel && outputAccumCount < outputBufferSize; i++)
+							{
+								outputAccumL[outputAccumCount] = buf[i];
+								outputAccumR[outputAccumCount] = buf[i]; // 复制到 R
+								outputAccumCount++;
+							}
+						}
+						else
+						{
+							// 双声道输入
+							for (int i = 0; i < samplesPerChannel && outputAccumCount < outputBufferSize; i++)
+							{
+								outputAccumL[outputAccumCount] = buf[i * 2];
+								outputAccumR[outputAccumCount] = buf[i * 2 + 1];
+								outputAccumCount++;
+							}
+						}
+					}
+					
+					// 当累积够 AAC 帧大小时，编码输出
+					while (outputAccumCount >= aacFrameSize)
+					{
+						// 填充编码帧（支持单声道或双声道）
+						float* encL = (float*)_resampledAudioFrame->data[0];
+						for (int i = 0; i < aacFrameSize; i++)
+						{
+							encL[i] = outputAccumL[i];
+						}
+						if (outputChannels >= 2)
+						{
+							float* encR = (float*)_resampledAudioFrame->data[1];
+							for (int i = 0; i < aacFrameSize; i++)
+							{
+								encR[i] = outputAccumR[i];
+							}
+						}
+						_resampledAudioFrame->nb_samples = aacFrameSize;
+						_resampledAudioFrame->pts = _audioSampleCount;
+						
+						DoEncode(_audioCtx, _audioStream, _resampledAudioFrame, _audioAvPacket);
+						_audioSampleCount += aacFrameSize;
+						
+						// 移除已处理的数据
+						Array.Copy(outputAccumL, aacFrameSize, outputAccumL, 0, outputAccumCount - aacFrameSize);
+						Array.Copy(outputAccumR, aacFrameSize, outputAccumR, 0, outputAccumCount - aacFrameSize);
+						outputAccumCount -= aacFrameSize;
+					}
+				};
+			}
+			else
+			{
+				Generator.DebugLog("[FFmpeg] 跳过音频帧缓冲分配（音频编码器不可用）");
+			}
 
 			Logger.Debug($"video original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
 			Logger.Debug($"video target linesize =   {_videoAvFrame->linesize[0]} {_videoAvFrame->linesize[1]} {_videoAvFrame->linesize[2]}");
-			Logger.Debug($"req. audio frame size =   {_audioCtx->frame_size} * {_audioCtx->ch_layout.nb_channels}ch");
-			Logger.Debug($"audio ch layout =         {_audioAvFrame->ch_layout.nb_channels} {_audioAvFrame->ch_layout.order} {_audioAvFrame->ch_layout.u.mask}");
-			Logger.Debug($"audio linesizes =         {_audioAvFrame->linesize[0]} {_audioAvFrame->linesize[1]} {_audioAvFrame->linesize[2]} {_audioAvFrame->linesize[3]} {_audioAvFrame->linesize[4]} {_audioAvFrame->linesize[5]} {_audioAvFrame->linesize[6]} {_audioAvFrame->linesize[7]}");
+			// 只在音频可用时输出音频调试信息
+			if (_audioEnabled)
+			{
+				Logger.Debug($"req. audio frame size =   {_audioCtx->frame_size} * {_audioCtx->ch_layout.nb_channels}ch");
+				Logger.Debug($"audio ch layout =         {_audioAvFrame->ch_layout.nb_channels} {_audioAvFrame->ch_layout.order} {_audioAvFrame->ch_layout.u.mask}");
+				Logger.Debug($"audio linesizes =         {_audioAvFrame->linesize[0]} {_audioAvFrame->linesize[1]} {_audioAvFrame->linesize[2]} {_audioAvFrame->linesize[3]} {_audioAvFrame->linesize[4]} {_audioAvFrame->linesize[5]} {_audioAvFrame->linesize[6]} {_audioAvFrame->linesize[7]}");
+			}
 
 			_videoAvPacket = ffmpeg.av_packet_alloc();
-			_audioAvPacket = ffmpeg.av_packet_alloc();
+			// 只在音频可用时分配音频包
+			if (_audioEnabled)
+			{
+				_audioAvPacket = ffmpeg.av_packet_alloc();
+			}
 
 			ffmpeg.av_dump_format(_fmtCtx, 0, Generator.OutputFilePath ?? "pipe:", 1);
+			Generator.DebugLog("[FFmpeg] 初始化完成！");
 		}
 		_init = true;
 	}
@@ -365,36 +716,47 @@ public class FfmpegExporter : IExporter
 
 		FfmpegUtils.LogFrameData(frame);
 
+		// 发送帧到编码器
 		ret = ffmpeg.avcodec_send_frame(cCtx, frame);
-		FfmpegUtils.LogIfAvError(ret, "cannot send frame to encoder");
+		if (ret < 0 && ret != ffmpeg.AVERROR(ffmpeg.EAGAIN))
+		{
+			FfmpegUtils.LogIfAvError(ret, "cannot send frame to encoder");
+			return;
+		}
 
-		while (ret >= 0)
+		// 循环接收编码后的 packet
+		while (true)
 		{
 			ret = ffmpeg.avcodec_receive_packet(cCtx, packet);
 
-			if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN))
+			if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF)
 			{
+				// EAGAIN: 需要更多输入帧；EOF: 编码器已刷新完毕
 				break;
 			}
 			else if (ret < 0)
 			{
-				// if frame is null, `EOF` code is expected, don't treat it as an error.
-				if (frame != null)
-				{
-					FfmpegUtils.LogIfAvError(ret, "cannot encode");
-				}
+				FfmpegUtils.LogIfAvError(ret, "cannot encode");
 				break;
 			}
 
+			// 转换时间戳
 			ffmpeg.av_packet_rescale_ts(packet, cCtx->time_base, stream->time_base);
 			packet->stream_index = stream->index;
 			packet->time_base.num = stream->time_base.num;
 			packet->time_base.den = stream->time_base.den;
 			FfmpegUtils.LogPacketData(packet);
 
+			// 写入 packet
 			ret = ffmpeg.av_interleaved_write_frame(_fmtCtx, packet);
-			FfmpegUtils.LogIfAvError(ret, "cannot write packet");
-			if (ret == -32) Generator._exitRequested = true;
+			if (ret < 0)
+			{
+				FfmpegUtils.LogIfAvError(ret, "cannot write packet");
+				if (ret == -32) Generator._exitRequested = true;
+			}
+			
+			// 关键：释放 packet 资源，防止内存泄漏
+			ffmpeg.av_packet_unref(packet);
 		}
 	}
 
@@ -408,6 +770,7 @@ public class FfmpegExporter : IExporter
 		if (!_init)
 		{
 			InitializeFfmpeg();
+			Generator.DebugLog("[FFmpeg] 开始推送第一帧...");
 		}
 
 		var ret = ffmpeg.av_frame_make_writable(_videoAvFrame);
@@ -477,14 +840,17 @@ public class FfmpegExporter : IExporter
 
 		_videoAvFrame->time_base.num = _videoCtx->time_base.num;
 		_videoAvFrame->time_base.den = _videoCtx->time_base.den;
-		// 视频 PTS = 帧号 × 每帧采样数，与音频完美同步
-		// 例如 60fps @ 48kHz: 每帧 800 采样
-		long samplesPerFrame = Generator.AudioOutputSampleRate / Generator.OutputFps;
-		_videoAvFrame->pts = _frameNum * samplesPerFrame;
-		_videoAvFrame->duration = samplesPerFrame;
+		// 视频 PTS 直接使用帧号，time_base 已设为 1/fps
+		// 这确保视频帧精确对应每个时间点，与音频独立计算
+		_videoAvFrame->pts = _frameNum;
+		_videoAvFrame->duration = 1;
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
 
-		_audioQueue.Push(audioFrame.ToArray());
+		// 只在音频编码器可用时处理音频
+		if (_audioEnabled)
+		{
+			_audioQueue.Push(audioFrame.ToArray());
+		}
 
 		if (_frameNum % 10 == 0)
 		{
@@ -498,10 +864,29 @@ public class FfmpegExporter : IExporter
 	{
 		Logger.Debug("Flushing streams…");
 		DoEncode(_videoCtx, _videoStream, null, _videoAvPacket);
-		DoEncode(_audioCtx, _audioStream, null, _audioAvPacket);
+		// 只在音频编码器可用时刷新音频流
+		if (_audioEnabled)
+		{
+			DoEncode(_audioCtx, _audioStream, null, _audioAvPacket);
+		}
 
 		Logger.Debug("Freeing FFmpeg resources…");
 		ffmpeg.sws_freeContext(_swsCtx);
+		
+		// 释放音频重采样资源
+		if (_swrCtx != null)
+		{
+			var swrCtx = _swrCtx;
+			ffmpeg.swr_free(&swrCtx);
+			_swrCtx = null;
+		}
+		if (_resampledAudioFrame != null)
+		{
+			var resampledFrame = _resampledAudioFrame;
+			ffmpeg.av_frame_free(&resampledFrame);
+			_resampledAudioFrame = null;
+		}
+		
 		var videoCtx = _videoCtx;
 		ffmpeg.avcodec_free_context(&videoCtx);
 		var audioCtx = _audioCtx;

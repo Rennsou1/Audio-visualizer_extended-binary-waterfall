@@ -30,6 +30,8 @@
 		<PackageReference Include="CSCore.Ogg" Version="1.0.0.1" />
 		<!-- Used for reading audio metadata (album/artist/genre 等) -->
 		<PackageReference Include="TagLibSharp" Version="2.3.0" />
+		<!-- Used for GPU detection on Windows -->
+		<PackageReference Include="System.Management" Version="9.0.0" />
 	</ItemGroup>
 
 </Project>

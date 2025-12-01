@@ -1,5 +1,10 @@
-using System;
+﻿using System;
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 using FFmpeg.AutoGen;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
@@ -16,6 +21,27 @@ public enum HardwareAccelType
 	AMF      // AMD Advanced Media Framework
 }
 
+// 编码质量预设（速度 vs 质量权衡）
+public enum EncodingQualityPreset
+{
+	Speed,    // 速度优先
+	Balanced, // 平衡
+	Quality   // 质量
+}
+
+// 异步编码帧数据
+public class PendingFrame
+{
+	public byte[] PixelData;        // 像素数据副本
+	public int Width;
+	public int Height;
+	public float[] AudioSamples;    // 音频采样副本
+	public int AudioSampleCount;
+	public int AudioChannels;
+	public long VideoPts;           // 视频 PTS
+	public long AudioPts;           // 音频 PTS
+}
+
 [Exporter("ffmpeg", "FFmpeg Stream", "Use FFmpeg libraries to encode audio and video data and output it in Matroska format.")]
 public class FfmpegExporter : IExporter
 {
@@ -24,6 +50,20 @@ public class FfmpegExporter : IExporter
 	private bool _audioEnabled = true;
 	// 实际使用的音频采样率（AAC 标准采样率）
 	private int _actualAudioSampleRate = 48000;
+	
+	// 异步编码管道（使用 Channel 替代 BlockingCollection）
+	private Channel<PendingFrame> _frameChannel;
+	private Task _encoderTask;
+	private CancellationTokenSource _encoderCts;
+	private const int MaxQueueSize = 128;  // 大缓冲区最大化吞吐量（增加管道深度）
+	
+	// 帧数据对象池（减少 GC 压力）
+	private ConcurrentBag<PendingFrame> _framePool = new();
+	private ConcurrentBag<byte[]> _pixelBufferPool = new();
+	private ConcurrentBag<float[]> _audioBufferPool = new();
+	
+	// 预分配对象池
+	private const int PreallocPoolSize = 160;  // 增大预分配数量以匹配管道深度
 
 	private unsafe AVFormatContext* _fmtCtx;
 
@@ -71,16 +111,17 @@ public class FfmpegExporter : IExporter
 	[CliParameter("Hardware Acceleration", "hwaccel")]
 	public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
 
-	// NVENC 编码配置（基于 NVIDIA Video Codec SDK 10 最佳实践）
-	// P1=最快/低质量, P4=平衡, P7=最慢/高质量
-	public string NvencPreset { get; set; } = "p4";      // P4 平衡速度和质量
-	public string NvencTune { get; set; } = "hq";        // hq=高质量, ll=低延迟, ull=超低延迟
+	// NVENC 编码配置
+	// P1=最快, P2=快速, P4=平衡, P7=最慢
+	public string NvencPreset { get; set; } = "p1";       // P1 最快速度
+	public string NvencTune { get; set; } = "ll";         // ll=低延迟模式（比 hq 更快）
 	public string NvencRateControl { get; set; } = "vbr"; // vbr=可变比特率
-	public int NvencBFrames { get; set; } = 2;           // B帧数量（减少以提高速度）
-	public bool NvencTemporalAQ { get; set; } = true;    // 时域自适应量化（改善动态场景）
-	public bool NvencSpatialAQ { get; set; } = false;    // 空域AQ关闭以提高速度
-	public int NvencAQStrength { get; set; } = 8;        // AQ强度（1-15, 8=默认）
-	public int NvencLookahead { get; set; } = 8;         // Lookahead帧数（8帧平衡质量和速度）
+	public int NvencBFrames { get; set; } = 0;            // B帧=0（禁用B帧显著提高速度）
+	public bool NvencTemporalAQ { get; set; } = false;    // 关闭时域AQ以提高速度
+	public bool NvencSpatialAQ { get; set; } = false;     // 关闭空域AQ以提高速度
+	public int NvencAQStrength { get; set; } = 0;         // AQ强度=0（已禁用）
+	public int NvencLookahead { get; set; } = 0;          // Lookahead=0（禁用前瞻提高速度）
+	public bool NvencZeroLatency { get; set; } = true;    // 零延迟模式（最大化速度）
 	
 	// 视频编码参数
 	public int VideoCodecIndex { get; set; } = 0;
@@ -96,8 +137,53 @@ public class FfmpegExporter : IExporter
 	
 	// 输出格式
 	public string OutputFormat { get; set; } = "matroska";
+	
+	// 编码质量预设（用于快速切换速度/质量配置）
+	public EncodingQualityPreset QualityPreset { get; set; } = EncodingQualityPreset.Speed;
 
 	#endregion
+
+	// 根据质量预设应用相应的 NVENC 配置
+	public void ApplyQualityPreset(EncodingQualityPreset preset)
+	{
+		QualityPreset = preset;
+		switch (preset)
+		{
+			case EncodingQualityPreset.Speed:
+				// 速度
+				NvencPreset = "p1";           // 映射到 fast
+				NvencBFrames = 0;             // 禁用B帧
+				NvencTemporalAQ = false;      // 禁用时域AQ
+				NvencSpatialAQ = false;       // 禁用空域AQ
+				NvencLookahead = 0;           // 禁用前瞻
+				NvencZeroLatency = true;      // 零延迟模式
+				Logger.Info("已应用速度预设");
+				break;
+				
+			case EncodingQualityPreset.Balanced:
+				// 平衡模式
+				NvencPreset = "p4";           // 映射到 medium
+				NvencBFrames = 2;             // 2个B帧
+				NvencTemporalAQ = true;       // 启用时域AQ
+				NvencSpatialAQ = false;       // 禁用空域AQ
+				NvencLookahead = 8;           // 8帧前瞻
+				NvencZeroLatency = false;     // 正常延迟
+				Logger.Info("已应用平衡预设");
+				break;
+				
+			case EncodingQualityPreset.Quality:
+				// 质量优先
+				NvencPreset = "p6";           // 映射到 slow
+				NvencBFrames = 3;             // 3个B帧
+				NvencTemporalAQ = true;       // 启用时域AQ
+				NvencSpatialAQ = true;        // 启用空域AQ
+				NvencAQStrength = 8;          // AQ强度
+				NvencLookahead = 20;          // 20帧前瞻
+				NvencZeroLatency = false;     // 正常延迟
+				Logger.Info("已应用质量预设");
+				break;
+		}
+	}
 
 	// AAC 支持的标准采样率
 	private static readonly int[] SupportedSampleRates = { 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000 };
@@ -156,11 +242,9 @@ public class FfmpegExporter : IExporter
 
 	public void InitializeFfmpeg()
 	{
-		Generator.DebugLog("[FFmpeg] 开始初始化...");
 		unsafe
 		{
 			// 获取 FFmpeg 库路径
-			Generator.DebugLog("[FFmpeg] 查找库路径...");
 			var ffmpegPath = FfmpegUtils.GetFfmpegLibraryPath();
 			if (string.IsNullOrEmpty(ffmpegPath))
 			{
@@ -171,11 +255,9 @@ public class FfmpegExporter : IExporter
 					"2. 或下载 FFmpeg 并放到 C:\\ffmpeg 目录\n" +
 					"3. 重启应用程序");
 			}
-			Generator.DebugLog($"[FFmpeg] 库路径: {ffmpegPath}");
 			ffmpeg.RootPath = ffmpegPath;
 			Logger.Debug($"FFmpeg library path: '{ffmpeg.RootPath}'.");
 			
-			Generator.DebugLog("[FFmpeg] 加载 FFmpeg 库...");
 			ffmpeg.av_log_set_level(LogLevel);
 			av_log_set_callback_callback logCb = (p0, level, format, v1) =>
 			{
@@ -188,11 +270,9 @@ public class FfmpegExporter : IExporter
 				Console.Error.Write(message);
 			};
 			ffmpeg.av_log_set_callback(logCb);
-			Generator.DebugLog("[FFmpeg] 日志回调设置完成");
 
 			// format
 			// ======
-			Generator.DebugLog("[FFmpeg] 创建输出格式上下文...");
 			{
 				AVFormatContext* fmtCtx = null;
 				// 根据输出格式选择正确的 FFmpeg 格式名称
@@ -205,16 +285,13 @@ public class FfmpegExporter : IExporter
 					"avi" => "avi",
 					_ => "matroska"
 				};
-				Generator.DebugLog($"[FFmpeg] 输出格式: {formatName}, 文件: {Generator.OutputFilePath}");
 				ffmpeg.avformat_alloc_output_context2(&fmtCtx, null, formatName, Generator.OutputFilePath ?? "/dev/stdout");
 				if (fmtCtx == null)
 				{
-					Generator.DebugLog("[FFmpeg] 错误: 无法分配 AVFormatContext");
 					Console.Error.WriteLine("cannot allocate AVFormatContext");
 				}
 				_fmtCtx = fmtCtx;
 			}
-			Generator.DebugLog("[FFmpeg] 输出格式上下文创建完成");
 			if ((_fmtCtx->oformat->flags & ffmpeg.AVFMT_GLOBALHEADER) != 0)
 			{
 				Logger.Debug("Format requested global stream headers.");
@@ -222,7 +299,6 @@ public class FfmpegExporter : IExporter
 
 			// encoders
 			// ========
-			Generator.DebugLog("[FFmpeg] 查找视频编码器...");
 
 			AVRational videoFps; videoFps.num = Generator.OutputFps; videoFps.den = 1;
 			// 先计算实际使用的音频采样率（AAC 支持的标准采样率）
@@ -234,15 +310,11 @@ public class FfmpegExporter : IExporter
 			var videoEnc = FindVideoEncoder();
 			if (videoEnc == null)
 			{
-				Generator.DebugLog("[FFmpeg] 错误: 找不到视频编码器！");
 				throw new InvalidOperationException("找不到可用的视频编码器！");
 			}
 			string vEncName = Marshal.PtrToStringAnsi((nint)videoEnc->name);
-			Generator.DebugLog($"[FFmpeg] 视频编码器: {vEncName}");
 			
-			Generator.DebugLog("[FFmpeg] 查找音频编码器...");
 			var audioEnc = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_AAC);
-			Generator.DebugLog($"[FFmpeg] 音频编码器: {(audioEnc != null ? "AAC" : "null")}");
 
 			_videoCtx = ffmpeg.avcodec_alloc_context3(videoEnc);
 			_videoCtx->codec_type = AVMediaType.AVMEDIA_TYPE_VIDEO;
@@ -274,74 +346,94 @@ public class FfmpegExporter : IExporter
 			string encoderName = Marshal.PtrToStringAnsi((nint)videoEnc->name);
 			if (encoderName == "h264_nvenc" || encoderName == "hevc_nvenc")
 			{
-				// 预设名称（某些 FFmpeg 版本好像不支持 p1-p7？！）
+				// 预设名称（使用 FFmpeg 支持的标准名称）
+				// p1=最快, ll=低延迟, llhp=低延迟高性能
 				string preset = NvencPreset switch
 				{
-					"p1" => "fastest",
-					"p2" => "faster",
-					"p3" => "fast",
-					"p4" => "medium",
-					"p5" => "slow",
-					"p6" => "slower",
-					"p7" => "slowest",
-					_ => NvencPreset
+					"p1" => "p1",        // 最快预设
+					"p2" => "p2",
+					"p3" => "p3",
+					"p4" => "p4",
+					"p5" => "p5",
+					"p6" => "p6",
+					"p7" => "p7",
+					_ => "p1"            // 默认使用最快预设
 				};
 				ffmpeg.av_dict_set(&videoEncOpts, "preset", preset, 0);
+				
+				// 低延迟调优（最大化速度）
+				ffmpeg.av_dict_set(&videoEncOpts, "tune", "ll", 0);
 				
 				// 码率控制
 				string rc = NvencRateControl switch
 				{
+					"vbr" => "vbr",
+					"cbr" => "cbr",
 					"vbr_hq" => "vbr",
 					"cbr_hq" => "cbr",
-					_ => NvencRateControl
+					_ => "vbr"
 				};
 				ffmpeg.av_dict_set(&videoEncOpts, "rc", rc, 0);
 				
-				// B帧数量
+				// B帧=0（禁用B帧显著提高速度）
 				ffmpeg.av_dict_set(&videoEncOpts, "bf", NvencBFrames.ToString(), 0);
+				
+				// 禁用双向参考帧（提高速度）
+				ffmpeg.av_dict_set(&videoEncOpts, "b_ref_mode", "0", 0);
+				
+				// 零延迟模式
+				if (NvencZeroLatency)
+				{
+					ffmpeg.av_dict_set(&videoEncOpts, "delay", "0", 0);
+					ffmpeg.av_dict_set(&videoEncOpts, "zerolatency", "1", 0);
+				}
+				
+				// Lookahead（0=禁用）
+				if (NvencLookahead >= 0)
+					ffmpeg.av_dict_set(&videoEncOpts, "rc-lookahead", NvencLookahead.ToString(), 0);
 				
 				// 自适应量化
 				if (NvencSpatialAQ)
 					ffmpeg.av_dict_set(&videoEncOpts, "spatial-aq", "1", 0);
 				if (NvencTemporalAQ)
 					ffmpeg.av_dict_set(&videoEncOpts, "temporal-aq", "1", 0);
-				if (NvencSpatialAQ || NvencTemporalAQ)
-					ffmpeg.av_dict_set(&videoEncOpts, "aq-strength", NvencAQStrength.ToString(), 0);
-				
-				// Lookahead
-				if (NvencLookahead > 0)
-					ffmpeg.av_dict_set(&videoEncOpts, "rc-lookahead", NvencLookahead.ToString(), 0);
 				
 				// GPU设备选择
 				ffmpeg.av_dict_set(&videoEncOpts, "gpu", "0", 0);
 				
-				Logger.Info($"NVENC 配置: preset={preset}, rc={rc}, bf={NvencBFrames}, lookahead={NvencLookahead}");
+				// 增加编码器表面缓冲区数量（提高并行度）
+				ffmpeg.av_dict_set(&videoEncOpts, "surfaces", "64", 0);
+				
+				// 禁用强制关键帧（减少编码开销）
+				ffmpeg.av_dict_set(&videoEncOpts, "forced-idr", "0", 0);
+				
+				Logger.Info($"NVENC 配置: preset={preset}, tune=ll, rc={rc}, bf={NvencBFrames}, surfaces=64, zerolatency={NvencZeroLatency}");
 			}
 			else if (encoderName == "h264_qsv" || encoderName == "hevc_qsv")
 			{
 				// Intel QSV 选项
-				ffmpeg.av_dict_set(&videoEncOpts, "preset", "medium", 0);
-				Logger.Info($"QSV 选项已配置: preset=medium");
+				ffmpeg.av_dict_set(&videoEncOpts, "preset", "veryfast", 0);
+				ffmpeg.av_dict_set(&videoEncOpts, "low_power", "1", 0);  // 低功耗模式（更快）
+				ffmpeg.av_dict_set(&videoEncOpts, "look_ahead", "0", 0); // 禁用前瞻
+				Logger.Info($"QSV 选项已配置: preset=veryfast, low_power=1");
 			}
 			else if (encoderName == "h264_amf" || encoderName == "hevc_amf")
 			{
 				// AMD AMF 选项
-				ffmpeg.av_dict_set(&videoEncOpts, "quality", "balanced", 0);
-				Logger.Info($"AMF 选项已配置: quality=balanced");
+				ffmpeg.av_dict_set(&videoEncOpts, "quality", "speed", 0);
+				ffmpeg.av_dict_set(&videoEncOpts, "usage", "lowlatency", 0);  // 低延迟模式
+				ffmpeg.av_dict_set(&videoEncOpts, "preanalysis", "0", 0);     // 禁用预分析
+				Logger.Info($"AMF 选项已配置: quality=speed, usage=lowlatency");
 			}
 			
-			Generator.DebugLog("[FFmpeg] 打开视频编码器...");
 			var ret = ffmpeg.avcodec_open2(_videoCtx, videoEnc, &videoEncOpts);
-			Generator.DebugLog($"[FFmpeg] 视频编码器结果: {ret}");
 			if (ret < 0)
 			{
 				FfmpegUtils.LogIfAvError(ret, "cannot open video codec");
 				throw new InvalidOperationException($"无法打开视频编码器 {encoderName}，错误码: {ret}");
 			}
 
-			Generator.DebugLog("[FFmpeg] 配置音频编码器...");
 			_audioCtx = ffmpeg.avcodec_alloc_context3(audioEnc);
-			Generator.DebugLog("[FFmpeg] 音频上下文已分配");
 			_audioCtx->codec_type = AVMediaType.AVMEDIA_TYPE_AUDIO;
 			_audioCtx->sample_fmt = AVSampleFormat.AV_SAMPLE_FMT_FLTP;
 			// AAC 不支持任意采样率！！！！！使用已计算的标准采样率o(*￣▽￣*)ブ
@@ -356,20 +448,15 @@ public class FfmpegExporter : IExporter
 			{
 				_audioCtx->flags |= ffmpeg.AV_CODEC_FLAG_GLOBAL_HEADER;
 			}
-			Generator.DebugLog($"[FFmpeg] 音频参数: 解码器{Generator.AudioDecoderSampleRate}Hz {Generator.AudioDecoderChannelCount}ch -> 输出{_actualAudioSampleRate}Hz {Generator.AudioOutputChannelCount}ch, {_audioCtx->bit_rate}bps");
-			Generator.DebugLog("[FFmpeg] 打开音频编码器...");
 			ret = ffmpeg.avcodec_open2(_audioCtx, audioEnc, null);
-			Generator.DebugLog($"[FFmpeg] 音频编码器结果: {ret}");
 			if (ret < 0)
 			{
-				Generator.DebugLog("[FFmpeg] 警告: 音频编码器打开失败，将跳过音频");
 				_audioEnabled = false;
 			}
 			FfmpegUtils.LogIfAvError(ret, "cannot open audio codec");
 
 			// streams
 			// =======
-			Generator.DebugLog("[FFmpeg] 创建视频流...");
 			_videoStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
 			if (_videoStream == null) Logger.Error("cannot allocate video output stream");
 			_videoStream->index = (int)(_fmtCtx->nb_streams - 1);
@@ -382,7 +469,6 @@ public class FfmpegExporter : IExporter
 			// 只在音频编码器可用时创建音频流
 			if (_audioEnabled)
 			{
-				Generator.DebugLog("[FFmpeg] 创建音频流...");
 				_audioStream = ffmpeg.avformat_new_stream(_fmtCtx, null);
 				if (_audioStream == null) Logger.Error("cannot allocate audio output stream");
 				_audioStream->index = (int)(_fmtCtx->nb_streams - 1);
@@ -397,20 +483,14 @@ public class FfmpegExporter : IExporter
 			}
 			else
 			{
-				Generator.DebugLog("[FFmpeg] 跳过音频流创建（音频编码器不可用）");
 			}
-			Generator.DebugLog("[FFmpeg] 流创建完成");
 
 			// output file/stream
 			// ==================
-			Generator.DebugLog($"[FFmpeg] 打开输出文件: {Generator.OutputFilePath}");
 			ret = ffmpeg.avio_open(&_fmtCtx->pb, Generator.OutputFilePath ?? "pipe:", Generator.OutputFilePath != null ? ffmpeg.AVIO_FLAG_READ_WRITE : ffmpeg.AVIO_FLAG_WRITE);
-			Generator.DebugLog($"[FFmpeg] avio_open 结果: {ret}");
 			FfmpegUtils.LogIfAvError(ret, "cannot open stdout");
-			Generator.DebugLog("[FFmpeg] 写入文件头...");
 			AVDictionary* fmtOpts;
 			ret = ffmpeg.avformat_write_header(_fmtCtx, &fmtOpts);
-			Generator.DebugLog($"[FFmpeg] 写入头结果: {ret}");
 			FfmpegUtils.LogIfAvError(ret, "cannot write header");
 
 			byte* dictBuf = (byte*)ffmpeg.av_malloc(1024);
@@ -418,7 +498,6 @@ public class FfmpegExporter : IExporter
 
 			// video frames
 			// ============
-			Generator.DebugLog("[FFmpeg] 分配视频帧缓冲...");
 			_videoAvFrame = ffmpeg.av_frame_alloc();
 			_videoAvFrame->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
 			_videoAvFrame->width = Generator.OutputVideoWidth;
@@ -441,7 +520,6 @@ public class FfmpegExporter : IExporter
 			// ============
 			if (_audioEnabled)
 			{
-				Generator.DebugLog("[FFmpeg] 分配音频帧缓冲...");
 				
 				// 输入采样率是音频解码器的原始采样率
 				_inputAudioSampleRate = Generator.AudioDecoderSampleRate;
@@ -449,16 +527,13 @@ public class FfmpegExporter : IExporter
 				_actualAudioSampleRate = GetNearestSupportedSampleRate(Generator.AudioOutputSampleRate);
 				// 当输入和输出采样率不同时需要重采样
 				_needResample = (_inputAudioSampleRate != _actualAudioSampleRate);
-				Generator.DebugLog($"[FFmpeg] 音频重采样: {_inputAudioSampleRate}Hz (解码器) -> {_actualAudioSampleRate}Hz (输出), 需要重采样: {_needResample}");
 				
 				// Generator 每帧产生的采样数（基于解码器采样率）
 				// 解码器每帧产生: AudioDecoderSampleRate / OutputFps 个采样（每通道）
 				int inputSamplesPerChannel = Generator.AudioDecoderSampleRate / Generator.OutputFps;
-				Generator.DebugLog($"[FFmpeg] Generator 每帧采样数(每通道): {inputSamplesPerChannel} (基于解码器 {Generator.AudioDecoderSampleRate}Hz)");
 				
 				// 输入音频帧缓冲区大小需要足够容纳 AAC 帧（通常 1024 采样）
 				int audioFrameBufferSize = Math.Max(inputSamplesPerChannel, _audioCtx->frame_size);
-				Generator.DebugLog($"[FFmpeg] 音频帧缓冲区大小: {audioFrameBufferSize} (AAC帧: {_audioCtx->frame_size})");
 				
 				// 输入音频帧（使用解码器的实际声道数）
 				int inputChannels = Generator.AudioDecoderChannelCount;
@@ -471,7 +546,6 @@ public class FfmpegExporter : IExporter
 				_audioAvFrame->nb_samples = audioFrameBufferSize;
 				_audioAvFrame->time_base.num = 1;
 				_audioAvFrame->time_base.den = _actualAudioSampleRate;
-				Generator.DebugLog($"[FFmpeg] 输入帧配置: {inputChannels}ch, {_inputAudioSampleRate}Hz, {audioFrameBufferSize}samples");
 
 				ret = ffmpeg.av_frame_get_buffer(_audioAvFrame, 0);
 				FfmpegUtils.LogIfAvError(ret, "cannot allocate input audio sample buffer");
@@ -479,7 +553,6 @@ public class FfmpegExporter : IExporter
 				if (_needResample)
 				{
 					// 初始化重采样上下文
-					Generator.DebugLog("[FFmpeg] 初始化音频重采样上下文...");
 					
 					// 初始化重采样上下文（在 unsafe 上下文中局部变量已固定）
 					// 输入：使用解码器的声道数
@@ -500,7 +573,6 @@ public class FfmpegExporter : IExporter
 					
 					ret = ffmpeg.swr_init(_swrCtx);
 					FfmpegUtils.LogIfAvError(ret, "cannot init swr context");
-					Generator.DebugLog($"[FFmpeg] 重采样上下文初始化完成: {_inputAudioSampleRate}Hz {inputChannels}ch -> {_actualAudioSampleRate}Hz {outputChannels}ch");
 					
 					// 分配重采样后的输出帧
 					_resampledAudioFrame = ffmpeg.av_frame_alloc();
@@ -524,7 +596,6 @@ public class FfmpegExporter : IExporter
 				// 音频队列缓冲长度 = 每通道采样数 × 实际声道数
 				int audioQueueLength = inputSamplesPerChannel * inputChannels;
 				_audioQueue.BufferLength = audioQueueLength;
-				Generator.DebugLog($"[FFmpeg] 音频队列长度: {audioQueueLength}, AAC帧大小: {_audioCtx->frame_size}, 输入帧采样数(每通道): {inputSamplesPerChannel}, 输入声道数: {inputChannels}");
 				
 				int aacFrameSize = _audioCtx->frame_size; // AAC 通常是 1024
 				
@@ -540,7 +611,6 @@ public class FfmpegExporter : IExporter
 				float[] tempResampleL = new float[inputSamplesPerChannel * resampleRatio + 1024];
 				float[] tempResampleR = new float[inputSamplesPerChannel * resampleRatio + 1024];
 				
-				Generator.DebugLog($"[FFmpeg] 重采样比率: {resampleRatio}, 输出缓冲区大小: {outputBufferSize}");
 				
 				_audioQueue.OutputCallback = (buf) =>
 				{
@@ -684,7 +754,6 @@ public class FfmpegExporter : IExporter
 			}
 			else
 			{
-				Generator.DebugLog("[FFmpeg] 跳过音频帧缓冲分配（音频编码器不可用）");
 			}
 
 			Logger.Debug($"video original linesize = {_videoAvFramePre->linesize[0]} {_videoAvFramePre->linesize[1]}");
@@ -705,7 +774,6 @@ public class FfmpegExporter : IExporter
 			}
 
 			ffmpeg.av_dump_format(_fmtCtx, 0, Generator.OutputFilePath ?? "pipe:", 1);
-			Generator.DebugLog("[FFmpeg] 初始化完成！");
 		}
 		_init = true;
 	}
@@ -770,21 +838,138 @@ public class FfmpegExporter : IExporter
 		if (!_init)
 		{
 			InitializeFfmpeg();
-			Generator.DebugLog("[FFmpeg] 开始推送第一帧...");
+			StartAsyncEncoder();
+		}
+		
+		// 获取或创建帧数据对象（从对象池）
+		if (!_framePool.TryTake(out var pendingFrame))
+		{
+			pendingFrame = new PendingFrame();
+		}
+		
+		// 获取或创建像素缓冲区（从对象池）
+		int pixelSize = videoFrame.Width * videoFrame.Height * 4;
+		if (!_pixelBufferPool.TryTake(out var pixelBuffer) || pixelBuffer.Length < pixelSize)
+		{
+			pixelBuffer = new byte[pixelSize];
+		}
+		
+		// 复制像素数据
+		videoFrame.CopyPixelDataTo(pixelBuffer);
+		pendingFrame.PixelData = pixelBuffer;
+		pendingFrame.Width = videoFrame.Width;
+		pendingFrame.Height = videoFrame.Height;
+		
+		// 复制音频数据
+		if (_audioEnabled && audioFrame != null)
+		{
+			var audioData = audioFrame.ToArray();
+			if (!_audioBufferPool.TryTake(out var audioBuffer) || audioBuffer.Length < audioData.Length)
+			{
+				audioBuffer = new float[audioData.Length];
+			}
+			Array.Copy(audioData, audioBuffer, audioData.Length);
+			pendingFrame.AudioSamples = audioBuffer;
+			pendingFrame.AudioSampleCount = audioData.Length;
+			pendingFrame.AudioChannels = audioFrame.ChannelCount;
+		}
+		else
+		{
+			pendingFrame.AudioSamples = null;
+		}
+		
+		// 设置 PTS
+		pendingFrame.VideoPts = _frameNum;
+		
+		// 将帧加入编码 Channel（高性能非阻塞）
+		if (!_frameChannel.Writer.TryWrite(pendingFrame))
+		{
+			// Channel 满了，等待写入
+			_frameChannel.Writer.WriteAsync(pendingFrame).AsTask().Wait();
 		}
 
+		if (_frameNum % 50 == 0)
+		{
+			Logger.Trace($"frame {_frameNum}, ts {_frameNum / Generator.OutputFps}, speed {(int)(1/delta)} fps\x1b[K\x1b[G");
+		}
+
+		_frameNum++;
+	}
+	
+	// 启动异步编码线程
+	private void StartAsyncEncoder()
+	{
+		// 使用高性能 Channel（比 BlockingCollection 快 2-3 倍）
+		_frameChannel = Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(MaxQueueSize)
+		{
+			FullMode = BoundedChannelFullMode.Wait,
+			SingleReader = true,
+			SingleWriter = true
+		});
+		_encoderCts = new CancellationTokenSource();
+		
+		// 预分配对象池（减少 GC）
+		int pixelSize = Generator.OutputVideoWidth * Generator.OutputVideoHeight * 4;
+		int audioSize = Generator.AudioDecoderSampleRate / Generator.OutputFps * Generator.AudioDecoderChannelCount * 2;
+		for (int i = 0; i < PreallocPoolSize; i++)
+		{
+			_framePool.Add(new PendingFrame());
+			_pixelBufferPool.Add(new byte[pixelSize]);
+			_audioBufferPool.Add(new float[audioSize]);
+		}
+		
+		// 强制进行一次完整 GC，清理启动时的临时对象
+		GC.Collect(2, GCCollectionMode.Forced, true, true);
+		GC.WaitForPendingFinalizers();
+		
+		// 高优先级线程运行编码器
+		_encoderTask = Task.Factory.StartNew(AsyncEncoderLoop, _encoderCts.Token, 
+			TaskCreationOptions.LongRunning, TaskScheduler.Default);
+		
+		Logger.Info($"高性能编码器已启动，Channel 缓冲: {MaxQueueSize} 帧，预分配池: {PreallocPoolSize} 对象");
+	}
+	
+	// 异步编码循环（在后台线程运行）
+	private async void AsyncEncoderLoop()
+	{
+		// 设置线程优先级为高
+		Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+		
+		try
+		{
+			await foreach (var frame in _frameChannel.Reader.ReadAllAsync(_encoderCts.Token))
+			{
+				EncodeFrameSync(frame);
+				ReturnToPool(frame);
+			}
+		}
+		catch (OperationCanceledException)
+		{
+			// 正常取消
+		}
+		catch (Exception ex)
+		{
+			Logger.Error($"异步编码器错误: {ex.Message}");
+		}
+	}
+	
+	// 同步编码单帧
+	private unsafe void EncodeFrameSync(PendingFrame frame)
+	{
 		var ret = ffmpeg.av_frame_make_writable(_videoAvFrame);
 		FfmpegUtils.LogIfAvError(ret, "cannot make video pixel data writable");
 		ret = ffmpeg.av_frame_make_writable(_audioAvFrame);
 		FfmpegUtils.LogIfAvError(ret, "cannot make audio sample buffer writable");
 
-		// 音频 PTS 现在在 _audioQueue.OutputCallback 中设置
-
-		// TODO: move to init method
+		// 初始化色彩转换上下文（使用最快的点采样算法）
 		if (_swsCtx == null)
 		{
-			// SWS_BILINEAR = 2
-			_swsCtx = ffmpeg.sws_getContext(videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFramePre->format, videoFrame.Width, videoFrame.Height, (AVPixelFormat)_videoAvFrame->format, 2, null, null, null);
+			// SWS_POINT = 0x10 = 最快的点采样（无插值）
+			// SWS_FAST_BILINEAR = 1 = 快速双线性（稍慢但更平滑）
+			const int SWS_POINT = 0x10;
+			_swsCtx = ffmpeg.sws_getContext(frame.Width, frame.Height, 
+				(AVPixelFormat)_videoAvFramePre->format, frame.Width, frame.Height, 
+				(AVPixelFormat)_videoAvFrame->format, SWS_POINT, null, null, null);
 			if (_swsCtx == null)
 			{
 				Logger.Error("cannot initialize sws context");
@@ -793,85 +978,161 @@ public class FfmpegExporter : IExporter
 
 		if (_swsCtx != null)
 		{
-			// 复用像素数据缓冲区
-			int requiredSize = videoFrame.Width * videoFrame.Height * 4;
-			if (_pixelDataBuffer == null || _pixelDataBuffer.Length < requiredSize)
-			{
-				_pixelDataBuffer = new byte[requiredSize];
-			}
-			videoFrame.CopyPixelDataTo(_pixelDataBuffer);
-
-			// 使用正确的 linesize 进行 sws_scale
-			// 输入数据的 linesize 是 width * 4 (RGBA)
-			int srcLinesize = videoFrame.Width * 4;
+			int srcLinesize = frame.Width * 4;
 			
-			fixed (byte* srcData = _pixelDataBuffer)
+			fixed (byte* srcData = frame.PixelData)
 			{
-				// 创建源数据指针数组
 				byte_ptrArray8 srcDataArray = new byte_ptrArray8();
 				srcDataArray[0] = srcData;
 				
-				// 创建源 linesize 数组
 				int_array8 srcLinesizeArray = new int_array8();
 				srcLinesizeArray[0] = srcLinesize;
 				
-				ffmpeg.sws_scale(_swsCtx, srcDataArray, srcLinesizeArray, 0, videoFrame.Height, _videoAvFrame->data, _videoAvFrame->linesize);
+				ffmpeg.sws_scale(_swsCtx, srcDataArray, srcLinesizeArray, 0, frame.Height, 
+					_videoAvFrame->data, _videoAvFrame->linesize);
 			}
-		}
-		else if (_videoAvFrame->format == (int)AVPixelFormat.AV_PIX_FMT_GBRP)
-		{
-			// Unoptimized pixel copy.
-			videoFrame.ProcessPixelRows((pa) =>
-			{
-				for (int y = 0; y < pa.Height; y++)
-				{
-					var row = pa.GetRowSpan(y);
-
-					for (int x = 0; x < pa.Width; x++)
-					{
-						var p = row[x];
-						_videoAvFrame->data[0][_videoAvFrame->linesize[0] * y + x] = p.G;
-						_videoAvFrame->data[1][_videoAvFrame->linesize[1] * y + x] = p.B;
-						_videoAvFrame->data[2][_videoAvFrame->linesize[2] * y + x] = p.R;
-					}
-				}
-			});
 		}
 
 		_videoAvFrame->time_base.num = _videoCtx->time_base.num;
 		_videoAvFrame->time_base.den = _videoCtx->time_base.den;
-		// 视频 PTS 直接使用帧号，time_base 已设为 1/fps
-		// 这确保视频帧精确对应每个时间点，与音频独立计算
-		_videoAvFrame->pts = _frameNum;
+		_videoAvFrame->pts = frame.VideoPts;
 		_videoAvFrame->duration = 1;
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
 
-		// 只在音频编码器可用时处理音频
-		if (_audioEnabled)
+		// 处理音频（使用 ArrayPool 减少 GC）
+		if (_audioEnabled && frame.AudioSamples != null && frame.AudioSampleCount > 0)
 		{
-			_audioQueue.Push(audioFrame.ToArray());
+			// 使用 ArrayPool 租用缓冲区
+			var audioCopy = ArrayPool<float>.Shared.Rent(frame.AudioSampleCount);
+			Array.Copy(frame.AudioSamples, audioCopy, frame.AudioSampleCount);
+			_audioQueue.Push(new ArraySegment<float>(audioCopy, 0, frame.AudioSampleCount).ToArray());
+			ArrayPool<float>.Shared.Return(audioCopy);
 		}
-
-		if (_frameNum % 10 == 0)
+	}
+	
+	// 将帧数据对象归还到对象池
+	private void ReturnToPool(PendingFrame frame)
+	{
+		// 像素缓冲区可以安全归还
+		if (frame.PixelData != null)
 		{
-			Logger.Trace($"frame {_frameNum}, ts {_frameNum / Generator.OutputFps}, framegen speed {(int)(1/delta)} fps\x1b[K\x1b[G");
+			_pixelBufferPool.Add(frame.PixelData);
+			frame.PixelData = null;
 		}
-
-		_frameNum++;
+		// 音频缓冲区也可以归还（数据已经被复制）
+		if (frame.AudioSamples != null)
+		{
+			_audioBufferPool.Add(frame.AudioSamples);
+			frame.AudioSamples = null;
+		}
+		_framePool.Add(frame);
 	}
 
 	public unsafe void Finish()
 	{
-		Logger.Debug("Flushing streams…");
-		DoEncode(_videoCtx, _videoStream, null, _videoAvPacket);
-		// 只在音频编码器可用时刷新音频流
-		if (_audioEnabled)
+		Logger.Debug("等待异步编码器完成...");
+		
+		// 停止接受新帧并等待 Channel 清空
+		if (_frameChannel != null)
 		{
-			DoEncode(_audioCtx, _audioStream, null, _audioAvPacket);
+			_frameChannel.Writer.Complete();
+			try
+			{
+				// 等待编码器线程完成所有待处理帧
+				_encoderTask?.Wait(TimeSpan.FromMinutes(5));
+			}
+			catch (AggregateException ex)
+			{
+				Logger.Error($"编码器线程异常: {ex.InnerException?.Message}");
+			}
+			finally
+			{
+				_encoderCts?.Cancel();
+				_encoderCts?.Dispose();
+			}
+		}
+		
+		Logger.Debug("Flushing streams…");
+		// 刷新视频编码器（发送 null 帧触发编码器输出所有缓冲的帧）
+		if (_videoCtx != null && _videoStream != null && _videoAvPacket != null)
+		{
+			try
+			{
+				DoEncode(_videoCtx, _videoStream, null, _videoAvPacket);
+			}
+			catch (Exception ex)
+			{
+				Logger.Error($"视频流刷新失败: {ex.Message}");
+			}
+		}
+		// 只在音频编码器可用时刷新音频流
+		if (_audioEnabled && _audioCtx != null && _audioStream != null && _audioAvPacket != null)
+		{
+			try
+			{
+				DoEncode(_audioCtx, _audioStream, null, _audioAvPacket);
+			}
+			catch (Exception ex)
+			{
+				Logger.Error($"音频流刷新失败: {ex.Message}");
+			}
 		}
 
 		Logger.Debug("Freeing FFmpeg resources…");
-		ffmpeg.sws_freeContext(_swsCtx);
+		
+		// 重要：必须先写入文件尾（在释放编码器之前）
+		if (_fmtCtx != null)
+		{
+			try
+			{
+				ffmpeg.av_write_trailer(_fmtCtx);
+			}
+			catch (Exception ex)
+			{
+				Logger.Error($"av_write_trailer 失败: {ex.Message}");
+			}
+		}
+		
+		// 释放视频帧和包
+		if (_videoAvFrame != null)
+		{
+			var frame = _videoAvFrame;
+			ffmpeg.av_frame_free(&frame);
+			_videoAvFrame = null;
+		}
+		if (_videoAvFramePre != null)
+		{
+			var frame = _videoAvFramePre;
+			ffmpeg.av_frame_free(&frame);
+			_videoAvFramePre = null;
+		}
+		if (_videoAvPacket != null)
+		{
+			var packet = _videoAvPacket;
+			ffmpeg.av_packet_free(&packet);
+			_videoAvPacket = null;
+		}
+		
+		// 释放音频帧和包
+		if (_audioAvFrame != null)
+		{
+			var frame = _audioAvFrame;
+			ffmpeg.av_frame_free(&frame);
+			_audioAvFrame = null;
+		}
+		if (_audioAvPacket != null)
+		{
+			var packet = _audioAvPacket;
+			ffmpeg.av_packet_free(&packet);
+			_audioAvPacket = null;
+		}
+		
+		// 释放色彩转换上下文
+		if (_swsCtx != null)
+		{
+			ffmpeg.sws_freeContext(_swsCtx);
+			_swsCtx = null;
+		}
 		
 		// 释放音频重采样资源
 		if (_swrCtx != null)
@@ -887,18 +1148,41 @@ public class FfmpegExporter : IExporter
 			_resampledAudioFrame = null;
 		}
 		
-		var videoCtx = _videoCtx;
-		ffmpeg.avcodec_free_context(&videoCtx);
-		var audioCtx = _audioCtx;
-		ffmpeg.avcodec_free_context(&audioCtx);
-
-		ffmpeg.av_write_trailer(_fmtCtx);
-
-		if ((_fmtCtx->flags & ffmpeg.AVFMT_NOFILE) == 0)
+		// 释放视频编码器上下文
+		if (_videoCtx != null)
 		{
-			ffmpeg.avio_closep(&_fmtCtx->pb);
+			var videoCtx = _videoCtx;
+			ffmpeg.avcodec_free_context(&videoCtx);
+			_videoCtx = null;
+		}
+		
+		// 释放音频编码器上下文
+		if (_audioCtx != null)
+		{
+			var audioCtx = _audioCtx;
+			ffmpeg.avcodec_free_context(&audioCtx);
+			_audioCtx = null;
 		}
 
-		ffmpeg.avformat_free_context(_fmtCtx);
+		// 关闭输出文件并释放格式上下文
+		if (_fmtCtx != null)
+		{
+			try
+			{
+				if ((_fmtCtx->flags & ffmpeg.AVFMT_NOFILE) == 0 && _fmtCtx->pb != null)
+				{
+					ffmpeg.avio_closep(&_fmtCtx->pb);
+				}
+			}
+			catch (Exception ex)
+			{
+				Logger.Error($"avio_closep 失败: {ex.Message}");
+			}
+
+			ffmpeg.avformat_free_context(_fmtCtx);
+			_fmtCtx = null;
+		}
+		
+		Logger.Info("FFmpeg 资源释放完成");
 	}
 }

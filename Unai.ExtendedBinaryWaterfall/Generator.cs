@@ -906,7 +906,7 @@ public class Generator
     public float SpectrumSmoothing { get; set; } = 0.6f; // 频谱平滑系数，范围 0.1~1
 
     [CliParameter("FFT size for spectrum analysis (power of 2)", "fft-size")]
-    public int FftSize { get; set; } = 2048; // FFT 大小，必须是 2 的幂次方，范围 512~8192
+    public int FftSize { get; set; } = 4096; // FFT 大小，必须是 2 的幂次方，范围 512~8192
 
     [CliParameter("Intro fade duration in seconds", "intro-fade-duration")]
     public float IntroFadeDuration { get; set; } = 1.0f; // 开头免责声明的淡入淡出时长（秒）
@@ -2956,17 +2956,14 @@ public class Generator
     // 频谱绘制：使用历史缓冲实现大 FFT 窗口 + 对数频率映射 + 时间平滑
     private void DrawSpectrum(IImageProcessingContext ctx, RectangleF region, float[] samples)
     {
-        // 使用可配置的 FFT 大小（确保是 2 的幂次方）
         int fftSize = GetValidFftSize();
         
-        // 初始化或重置历史缓冲
         if (_audioHistoryBuffer == null || _audioHistoryBuffer.Length != fftSize)
         {
             _audioHistoryBuffer = new float[fftSize];
             _audioHistoryWritePos = 0;
         }
         
-        // 将当前帧样本追加到历史缓冲（循环写入）
         for (int i = 0; i < samples.Length; i++)
         {
             _audioHistoryBuffer[_audioHistoryWritePos] = samples[i];
@@ -2976,7 +2973,6 @@ public class Generator
         int n = fftSize;
         int halfN = n / 2;
 
-        // 复用 FFT 缓冲区
         if (_fftReal == null || _fftReal.Length != n)
         {
             _fftReal = new double[n];
@@ -2984,10 +2980,8 @@ public class Generator
             _fftMagnitudes = new float[halfN];
         }
 
-        // 预计算 Hann 窗口
         PrecomputeHannWindow(n);
 
-        // 准备 FFT 输入：从历史缓冲提取 + 预计算的 Hann 窗
         for (int i = 0; i < n; i++)
         {
             int idx = (_audioHistoryWritePos + i) % n;
@@ -2995,22 +2989,17 @@ public class Generator
             _fftImag[i] = 0;
         }
 
-        // 执行 SIMD 加速的快速 FFT
         ComputeFFT(_fftReal, _fftImag, n);
-
-        // 使用 SIMD 加速计算幅度谱
         ComputeMagnitudesSimd(_fftReal, _fftImag, _fftMagnitudes, halfN, n);
 
-        // 频率范围：30Hz ~ 18kHz
+        // 频率范围：20Hz ~ 采样率/2（覆盖完整频谱）
         float freqPerBin = (float)AudioOutputSampleRate / n;
-        float minFreq = 30f;
-        float maxFreq = Math.Min(18000f, AudioOutputSampleRate / 2f * 0.9f);
+        float minFreq = 20f;
+        float maxFreq = AudioOutputSampleRate / 2f * 0.98f;
 
-        // 频谱柱
         int barCount = Math.Clamp(SpectrumBarCount, 16, 128);
         float[] bars = new float[barCount];
 
-        // 对数频率映射：每个柱对应不同的频率范围
         float logMin = (float)Math.Log10(minFreq);
         float logMax = (float)Math.Log10(maxFreq);
         float logRange = logMax - logMin;
@@ -3022,26 +3011,22 @@ public class Generator
             float freqLo = (float)Math.Pow(10, logMin + t0 * logRange);
             float freqHi = (float)Math.Pow(10, logMin + t1 * logRange);
 
-            // 转换为 FFT bin 索引（使用浮点数以支持插值）
             float binLo = freqLo / freqPerBin;
             float binHi = freqHi / freqPerBin;
             int bin0 = Math.Max(1, (int)binLo);
             int bin1 = Math.Min(halfN - 1, (int)Math.Ceiling(binHi));
             if (bin1 < bin0) bin1 = bin0;
 
-            // 取该范围内的最大幅度
             float maxMag = 0f;
             for (int k = bin0; k <= bin1; k++)
             {
                 if (_fftMagnitudes[k] > maxMag) maxMag = _fftMagnitudes[k];
             }
 
-            // 对数功率刻度（dB）：-60dB ~ 0dB 映射到 0 ~ 1
             float db = 20f * (float)Math.Log10(maxMag + 1e-10f);
             bars[i] = Math.Clamp((db + 60f) / 60f, 0f, 1f);
         }
 
-        // 时间平滑 (attack!!!!!release~~~~)
         if (_smoothedSpectrum == null || _smoothedSpectrum.Length != barCount)
         {
             _smoothedSpectrum = new float[barCount];
@@ -3052,25 +3037,20 @@ public class Generator
         for (int i = 0; i < barCount; i++)
         {
             if (bars[i] > _smoothedSpectrum[i])
-            {
                 _smoothedSpectrum[i] = _smoothedSpectrum[i] * 0.2f + bars[i] * 0.8f;
-            }
             else
-            {
                 _smoothedSpectrum[i] = _smoothedSpectrum[i] * release + bars[i] * (1f - release);
-            }
         }
 
-        // 绘制
         float barWidth = region.Width / barCount;
         float gap = barWidth * 0.15f;
         float actualWidth = barWidth - gap;
 
-        // 每隔几个柱形批量绘制
         for (int i = 0; i < barCount; i++)
         {
+            float h = _smoothedSpectrum[i] * region.Height;
+            if (h < 0.5f) continue;
             float x = region.Left + i * barWidth + gap / 2f;
-            float h = Math.Max(2f, _smoothedSpectrum[i] * region.Height);
             float y = region.Top + region.Height - h;
             ctx.Fill(Color.White, new RectangleF(x, y, actualWidth, h));
         }
@@ -3078,8 +3058,6 @@ public class Generator
 
     private string BuildSubfileDisplayLine(SubFile subfile)
     {
-        // 构造单行显示文本：Disc.Track- Title // Artist [Genre]
-        // 按需省略符号，保持在一行内，最终再由外层做截断
         if (subfile == null)
         {
             return string.Empty;

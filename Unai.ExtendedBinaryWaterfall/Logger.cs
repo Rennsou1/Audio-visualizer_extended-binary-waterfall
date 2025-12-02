@@ -13,13 +13,37 @@ public static class Logger
 
 	public static bool UseColor { get; set; } = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NOCOLOR"));
 	
-	// 日志文件路径 EXE 同级目录
-	private static readonly string LogFilePath = Path.Combine(
+	// 日志文件夹路径：EXE 同级目录下的 logs 文件夹
+	private static readonly string LogFolder = Path.Combine(
 		Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, 
-		"performance.log");
+		"logs");
+	// 日志文件路径（按日期命名）
+	private static readonly string LogFilePath;
 	private static readonly object _logLock = new();
 	// 是否启用文件日志
 	public static bool EnableFileLog { get; set; } = true;
+	// 是否记录所有日志到文件（默认开启）
+	public static bool LogAllToFile { get; set; } = true;
+	
+	// 静态构造函数：初始化日志文件夹和文件
+	static Logger()
+	{
+		try
+		{
+			// 确保日志文件夹存在
+			if (!Directory.Exists(LogFolder))
+			{
+				Directory.CreateDirectory(LogFolder);
+			}
+			// 按日期命名日志文件
+			LogFilePath = Path.Combine(LogFolder, $"app_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+		}
+		catch
+		{
+			// 如果创建失败，使用临时目录
+			LogFilePath = Path.Combine(Path.GetTempPath(), $"AudioVisualizer_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+		}
+	}
 
 	private static void Print(string message, LogLevel logLevel, StackFrame sf)
 	{
@@ -34,11 +58,12 @@ public static class Logger
 			LogLevel.Trace => "\x1b[32m",
 			_ => "\x1b[0m",
 		};
-		var logLine = $"{source} {message}";
+		var levelName = logLevel.ToString().ToUpper();
+		var logLine = $"[{levelName}] {source} {message}";
 		Console.Error.WriteLine(UseColor ? $"\x1b[90m{source} {logLevelAnsiColor}{message}\x1b[0m" : logLine);
 		
-		// 性能相关日志
-		if (EnableFileLog && (message.Contains("[性能]") || message.Contains("[渲染性能]")))
+		// 写入日志文件
+		if (EnableFileLog && LogAllToFile)
 		{
 			lock (_logLock)
 			{

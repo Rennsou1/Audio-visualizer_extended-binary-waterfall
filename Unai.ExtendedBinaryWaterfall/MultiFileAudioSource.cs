@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using CSCore;
 using CSCore.Codecs;
+using CSCore.MediaFoundation;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
@@ -57,7 +58,8 @@ public class MultiFileAudioSource : ISampleSource
             try
             {
                 using var tempSource = CodecFactory.Instance.GetCodec(filePath);
-                using var tempSample = tempSource.ToSampleSource();
+                // 安全转换为 ISampleSource（支持 ADPCM 等特殊格式）
+                using var tempSample = SafeToSampleSource(tempSource, filePath);
                 
                 long fileLength = tempSample.Length;
                 _fileOffsets.Add(_totalLength);
@@ -85,7 +87,8 @@ public class MultiFileAudioSource : ISampleSource
 
         // 打开新文件
         _currentWaveSource = CodecFactory.Instance.GetCodec(_filePaths[index]);
-        _currentSampleSource = _currentWaveSource.ToSampleSource();
+        // 安全转换为 ISampleSource（支持 ADPCM 等特殊格式）
+        _currentSampleSource = SafeToSampleSource(_currentWaveSource, _filePaths[index]);
         _currentFileIndex = index;
     }
 
@@ -181,6 +184,43 @@ public class MultiFileAudioSource : ISampleSource
             _currentSampleSource?.Dispose();
             _currentWaveSource?.Dispose();
             _isDisposed = true;
+        }
+    }
+    
+    // 安全地将 IWaveSource 转换为 ISampleSource，支持更多音频格式
+    private static ISampleSource SafeToSampleSource(IWaveSource waveSource, string filePath)
+    {
+        var wf = waveSource.WaveFormat;
+        // 记录音频格式信息（使用 Info 确保 Release 版本也输出）
+        string fileName = Path.GetFileName(filePath);
+        Logger.Info($"[音频] {fileName}: SampleRate={wf.SampleRate}, Channels={wf.Channels}, Bits={wf.BitsPerSample}, Tag={wf.WaveFormatTag}");
+        
+        try
+        {
+            // 首先尝试直接转换
+            var result = waveSource.ToSampleSource();
+            Logger.Info($"[音频] {fileName}: 转换成功 (直接)");
+            return result;
+        }
+        catch (NotSupportedException ex)
+        {
+            // 格式不支持时，尝试使用 MediaFoundationDecoder 重新解码
+            Logger.Warning($"[音频] {fileName}: 直接转换失败 ({ex.Message})，尝试 MediaFoundation");
+            try
+            {
+                waveSource.Dispose();
+                var mfDecoder = new MediaFoundationDecoder(filePath);
+                var mfWf = mfDecoder.WaveFormat;
+                Logger.Info($"[音频] {fileName}: MF 格式: SampleRate={mfWf.SampleRate}, Channels={mfWf.Channels}, Bits={mfWf.BitsPerSample}");
+                var result = mfDecoder.ToSampleSource();
+                Logger.Info($"[音频] {fileName}: 转换成功 (MediaFoundation)");
+                return result;
+            }
+            catch (Exception mfEx)
+            {
+                Logger.Error($"[音频] {fileName}: MediaFoundation 也失败: {mfEx.Message}");
+                throw;
+            }
         }
     }
 }

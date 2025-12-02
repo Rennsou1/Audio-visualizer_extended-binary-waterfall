@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using CSCore;
 using CSCore.Codecs;
+using CSCore.MediaFoundation;
 using SkiaSharp;
 using Unai.ExtendedBinaryWaterfall.Exporters;
 using Unai.ExtendedBinaryWaterfall.Parsers;
@@ -108,7 +109,10 @@ public class Generator
     // 高级切换动画状态（基于时间）
     private string _prevDisplayInfo = "";         // 前一首显示信息（用于字符动画）
     private string _prevTimeString = "";          // 前一首时间字符串
+    private string _currentDisplayInfo = "";      // 当前显示信息（每帧更新，用于快速切换时保存）
+    private string _currentTimeString = "";       // 当前时间字符串
     private float[] _prevWaveformPeaks = null;    // 前一首波形数据
+    private float[] _currentWaveformPeaks = null; // 当前波形数据
     private SKBitmap _prevScaledCover = null;     // 前一首缩放后的封面
     private byte[] _prevCoverHash = null;         // 前一首封面哈希（用于判断是否相同）
     private double _animationStartTime = -1;      // 动画开始时间（秒）
@@ -542,8 +546,14 @@ public class Generator
     [CliParameter("Spectrum bar count", "spectrum-bars")]
     public int SpectrumBarCount { get; set; } = 64; // 频谱柱数量，范围 8~1024
 
-    [CliParameter("Spectrum smoothing factor", "spectrum-smoothing")]
-    public float SpectrumSmoothing { get; set; } = 0.6f; // 频谱平滑系数，范围 0.1~1
+    [CliParameter("Spectrum smoothing factor (deprecated, use attack/release)", "spectrum-smoothing")]
+    public float SpectrumSmoothing { get; set; } = 0.6f; // 频谱平滑系数（已弃用）
+
+    [CliParameter("Spectrum attack time in milliseconds", "spectrum-attack-ms")]
+    public float SpectrumAttackMs { get; set; } = 10f; // 频谱上升时间（毫秒），值越小响应越快
+
+    [CliParameter("Spectrum release time in milliseconds", "spectrum-release-ms")]
+    public float SpectrumReleaseMs { get; set; } = 150f; // 频谱下降时间（毫秒），值越大弹动越慢
 
     [CliParameter("FFT size for spectrum analysis (power of 2)", "fft-size")]
     public int FftSize { get; set; } = 4096; // FFT 大小，必须是 2 的幂次方，范围 512~8192
@@ -625,7 +635,68 @@ public class Generator
         _strokePaint.IsAntialias = _fontAntialiasing;
         _textPaint.IsAntialias = _fontAntialiasing;
 
+        // JIT 预热：预先编译热点代码路径，避免渲染开始时的性能抖动
+        WarmupRenderingPipeline();
+
         LogGeneratorStatus();
+    }
+
+    // JIT 预热：执行关键渲染路径以触发 JIT 编译
+    private void WarmupRenderingPipeline()
+    {
+        Logger.Info("Warming up rendering pipeline...");
+        var sw = Stopwatch.StartNew();
+        
+        using (var warmupBitmap = new SKBitmap(OutputVideoWidth, OutputVideoHeight, SKColorType.Bgra8888, SKAlphaType.Premul))
+        using (var warmupCanvas = new SKCanvas(warmupBitmap))
+        {
+            warmupCanvas.Clear(SKColors.Black);
+            _fillPaint.Color = SKColors.White;
+            warmupCanvas.DrawRect(0, 0, 100, 100, _fillPaint);
+            _textPaint.TextSize = _fontSize32;
+            _textPaint.Typeface = _typeface;
+            warmupCanvas.DrawText("Warmup 预热 0123456789", 0, 50, _textPaint);
+            using var shader = SKShader.CreateLinearGradient(
+                new SKPoint(0, 0), new SKPoint(100, 100),
+                new[] { SKColors.Black, SKColors.White },
+                SKShaderTileMode.Clamp);
+            _gradientPaint.Shader = shader;
+            warmupCanvas.DrawRect(0, 0, 100, 100, _gradientPaint);
+            _gradientPaint.Shader = null;
+        }
+        
+        if (_reusableVideoBuffer == null || _reusableVideoBuffer.Length < WaterfallFrameLength)
+            _reusableVideoBuffer = new byte[WaterfallFrameLength];
+        for (int i = 0; i < Math.Min(1000, _reusableVideoBuffer.Length); i++)
+            _reusableVideoBuffer[i] = (byte)(i & 0xFF);
+        
+        if (_smoothedSpectrum == null || _smoothedSpectrum.Length != SpectrumBarCount)
+            _smoothedSpectrum = new float[SpectrumBarCount];
+        for (int i = 0; i < SpectrumBarCount; i++)
+            _smoothedSpectrum[i] = (float)Math.Sin(i * 0.1) * 0.5f + 0.5f;
+        
+        MeasureTextWidth("Test 测试 0123456789 // Artist [Genre]", _fontSize32);
+        MeasureTextWidth("00:00 / 00:00", _fontSize24);
+        
+        // 预热常用文本的 SKTextBlob 缓存（使用临时 canvas 触发缓存创建）
+        using (var textWarmupBitmap = new SKBitmap(800, 200, SKColorType.Bgra8888, SKAlphaType.Premul))
+        using (var textWarmupCanvas = new SKCanvas(textWarmupBitmap))
+        {
+            // 预热固定标签（这些文本每帧都会用到）
+            string[] commonLabels = { "Title:", "Time:", "A/V SETTINGS", "ABS. OFFSET", "BITRATE", "Composer:", "Genre:", "▶", "♪" };
+            foreach (var label in commonLabels)
+            {
+                textWarmupCanvas.DrawTextAndCache(_typeface, _fontSize16, label, 0, 50, SKColors.White);
+                textWarmupCanvas.DrawTextAndCache(_typeface, _fontSize24, label, 0, 100, SKColors.White);
+            }
+            // 预热数字和常用字符
+            textWarmupCanvas.DrawTextAndCache(_typeface, _fontSize32, "0123456789:/ MiBx", 0, 50, SKColors.White);
+            textWarmupCanvas.DrawTextAndCache(_typeface, _fontSize24, "0123456789:/ MiBx%", 0, 100, SKColors.White);
+            textWarmupCanvas.DrawTextAndCache(_typeface, _fontSize48, "0123456789", 0, 150, SKColors.White);
+        }
+        
+        sw.Stop();
+        Logger.Info($"Warmup completed in {sw.ElapsedMilliseconds}ms");
     }
 
     // 多文件音频源（当 InputFilePaths 有多个文件时使用）
@@ -712,7 +783,7 @@ public class Generator
                     }
                 }
 
-                _audioSampleSource = _audioWaveSource.ToSampleSource();
+                _audioSampleSource = SafeToSampleSource(_audioWaveSource, InputFilePath);
             }
             
             // 恢复用户期望的输出设置
@@ -740,6 +811,32 @@ public class Generator
 
             _inputAudioBuffer = new(AudioInputSamplesPerFramePerChannel, AudioInputChannelCount);
             _outputAudioBuffer = new(AudioOutputSamplesPerFramePerChannel, AudioOutputChannelCount);
+        }
+    }
+
+    // 安全地将 IWaveSource 转换为 ISampleSource，支持更多音频格式
+    private ISampleSource SafeToSampleSource(IWaveSource waveSource, string filePath)
+    {
+        try
+        {
+            // 首先尝试直接转换
+            return waveSource.ToSampleSource();
+        }
+        catch (NotSupportedException ex) when (ex.Message.Contains("WaveformatTag"))
+        {
+            // 格式不支持时，尝试使用 MediaFoundationDecoder 重新解码
+            Logger.Warning($"音频格式不支持直接转换，尝试使用 MediaFoundation 解码: {filePath}");
+            try
+            {
+                waveSource.Dispose();
+                var mfDecoder = new MediaFoundationDecoder(filePath);
+                return mfDecoder.ToSampleSource();
+            }
+            catch (Exception mfEx)
+            {
+                Logger.Error($"MediaFoundation 解码也失败: {mfEx.Message}");
+                throw new NotSupportedException($"无法解码音频文件: {filePath}\n原因: {ex.Message}", ex);
+            }
         }
     }
 
@@ -1781,10 +1878,11 @@ public class Generator
             float listTop = rightPanelTop;
             float listBottom = listTop + listHeight;
 
-            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex - 2));
-            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)Math.Ceiling(subfileWindowIndex + 7));
+            int firstSubfileIndex = Math.Max(0, (int)(subfileWindowIndex));
+            int lastSubfileIndex = Math.Min(_subfiles.Count - 1, (int)Math.Ceiling(subfileWindowIndex + 9));
             float subfileRowH = 36f * s;
-            float subfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
+            // 列表起始位置：从 listTop 开始，第一行在中间位置
+            float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
             float minSubfileY = rightPanelTop;
 
             // 直接绘制子文件列表（预渲染缓存反而更慢）
@@ -2067,41 +2165,66 @@ public class Generator
         // 检测歌曲切换（注意：这里 displayInfo/timeString 已经是新歌曲的信息）
         if (subfileIdx != _lastSubfileIndex && subfileIdx >= 0)
         {
-            // _prevDisplayInfo 和 _prevTimeString 保持上一帧的旧值（已在上一帧设置）
-            // 这里不更新它们，让它们在动画结束后更新
-            
-            // 判断封面是否相同
-            bool coverSame = HashEquals(_prevCoverHash, currentCoverHash);
-            if (!coverSame && _cachedScaledCover != null)
+            // 第一首歌曲时，跳过切换动画，直接初始化
+            bool isFirstSong = _lastSubfileIndex < 0;
+            if (isFirstSong)
             {
-                _prevScaledCover?.Dispose();
-                _prevScaledCover = _cachedScaledCover.Copy();
-            }
-            _prevCoverHash = currentCoverHash;
-            
-            // 保存前一首波形
-            if (_prevWaveformPeaks == null || waveformPeaks == null || _prevWaveformPeaks.Length != waveformPeaks?.Length)
-            {
+                // 初始化当前信息，不触发动画
+                _currentDisplayInfo = displayInfo;
+                _currentTimeString = timeString;
+                _currentWaveformPeaks = waveformPeaks?.ToArray();
+                _prevDisplayInfo = displayInfo;
+                _prevTimeString = timeString;
                 _prevWaveformPeaks = waveformPeaks?.ToArray();
+                _prevCoverHash = currentCoverHash;
+                if (_cachedScaledCover != null)
+                {
+                    _prevScaledCover?.Dispose();
+                    _prevScaledCover = _cachedScaledCover.Copy();
+                }
+                _prevComposerLabelX = hasComposer ? composerStartX : 0;
+                _prevGenreLabelX = hasGenre ? genreStartX : 0;
+                _prevHasComposer = hasComposer;
+                _prevHasGenre = hasGenre;
+                // 不触发动画
+                _animationStartTime = -1;
             }
-            
-            // 开始动画（基于时间）
-            _animationStartTime = _currentVideoTime;
+            else
+            {
+                // 正常歌曲切换，触发动画
+                // 使用上一帧保存的"当前信息"作为"前一首信息"（解决快速切换问题）
+                _prevDisplayInfo = _currentDisplayInfo;
+                _prevTimeString = _currentTimeString;
+                _prevWaveformPeaks = _currentWaveformPeaks?.ToArray();
+                
+                // 判断封面是否相同
+                bool coverSame = HashEquals(_prevCoverHash, currentCoverHash);
+                if (!coverSame && _cachedScaledCover != null)
+                {
+                    _prevScaledCover?.Dispose();
+                    _prevScaledCover = _cachedScaledCover.Copy();
+                }
+                _prevCoverHash = currentCoverHash;
+                
+                // 开始动画（基于时间）
+                _animationStartTime = _currentVideoTime;
+            }
             _lastSubfileIndex = subfileIdx;
         }
         
+        // 每帧更新"当前信息"（用于下次切换时作为"前一首"）
+        _currentDisplayInfo = displayInfo;
+        _currentTimeString = timeString;
+        _currentWaveformPeaks = waveformPeaks;
+        
         // 计算动画进度（基于时间，帧率无关）
-        if (_animationStartTime >= 0 && _currentVideoTime < _animationStartTime + AnimationDurationSeconds)
+        // 仅当前一首信息有效时才显示动画（避免空白淡出）
+        bool prevInfoValid = !string.IsNullOrEmpty(_prevDisplayInfo);
+        if (_animationStartTime >= 0 && _currentVideoTime < _animationStartTime + AnimationDurationSeconds && prevInfoValid)
         {
             isInTransition = true;
             float rawT = (float)((_currentVideoTime - _animationStartTime) / AnimationDurationSeconds);
             animT = EaseOutCubic(Math.Clamp(rawT, 0f, 1f));
-        }
-        else
-        {
-            // 动画结束后，更新 prev 值为当前值
-            _prevDisplayInfo = displayInfo;
-            _prevTimeString = timeString;
         }
         
         float labelY = bottomY + 4f * s;
@@ -2808,13 +2931,28 @@ public class Generator
             Array.Copy(bars, _smoothedSpectrum, barCount);
         }
 
-        float release = Math.Clamp(SpectrumSmoothing, 0.3f, 0.95f);
+        // 基于时间的指数衰减平滑（与帧率无关）
+        // 公式：coef = exp(-dt / tau)，其中 dt = 帧时间，tau = 时间常数
+        float dt = 1000f / OutputFps; // 每帧时间（毫秒）
+        float attackMs = Math.Max(1f, SpectrumAttackMs);   // 上升时间（毫秒）
+        float releaseMs = Math.Max(1f, SpectrumReleaseMs); // 下降时间（毫秒）
+        
+        // 计算平滑系数（指数衰减）
+        float attackCoef = (float)Math.Exp(-dt / attackMs);
+        float releaseCoef = (float)Math.Exp(-dt / releaseMs);
+        
         for (int i = 0; i < barCount; i++)
         {
             if (bars[i] > _smoothedSpectrum[i])
-                _smoothedSpectrum[i] = _smoothedSpectrum[i] * 0.2f + bars[i] * 0.8f;
+            {
+                // 上升：使用 attack 时间常数
+                _smoothedSpectrum[i] = _smoothedSpectrum[i] * attackCoef + bars[i] * (1f - attackCoef);
+            }
             else
-                _smoothedSpectrum[i] = _smoothedSpectrum[i] * release + bars[i] * (1f - release);
+            {
+                // 下降：使用 release 时间常数
+                _smoothedSpectrum[i] = _smoothedSpectrum[i] * releaseCoef + bars[i] * (1f - releaseCoef);
+            }
         }
 
         float barWidth = region.Width / barCount;

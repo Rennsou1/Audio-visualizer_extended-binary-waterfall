@@ -645,10 +645,20 @@ public class FfmpegExporter : IExporter
 				ret = ffmpeg.av_frame_get_buffer(_audioAvFrame, 0);
 				FfmpegUtils.LogIfAvError(ret, "cannot allocate input audio sample buffer");
 				
+				// 分配用于编码的音频帧
+				_resampledAudioFrame = ffmpeg.av_frame_alloc();
+				_resampledAudioFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
+				ffmpeg.av_channel_layout_default(&_resampledAudioFrame->ch_layout, outputChannels);
+				_resampledAudioFrame->sample_rate = _actualAudioSampleRate;
+				_resampledAudioFrame->nb_samples = _audioCtx->frame_size;
+				_resampledAudioFrame->time_base.num = 1;
+				_resampledAudioFrame->time_base.den = _actualAudioSampleRate;
+				
+				ret = ffmpeg.av_frame_get_buffer(_resampledAudioFrame, 0);
+				FfmpegUtils.LogIfAvError(ret, "cannot allocate audio encode buffer");
+				
 				if (_needResample)
 				{
-					// 初始化重采样上下文
-					
 					// 初始化重采样上下文（在 unsafe 上下文中局部变量已固定）
 					// 输入：使用解码器的声道数
 					// 输出：使用用户设置的输出声道数，重采样器会自动upmix/downmix
@@ -668,18 +678,6 @@ public class FfmpegExporter : IExporter
 					
 					ret = ffmpeg.swr_init(_swrCtx);
 					FfmpegUtils.LogIfAvError(ret, "cannot init swr context");
-					
-					// 分配重采样后的输出帧
-					_resampledAudioFrame = ffmpeg.av_frame_alloc();
-					_resampledAudioFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
-					ffmpeg.av_channel_layout_default(&_resampledAudioFrame->ch_layout, outputChannels);
-					_resampledAudioFrame->sample_rate = _actualAudioSampleRate;
-					_resampledAudioFrame->nb_samples = _audioCtx->frame_size;
-					_resampledAudioFrame->time_base.num = 1;
-					_resampledAudioFrame->time_base.den = _actualAudioSampleRate;
-					
-					ret = ffmpeg.av_frame_get_buffer(_resampledAudioFrame, 0);
-					FfmpegUtils.LogIfAvError(ret, "cannot allocate resampled audio buffer");
 				}
 
 				// 检查音频编码器是否支持可变帧大小

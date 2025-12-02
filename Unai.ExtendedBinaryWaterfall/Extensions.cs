@@ -29,6 +29,10 @@ public static class Extensions
 	private static int[] _lruRemoveKeys = null;
 	private static long[] _lruRemoveValues = null;
 	
+	// SKFont 缓存（避免每次调用 ToFont()）
+	private static readonly Dictionary<int, SKFont> _fontCache = new();
+	private const int MaxFontCacheSize = 32;
+	
 	// 动画文本位图序列缓存（用于大字号动画文本的多帧预渲染）
 	// key = (text, fontSize, alpha), value = (bitmap, lastUsed)
 	private static readonly Dictionary<int, (SKBitmap bitmap, long lastUsed)> _animTextBitmapCache = new();
@@ -169,11 +173,28 @@ public static class Extensions
 				}
 			}
 			
-			// 配置画笔测量
+			// 获取或创建缓存的 SKFont
+			int fontHash = HashCode.Combine(typeface?.FamilyName ?? "", fontSize);
+			if (!_fontCache.TryGetValue(fontHash, out var font))
+			{
+				// 配置画笔并创建字体
+				_textPaint.Typeface = typeface;
+				_textPaint.TextSize = fontSize;
+				font = _textPaint.ToFont();
+				
+				// 限制字体缓存大小（简单清理策略）
+				if (_fontCache.Count >= MaxFontCacheSize)
+				{
+					var oldestKey = _fontCache.Keys.First();
+					_fontCache[oldestKey].Dispose();
+					_fontCache.Remove(oldestKey);
+				}
+				_fontCache[fontHash] = font;
+			}
+			
+			// 配置画笔并测量边界
 			_textPaint.Typeface = typeface;
 			_textPaint.TextSize = fontSize;
-			
-			// 测量文本边界
 			var bounds = new SKRect();
 			_textPaint.MeasureText(text, ref bounds);
 			
@@ -181,11 +202,19 @@ public static class Extensions
 			height = -bounds.Top + bounds.Bottom;
 			baselineY = -bounds.Top;
 			
-			// 创建 SKTextBlob（预布局字形）
+			// 获取字形 ID（使用预分配数组减少分配）
+			ushort[] glyphs = new ushort[text.Length];
+			font.GetGlyphs(text.AsSpan(), glyphs);
+			
+			// 获取字形位置
+			SKPoint[] positions = new SKPoint[text.Length];
+			font.GetGlyphPositions(glyphs, positions);
+			
+			// 创建带位置的 SKTextBlob（比 AllocateRun 更快）
 			using var builder = new SKTextBlobBuilder();
-			var font = _textPaint.ToFont();
-			var run = builder.AllocateRun(font, text.Length, 0, 0);
-			font.GetGlyphs(text, run.GetGlyphSpan());
+			var run = builder.AllocatePositionedRun(font, glyphs.Length);
+			glyphs.AsSpan().CopyTo(run.GetGlyphSpan());
+			positions.AsSpan().CopyTo(run.GetPositionSpan());
 			blob = builder.Build();
 			
 			_textBlobCache[hash] = (blob, width, height, baselineY, accessTime);

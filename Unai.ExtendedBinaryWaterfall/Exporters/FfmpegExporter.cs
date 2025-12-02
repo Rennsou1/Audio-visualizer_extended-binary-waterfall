@@ -54,7 +54,7 @@ public class FfmpegExporter : IExporter
 	private Channel<PendingFrame> _frameChannel;
 	private Task _encoderTask;
 	private CancellationTokenSource _encoderCts;
-	private const int MaxQueueSize = 128;  // 大缓冲区最大化吞吐量（增加管道深度）
+	private const int MaxQueueSize = 256;  // 大缓冲区最大化吞吐量
 	
 	// 帧数据对象池（减少 GC 压力）
 	private ConcurrentBag<PendingFrame> _framePool = new();
@@ -62,7 +62,7 @@ public class FfmpegExporter : IExporter
 	private ConcurrentBag<float[]> _audioBufferPool = new();
 	
 	// 预分配对象池
-	private const int PreallocPoolSize = 160;  // 增大预分配数量以匹配管道深度
+	private const int PreallocPoolSize = 300;  // 增大预分配数量以匹配管道深度
 
 	private unsafe AVFormatContext* _fmtCtx;
 
@@ -113,14 +113,14 @@ public class FfmpegExporter : IExporter
 	// NVENC 编码配置
 	// P1=最快, P2=快速, P4=平衡, P7=最慢
 	public string NvencPreset { get; set; } = "p1";       // P1 最快速度
-	public string NvencTune { get; set; } = "ll";         // ll=低延迟模式（比 hq 更快）
+	public string NvencTune { get; set; } = "ll";         // ll=低延迟模式
 	public string NvencRateControl { get; set; } = "vbr"; // vbr=可变比特率
-	public int NvencBFrames { get; set; } = 0;            // B帧=0（禁用B帧显著提高速度）
-	public bool NvencTemporalAQ { get; set; } = false;    // 关闭时域AQ以提高速度
-	public bool NvencSpatialAQ { get; set; } = false;     // 关闭空域AQ以提高速度
-	public int NvencAQStrength { get; set; } = 0;         // AQ强度=0（已禁用）
-	public int NvencLookahead { get; set; } = 0;          // Lookahead=0（禁用前瞻提高速度）
-	public bool NvencZeroLatency { get; set; } = true;    // 零延迟模式（最大化速度）
+	public int NvencBFrames { get; set; } = 0;            // B帧=0
+	public bool NvencTemporalAQ { get; set; } = false;    // 关闭时域AQ
+	public bool NvencSpatialAQ { get; set; } = false;     // 关闭空域AQ
+	public int NvencAQStrength { get; set; } = 0;         // AQ强度=0
+	public int NvencLookahead { get; set; } = 0;          // Lookahead=0
+	public bool NvencZeroLatency { get; set; } = true;    // 零延迟模式
 	
 	// 视频编码参数
 	public int VideoCodecIndex { get; set; } = 0;
@@ -205,9 +205,36 @@ public class FfmpegExporter : IExporter
 		return nearest;
 	}
 
+	// 检测并列出所有可用的硬件编码器
+	private unsafe void DetectAvailableEncoders()
+	{
+		string[] hwEncoders = { "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf" };
+		var available = new System.Collections.Generic.List<string>();
+		var unavailable = new System.Collections.Generic.List<string>();
+		
+		foreach (var name in hwEncoders)
+		{
+			var enc = ffmpeg.avcodec_find_encoder_by_name(name);
+			if (enc != null)
+				available.Add(name);
+			else
+				unavailable.Add(name);
+		}
+		
+		Logger.Info($"可用硬件编码器: {(available.Count > 0 ? string.Join(", ", available) : "无")}");
+		if (unavailable.Count > 0 && available.Count == 0)
+		{
+			Logger.Warning($"未检测到硬件编码器，将使用软件编码 (libx264)");
+			Logger.Warning($"提示: 确保已安装支持 NVENC/QSV/AMF 的 FFmpeg 版本");
+		}
+	}
+	
 	// 尝试查找可用的硬件编码器，返回编码器名称
 	private unsafe AVCodec* FindVideoEncoder()
 	{
+		// 首先检测所有可用编码器
+		DetectAvailableEncoders();
+		
 		AVCodec* encoder = null;
 		
 		// 按优先级尝试不同的硬件编码器
@@ -225,8 +252,17 @@ public class FfmpegExporter : IExporter
 			encoder = ffmpeg.avcodec_find_encoder_by_name(encoderName);
 			if (encoder != null)
 			{
-				Logger.Info($"使用视频编码器: {encoderName}");
+				// 判断是否为硬件编码器
+				bool isHwEncoder = encoderName.Contains("nvenc") || 
+				                   encoderName.Contains("qsv") || 
+				                   encoderName.Contains("amf");
+				string hwType = isHwEncoder ? "GPU 硬件" : "CPU 软件";
+				Logger.Info($"✓ 选择视频编码器: {encoderName} ({hwType}编码)");
 				return encoder;
+			}
+			else
+			{
+				Logger.Debug($"  编码器 {encoderName} 不可用");
 			}
 		}
 
@@ -234,7 +270,7 @@ public class FfmpegExporter : IExporter
 		encoder = ffmpeg.avcodec_find_encoder(AVCodecID.AV_CODEC_ID_H264);
 		if (encoder != null)
 		{
-			Logger.Info("使用默认 H.264 软件编码器");
+			Logger.Warning("⚠ 使用默认 H.264 软件编码器 (速度较慢)");
 		}
 		return encoder;
 	}
@@ -859,17 +895,17 @@ public class FfmpegExporter : IExporter
 		pendingFrame.Width = videoFrame.Width;
 		pendingFrame.Height = videoFrame.Height;
 		
-		// 复制音频数据
+		// 复制音频数据（使用 CopyTo 避免 ToArray 分配）
 		if (_audioEnabled && audioFrame != null)
 		{
-			var audioData = audioFrame.ToArray();
-			if (!_audioBufferPool.TryTake(out var audioBuffer) || audioBuffer.Length < audioData.Length)
+			int audioLen = audioFrame.TotalSampleCount;
+			if (!_audioBufferPool.TryTake(out var audioBuffer) || audioBuffer.Length < audioLen)
 			{
-				audioBuffer = new float[audioData.Length];
+				audioBuffer = new float[audioLen];
 			}
-			Array.Copy(audioData, audioBuffer, audioData.Length);
+			audioFrame.CopyTo(audioBuffer);
 			pendingFrame.AudioSamples = audioBuffer;
-			pendingFrame.AudioSampleCount = audioData.Length;
+			pendingFrame.AudioSampleCount = audioLen;
 			pendingFrame.AudioChannels = audioFrame.ChannelCount;
 		}
 		else
@@ -881,10 +917,22 @@ public class FfmpegExporter : IExporter
 		pendingFrame.VideoPts = _frameNum;
 		
 		// 将帧加入编码 Channel（高性能非阻塞）
-		if (!_frameChannel.Writer.TryWrite(pendingFrame))
+		// 使用 ValueTask 避免分配，且不阻塞渲染线程
+		var writeTask = _frameChannel.Writer.WriteAsync(pendingFrame);
+		if (!writeTask.IsCompletedSuccessfully)
 		{
-			// Channel 满了，等待写入
-			_frameChannel.Writer.WriteAsync(pendingFrame).AsTask().Wait();
+			// 如果不能立即写入，使用异步等待但不阻塞主线程
+			// 通过 SpinWait 短暂等待，避免线程切换开销
+			var spinner = new SpinWait();
+			while (!writeTask.IsCompleted)
+			{
+				spinner.SpinOnce();
+				if (spinner.NextSpinWillYield)
+				{
+					// 已经自旋足够多次，让出 CPU
+					Thread.Sleep(0);
+				}
+			}
 		}
 
 		if (_frameNum % 50 == 0)

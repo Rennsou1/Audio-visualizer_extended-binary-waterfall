@@ -66,13 +66,6 @@ public class Generator
     // 视频帧缓冲区复用（避免每帧分配）
     private byte[] _reusableVideoBuffer = null;
     
-    // 双缓冲：预读取的下一帧数据
-    private byte[] _prefetchVideoBuffer = null;
-    private float[] _prefetchAudioBuffer = null;
-    private int _prefetchAudioSampleCount = 0;
-    private bool _prefetchReady = false;
-    private Task _prefetchTask = null;
-    
     // 瀑布原始图像复用
     private SKBitmap _reusableWaterfallImage = null;
     // 缩放后的瀑布图像复用（避免每帧 Clone+Resize 导致的内存分配）

@@ -30,6 +30,11 @@ public class SubFile(string path, long startOffset, long length)
 	// 实际文件字节偏移（用于瀑布可视化读取）
 	public long ActualByteOffset { get; set; } = 0;           // 该子文件在实际二进制流中的起始偏移
 	public long ActualByteLength { get; set; } = 0;           // 该子文件的实际字节大小
+	
+	// 音频格式信息（用于 A/V SETTINGS 显示源文件格式）
+	public int AudioSampleRate { get; set; } = 0;             // 音频采样率 (Hz)
+	public int AudioChannels { get; set; } = 0;               // 音频声道数
+	public int AudioBitDepth { get; set; } = 0;               // 音频位深 (bits)
 
 	public string FileName => System.IO.Path.GetFileName(Path);
 	public string FileDirectory => System.IO.Path.GetDirectoryName(Path);

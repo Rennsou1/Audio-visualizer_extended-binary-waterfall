@@ -66,6 +66,13 @@ public class Generator
     // 视频帧缓冲区复用（避免每帧分配）
     private byte[] _reusableVideoBuffer = null;
     
+    // 双缓冲：预读取的下一帧数据
+    private byte[] _prefetchVideoBuffer = null;
+    private float[] _prefetchAudioBuffer = null;
+    private int _prefetchAudioSampleCount = 0;
+    private bool _prefetchReady = false;
+    private Task _prefetchTask = null;
+    
     // 瀑布原始图像复用
     private SKBitmap _reusableWaterfallImage = null;
     // 缩放后的瀑布图像复用（避免每帧 Clone+Resize 导致的内存分配）
@@ -141,6 +148,25 @@ public class Generator
     private readonly SKPaint _gradientPaint = new() { IsAntialias = false };
     // 封面画笔（复用，避免每帧创建）
     private readonly SKPaint _coverPaint = new() { IsAntialias = false, FilterQuality = SKFilterQuality.Low };
+    
+    // SIMD alpha 向量缓存（避免每帧创建）
+    private static readonly Vector<byte> _simdAlphaMask;
+    private static readonly Vector<byte> _simdPosMask;
+    
+    // 静态构造函数初始化 SIMD 向量
+    static Generator()
+    {
+        int vectorSize = Vector<byte>.Count;
+        byte[] alphaPattern = new byte[vectorSize];
+        byte[] posPattern = new byte[vectorSize];
+        for (int i = 3; i < vectorSize; i += 4)
+        {
+            alphaPattern[i] = 255;
+            posPattern[i] = 255;
+        }
+        _simdAlphaMask = new Vector<byte>(alphaPattern);
+        _simdPosMask = new Vector<byte>(posPattern);
+    }
     
     // Ease-out 缓动函数（快到慢）
     private static float EaseOutCubic(float t) => 1f - MathF.Pow(1f - t, 3f);
@@ -1094,12 +1120,22 @@ public class Generator
                 long fileLength = 0;
                 long actualFileSize = 0;
                 double durationSeconds = 0;
+                // 音频格式信息（用于 A/V SETTINGS 显示）
+                int audioSampleRate = 0;
+                int audioChannels = 0;
+                int audioBitDepth = 0;
+                
                 try
                 {
                     actualFileSize = new System.IO.FileInfo(filePath).Length;
                     using var tempSource = CodecFactory.Instance.GetCodec(filePath);
-                    durationSeconds = tempSource.Length / (double)tempSource.WaveFormat.BytesPerSecond;
+                    var wf = tempSource.WaveFormat;
+                    durationSeconds = tempSource.Length / (double)wf.BytesPerSecond;
                     fileLength = (long)(durationSeconds * InputBytesPerSecond);
+                    // 提取音频格式信息
+                    audioSampleRate = wf.SampleRate;
+                    audioChannels = wf.Channels;
+                    audioBitDepth = wf.BitsPerSample;
                 }
                 catch
                 {
@@ -1118,6 +1154,10 @@ public class Generator
                 // 设置实际文件字节偏移（用于瀑布可视化）
                 sf.ActualByteOffset = actualByteOffset;
                 sf.ActualByteLength = actualFileSize;
+                // 设置音频格式信息（用于 A/V SETTINGS 显示源文件格式）
+                sf.AudioSampleRate = audioSampleRate;
+                sf.AudioChannels = audioChannels;
+                sf.AudioBitDepth = audioBitDepth;
                 _subfiles.Add(sf);
                 
                 currentOffset += fileLength;
@@ -1560,10 +1600,8 @@ public class Generator
     {
         Logger.Info("Generating binary waterfall…");
 
-        string avSettingsString =
-            $"{AudioOutputSampleRate} Hz, PCM {(AudioOutputSampleFormat.IsSigned() ? "signed" : "unsigned")} {8 * AudioOutputSampleFormat.GetByteSize()}-bit, " +
-            $"{(AudioOutputChannelCount == 2 ? "stereo" : $"{AudioOutputChannelCount} ch")}\n" +
-            $"RGBA (32bpp), {WaterfallWidth} px/line";
+        // A/V SETTINGS 默认值（使用解码器格式，如果有多文件则会在循环内根据当前子文件动态更新）
+        string avSettingsString = BuildAudioFormatString(AudioDecoderSampleRate, AudioDecoderChannelCount, 32);
         string readSpeedString = $"{InputBytesPerSecond / 1024} KiB/s";
 
         float subfileWindowIndex = 0f;
@@ -1754,7 +1792,6 @@ public class Generator
             }
 
             int srcBytesPerRow = WaterfallWidth * 4;
-            int imageHeight = WaterfallHeight;
             var videoBuffer = _reusableVideoBuffer;
 
             // 使用 GetPixels 获取指针并转换为可写 Span
@@ -1768,15 +1805,9 @@ public class Generator
                 byte* destBase = (byte*)destPtr;
                 int vectorSize = Vector<byte>.Count;
                 
-                // 预计算 alpha 向量（每4字节设置一次 255）
-                byte[] alphaPattern = new byte[vectorSize];
-                for (int i = 3; i < vectorSize; i += 4) alphaPattern[i] = 255;
-                Vector<byte> alphaMask = new Vector<byte>(alphaPattern);
-                
-                // alpha 位置掩码（第3,7,11...字节为1，其余为0）
-                byte[] posPattern = new byte[vectorSize];
-                for (int i = 3; i < vectorSize; i += 4) posPattern[i] = 255;
-                Vector<byte> posMask = new Vector<byte>(posPattern);
+                // 使用缓存的 SIMD 向量（避免每帧创建）
+                Vector<byte> alphaMask = _simdAlphaMask;
+                Vector<byte> posMask = _simdPosMask;
                 
                 Parallel.For(0, height, y =>
                 {
@@ -1996,13 +2027,28 @@ public class Generator
             // 动态绘制：数值位置在标签下方（标签高度 _fontSize16 + 间距 8）
             float valueY = 32 + _fontSize16 + 8;
             
-            // A/V SETTINGS 值（左上角）
+            // A/V SETTINGS 值（左上角）：使用当前子文件的源格式（如果有）
+            string currentAvSettings = avSettingsString;
+            if (currentSubfileValue != null && currentSubfileValue.AudioSampleRate > 0)
+            {
+                currentAvSettings = BuildAudioFormatString(
+                    currentSubfileValue.AudioSampleRate,
+                    currentSubfileValue.AudioChannels,
+                    currentSubfileValue.AudioBitDepth);
+            }
             DrawText(32, valueY, _fontSize24,
-                avSettingsString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
+                currentAvSettings, SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
             
-            // ABS. OFFSET 值（右上角）
+            // ABS. OFFSET 值（右上角）：显示相对于当前文件的偏移
+            long displayOffset = currentOffset;
+            if (currentSubfileValue != null)
+            {
+                // 多文件模式：显示相对于当前文件的偏移
+                displayOffset = currentOffset - currentSubfileValue.StartOffset;
+                if (displayOffset < 0) displayOffset = 0;
+            }
             DrawText(OutputVideoWidth - 32, valueY, _fontSize24,
-                $"{currentOffset / 1048576f:N2} MiB\n0x{currentOffset:X8}", SKColors.White,
+                $"{displayOffset / 1048576f:N2} MiB\n0x{displayOffset:X8}", SKColors.White,
                 VerticalAlign.Top, HorizontalAlign.Right);
             
             // BITRATE 值（BITRATE 标签下方）
@@ -2054,6 +2100,26 @@ public class Generator
         }
 
         Exporter.Finish();
+    }
+    
+    // 生成音频格式显示字符串（用于 A/V SETTINGS）
+    private string BuildAudioFormatString(int sampleRate, int channels, int bitDepth)
+    {
+        // 声道描述
+        string channelDesc = channels switch
+        {
+            1 => "mono",
+            2 => "stereo",
+            6 => "6 ch",
+            8 => "8 ch",
+            _ => $"{channels} ch"
+        };
+        
+        // 位深描述（如果为0则使用默认值）
+        int bits = bitDepth > 0 ? bitDepth : 32;
+        
+        return $"{sampleRate} Hz, PCM signed {bits}-bit, {channelDesc}\n" +
+               $"RGBA (32bpp), {WaterfallWidth} px/line";
     }
     
     // 绘制底部音乐播放器 UI
@@ -2116,13 +2182,12 @@ public class Generator
             }
         }
         
-        // 构建显示文本
+        // 构建显示文本（根据 maxWidth 动态截断）
         string displayInfo = trackName;
         bool hasComposer = !string.IsNullOrWhiteSpace(composerName);
         bool hasGenre = !string.IsNullOrWhiteSpace(genreText);
         if (hasComposer) displayInfo += $" // {composerName}";
         if (hasGenre) displayInfo += $" [{genreText}]";
-        displayInfo = Utils.TruncateString(displayInfo, 55);
         
         // 计算各部分在显示文本中的位置（用于灰色标签对齐）
         float titleEndX = infoX + MeasureTextWidth(trackName, _fontSize32);

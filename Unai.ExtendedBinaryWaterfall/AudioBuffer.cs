@@ -6,6 +6,8 @@ namespace Unai.ExtendedBinaryWaterfall;
 
 public class AudioBuffer
 {
+	private static bool _truncationWarningShown = false;
+
 	float[][] Samples { get; set; }
 	public int ChannelCount => Samples.Length;
 	public int SampleCount => Samples[0].Length;
@@ -123,10 +125,11 @@ public class AudioBuffer
 			}
 		}
 
-		// 如果源数据太长，只简单截断并给出提示
-		if (samplesPerChannel > maxSamples)
+		// 如果源数据太长，只简单截断并给出提示（只打印一次）
+		if (samplesPerChannel > maxSamples && !_truncationWarningShown)
 		{
-			Logger.Warning($"AudioBuffer: source has {samplesPerChannel} samples/ch, truncated to {maxSamples}.");
+			Logger.Warning($"AudioBuffer: source has {samplesPerChannel} samples/ch, truncated to {maxSamples}. (后续相同警告将被抑制)");
+			_truncationWarningShown = true;
 		}
 
 		return this;

@@ -40,8 +40,16 @@ public class MultiFileAudioSource : ISampleSource
         OpenFile(0);
         _waveFormat = _currentSampleSource.WaveFormat;
 
-        // 计算所有文件的总长度
+        // 计算所有文件的总长度（使用临时解码器）
         CalculateTotalLength();
+        
+        // 重新打开第一个文件，确保从头开始读取
+        // 某些解码器在 CalculateTotalLength 期间可能会被影响
+        OpenFile(0);
+        if (_currentSampleSource.CanSeek)
+        {
+            _currentSampleSource.Position = 0;
+        }
     }
 
     // 计算所有文件的总采样数
@@ -143,12 +151,23 @@ public class MultiFileAudioSource : ISampleSource
 
     public long Length => _totalLength;
 
+    // 用于限制日志输出的标志（只在第一次切换时打印）
+    private bool _firstReadLogged = false;
+    private bool _switchLogged = false;
+    
     public int Read(float[] buffer, int offset, int count)
     {
         if (_isDisposed || _currentSampleSource == null)
             return 0;
 
         int totalRead = 0;
+        
+        // 诊断：第一次读取时打印状态
+        if (!_firstReadLogged)
+        {
+            _firstReadLogged = true;
+            Logger.Info($"[MultiFileAudioSource] 首次读取: fileIndex={_currentFileIndex}, position={_position}, totalLength={_totalLength}, sourcePos={_currentSampleSource.Position}, sourceLen={_currentSampleSource.Length}");
+        }
 
         while (totalRead < count && _position < _totalLength)
         {
@@ -161,14 +180,53 @@ public class MultiFileAudioSource : ISampleSource
             }
             else
             {
-                // 当前文件读完，切换到下一个
-                if (_currentFileIndex < _filePaths.Count - 1)
+                // Read 返回 0，检查是否真的到达文件末尾
+                bool fileEnded = _currentSampleSource.Position >= _currentSampleSource.Length;
+                
+                if (fileEnded)
                 {
-                    OpenFile(_currentFileIndex + 1);
+                    // 当前文件确实读完，切换到下一个
+                    if (_currentFileIndex < _filePaths.Count - 1)
+                    {
+                        // 诊断：打印切换信息（只打印一次）
+                        if (!_switchLogged)
+                        {
+                            _switchLogged = true;
+                            Logger.Info($"[MultiFileAudioSource] 切换文件: {_currentFileIndex} -> {_currentFileIndex + 1}, position={_position}, sourcePos={_currentSampleSource.Position}, sourceLen={_currentSampleSource.Length}");
+                        }
+                        OpenFile(_currentFileIndex + 1);
+                    }
+                    else
+                    {
+                        // 所有文件都读完了
+                        break;
+                    }
                 }
                 else
                 {
-                    // 所有文件都读完了
+                    // 文件没读完但 Read 返回 0，可能是解码器内部缓冲问题
+                    // 尝试 Seek 到当前位置来"唤醒"解码器
+                    if (_currentSampleSource.CanSeek)
+                    {
+                        long currentPos = _currentSampleSource.Position;
+                        _currentSampleSource.Position = currentPos;
+                        
+                        // 再次尝试读取
+                        read = _currentSampleSource.Read(buffer, offset + totalRead, count - totalRead);
+                        if (read > 0)
+                        {
+                            totalRead += read;
+                            _position += read;
+                            continue; // 成功读取，继续循环
+                        }
+                    }
+                    
+                    // Seek 后仍然返回 0，记录警告并结束当前读取循环
+                    if (!_switchLogged)
+                    {
+                        _switchLogged = true;
+                        Logger.Warning($"[MultiFileAudioSource] Read 返回 0 但文件未结束: pos={_currentSampleSource.Position}, len={_currentSampleSource.Length}");
+                    }
                     break;
                 }
             }

@@ -620,8 +620,13 @@ public class FfmpegExporter : IExporter
 				_inputAudioSampleRate = Generator.AudioDecoderSampleRate;
 				// 输出采样率是用户期望的目标采样率（已经过 AAC 兼容性检查）
 				_actualAudioSampleRate = GetNearestSupportedSampleRate(Generator.AudioOutputSampleRate);
-				// 当输入和输出采样率不同时需要重采样
-				_needResample = (_inputAudioSampleRate != _actualAudioSampleRate);
+				// 输入声道数
+				int inputChannels = Generator.AudioDecoderChannelCount;
+				// 输出声道数（用户设置的目标）
+				int outputChannels = Generator.AudioOutputChannelCount;
+				// 当采样率或声道数不同时需要重采样
+				_needResample = (_inputAudioSampleRate != _actualAudioSampleRate) || (inputChannels != outputChannels);
+				Logger.Info($"[音频] 输入: {_inputAudioSampleRate}Hz {inputChannels}ch -> 输出: {_actualAudioSampleRate}Hz {outputChannels}ch (需要重采样: {_needResample})");
 				
 				// Generator 每帧产生的采样数（基于解码器采样率）
 				// 解码器每帧产生: AudioDecoderSampleRate / OutputFps 个采样（每通道）
@@ -629,11 +634,6 @@ public class FfmpegExporter : IExporter
 				
 				// 输入音频帧缓冲区大小需要足够容纳 AAC 帧（通常 1024 采样）
 				int audioFrameBufferSize = Math.Max(inputSamplesPerChannel, _audioCtx->frame_size);
-				
-				// 输入音频帧（使用解码器的实际声道数）
-				int inputChannels = Generator.AudioDecoderChannelCount;
-				// 输出声道数（用户设置的目标）
-				int outputChannels = Generator.AudioOutputChannelCount;
 				_audioAvFrame = ffmpeg.av_frame_alloc();
 				_audioAvFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
 				ffmpeg.av_channel_layout_default(&_audioAvFrame->ch_layout, inputChannels);
@@ -712,29 +712,20 @@ public class FfmpegExporter : IExporter
 					
 					if (_needResample && _swrCtx != null)
 					{
-						// 填充输入帧（支持单声道或双声道输入）
-						float* ab0 = (float*)_audioAvFrame->data[0];
-						if (inputChannels == 1)
+						// 填充输入帧（支持任意声道数：interleaved -> planar）
+						// 输入数据格式：[L0 R0 C0 LFE0 Lb0 Rb0] [L1 R1 C1 LFE1 Lb1 Rb1] ...
+						// 输出到 planar：data[0]=[L0 L1 ...], data[1]=[R0 R1 ...], ...
+						for (uint ch = 0; ch < inputChannels; ch++)
 						{
-							// 单声道：所有数据在 data[0]
+							float* chData = (float*)_audioAvFrame->data[ch];
 							for (int i = 0; i < samplesPerChannel; i++)
 							{
-								ab0[i] = buf[i];
-							}
-						}
-						else
-						{
-							// 双声道：格式 -> planar 格式
-							float* ab1 = (float*)_audioAvFrame->data[1];
-							for (int i = 0; i < samplesPerChannel; i++)
-							{
-								ab0[i] = buf[i * 2];
-								ab1[i] = buf[i * 2 + 1];
+								chData[i] = buf[i * inputChannels + (int)ch];
 							}
 						}
 						_audioAvFrame->nb_samples = samplesPerChannel;
 						
-						// 使用 swr_convert 进行重采样（不是 swr_convert_frame）
+						// 使用 swr_convert 进行重采样
 						// 计算预期输出采样数
 						int maxOutputSamples = (int)((long)samplesPerChannel * _actualAudioSampleRate / _inputAudioSampleRate) + 256;
 						
@@ -792,26 +783,15 @@ public class FfmpegExporter : IExporter
 					}
 					else
 					{
-						// 无需重采样，直接累积（处理输入/输出声道不匹配的情况）
-						if (inputChannels == 1)
+						// 无需重采样（采样率和声道数相同），直接累积
+						// 此时 inputChannels == outputChannels
+						for (int i = 0; i < samplesPerChannel && outputAccumCount < outputBufferSize; i++)
 						{
-							// 单声道输入
-							for (int i = 0; i < samplesPerChannel && outputAccumCount < outputBufferSize; i++)
-							{
-								outputAccumL[outputAccumCount] = buf[i];
-								outputAccumR[outputAccumCount] = buf[i]; // 复制到 R
-								outputAccumCount++;
-							}
-						}
-						else
-						{
-							// 双声道输入
-							for (int i = 0; i < samplesPerChannel && outputAccumCount < outputBufferSize; i++)
-							{
-								outputAccumL[outputAccumCount] = buf[i * 2];
-								outputAccumR[outputAccumCount] = buf[i * 2 + 1];
-								outputAccumCount++;
-							}
+							// 左声道 (或单声道)
+							outputAccumL[outputAccumCount] = buf[i * inputChannels];
+							// 右声道 (如果有)
+							outputAccumR[outputAccumCount] = (inputChannels >= 2) ? buf[i * inputChannels + 1] : buf[i * inputChannels];
+							outputAccumCount++;
 						}
 					}
 					

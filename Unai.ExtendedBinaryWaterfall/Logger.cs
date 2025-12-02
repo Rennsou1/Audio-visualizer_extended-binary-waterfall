@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
@@ -11,6 +12,14 @@ public static class Logger
 	}
 
 	public static bool UseColor { get; set; } = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("NOCOLOR"));
+	
+	// 日志文件路径 EXE 同级目录
+	private static readonly string LogFilePath = Path.Combine(
+		Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory, 
+		"performance.log");
+	private static readonly object _logLock = new();
+	// 是否启用文件日志
+	public static bool EnableFileLog { get; set; } = true;
 
 	private static void Print(string message, LogLevel logLevel, StackFrame sf)
 	{
@@ -25,7 +34,21 @@ public static class Logger
 			LogLevel.Trace => "\x1b[32m",
 			_ => "\x1b[0m",
 		};
-		Console.Error.WriteLine(UseColor ? $"\x1b[90m{source} {logLevelAnsiColor}{message}\x1b[0m" : $"{source} {message}");
+		var logLine = $"{source} {message}";
+		Console.Error.WriteLine(UseColor ? $"\x1b[90m{source} {logLevelAnsiColor}{message}\x1b[0m" : logLine);
+		
+		// 性能相关日志
+		if (EnableFileLog && (message.Contains("[性能]") || message.Contains("[渲染性能]")))
+		{
+			lock (_logLock)
+			{
+				try
+				{
+					File.AppendAllText(LogFilePath, $"[{DateTime.Now:HH:mm:ss.fff}] {logLine}\n");
+				}
+				catch { }
+			}
+		}
 	}
 
 	public static void Fail(string message)

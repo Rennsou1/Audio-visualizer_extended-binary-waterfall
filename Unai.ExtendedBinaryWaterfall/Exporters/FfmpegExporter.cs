@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using FFmpeg.AutoGen;
+using Lennox.LibYuvSharp;
 using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
@@ -94,6 +95,13 @@ public class FfmpegExporter : IExporter
 	private int _frameNum = 0;
 	// 音频样本计数器（用于正确计算音频 PTS）
 	private long _audioSampleCount = 0;
+	
+	// 性能诊断计时器
+	private readonly System.Diagnostics.Stopwatch _perfTimer = new();
+	private double _totalSwsTime = 0;
+	private double _totalEncodeTime = 0;
+	private double _totalAudioTime = 0;
+	private int _perfSampleCount = 0;
 
 	public Generator Generator { get; set; }
 	
@@ -594,7 +602,7 @@ public class FfmpegExporter : IExporter
 					
 					// 初始化重采样上下文（在 unsafe 上下文中局部变量已固定）
 					// 输入：使用解码器的声道数
-					// 输出：使用用户设置的输出声道数，重采样器会自动上混/下混
+					// 输出：使用用户设置的输出声道数，重采样器会自动upmix/downmix
 					SwrContext* swrCtx = null;
 					AVChannelLayout inLayout = new AVChannelLayout();
 					AVChannelLayout outLayout = new AVChannelLayout();
@@ -1029,45 +1037,40 @@ public class FfmpegExporter : IExporter
 		ret = ffmpeg.av_frame_make_writable(_audioAvFrame);
 		FfmpegUtils.LogIfAvError(ret, "cannot make audio sample buffer writable");
 
-		// 初始化色彩转换上下文（使用最快的点采样算法）
-		if (_swsCtx == null)
+		// 计时：色彩空间转换（使用 libyuv，比 sws_scale 快 4-5 倍）
+		_perfTimer.Restart();
 		{
-			// SWS_POINT = 0x10 = 最快的点采样（无插值）
-			// SWS_FAST_BILINEAR = 1 = 快速双线性（稍慢但更平滑）
-			const int SWS_POINT = 0x10;
-			_swsCtx = ffmpeg.sws_getContext(frame.Width, frame.Height, 
-				(AVPixelFormat)_videoAvFramePre->format, frame.Width, frame.Height, 
-				(AVPixelFormat)_videoAvFrame->format, SWS_POINT, null, null, null);
-			if (_swsCtx == null)
-			{
-				Logger.Error("cannot initialize sws context");
-			}
-		}
-
-		if (_swsCtx != null)
-		{
-			int srcLinesize = frame.Width * 4;
+			int srcStride = frame.Width * 4;
+			int yStride = _videoAvFrame->linesize[0];
+			int uStride = _videoAvFrame->linesize[1];
+			int vStride = _videoAvFrame->linesize[2];
 			
 			fixed (byte* srcData = frame.PixelData)
 			{
-				byte_ptrArray8 srcDataArray = new byte_ptrArray8();
-				srcDataArray[0] = srcData;
-				
-				int_array8 srcLinesizeArray = new int_array8();
-				srcLinesizeArray[0] = srcLinesize;
-				
-				ffmpeg.sws_scale(_swsCtx, srcDataArray, srcLinesizeArray, 0, frame.Height, 
-					_videoAvFrame->data, _videoAvFrame->linesize);
+				// SkiaSharp BGRA8888 在内存中是 B-G-R-A
+				// libyuv 的 ARGBToI420 期望 little-endian ARGB（即内存中 B-G-R-A）
+				LibYuv.ARGBToI420(
+					srcData, srcStride,
+					_videoAvFrame->data[0], yStride,
+					_videoAvFrame->data[1], uStride,
+					_videoAvFrame->data[2], vStride,
+					frame.Width, frame.Height);
 			}
 		}
+		_totalSwsTime += _perfTimer.Elapsed.TotalMilliseconds;
 
 		_videoAvFrame->time_base.num = _videoCtx->time_base.num;
 		_videoAvFrame->time_base.den = _videoCtx->time_base.den;
 		_videoAvFrame->pts = frame.VideoPts;
 		_videoAvFrame->duration = 1;
+		
+		// 计时：视频编码
+		_perfTimer.Restart();
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
+		_totalEncodeTime += _perfTimer.Elapsed.TotalMilliseconds;
 
-		// 处理音频（使用 ArrayPool 减少 GC）
+		// 计时：音频处理
+		_perfTimer.Restart();
 		if (_audioEnabled && frame.AudioSamples != null && frame.AudioSampleCount > 0)
 		{
 			// 使用 ArrayPool 租用缓冲区
@@ -1075,6 +1078,17 @@ public class FfmpegExporter : IExporter
 			Array.Copy(frame.AudioSamples, audioCopy, frame.AudioSampleCount);
 			_audioQueue.Push(new ArraySegment<float>(audioCopy, 0, frame.AudioSampleCount).ToArray());
 			ArrayPool<float>.Shared.Return(audioCopy);
+		}
+		_totalAudioTime += _perfTimer.Elapsed.TotalMilliseconds;
+		
+		// 每 100 帧输出性能统计
+		_perfSampleCount++;
+		if (_perfSampleCount % 100 == 0)
+		{
+			double avgSws = _totalSwsTime / _perfSampleCount;
+			double avgEncode = _totalEncodeTime / _perfSampleCount;
+			double avgAudio = _totalAudioTime / _perfSampleCount;
+			Logger.Info($"[性能] sws_scale: {avgSws:F2}ms, 编码: {avgEncode:F2}ms, 音频: {avgAudio:F2}ms (avg/frame)");
 		}
 	}
 	

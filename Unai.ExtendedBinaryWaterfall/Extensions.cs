@@ -17,7 +17,7 @@ public static class Extensions
 	{
 		IsAntialias = true,
 		Style = SKPaintStyle.Stroke,
-		StrokeCap = SKStrokeCap.Butt  // 方形端点
+		StrokeCap = SKStrokeCap.Butt
 	};
 	
 	// 文本渲染缓存（预渲染的文本位图）- 使用 LRU 策略

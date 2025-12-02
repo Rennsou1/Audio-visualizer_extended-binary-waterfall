@@ -629,8 +629,8 @@ public class FfmpegExporter : IExporter
 				Logger.Info($"[音频] 输入: {_inputAudioSampleRate}Hz {inputChannels}ch -> 输出: {_actualAudioSampleRate}Hz {outputChannels}ch (需要重采样: {_needResample})");
 				
 				// Generator 每帧产生的采样数（基于解码器采样率）
-				// 解码器每帧产生: AudioDecoderSampleRate / OutputFps 个采样（每通道）
-				int inputSamplesPerChannel = Generator.AudioDecoderSampleRate / Generator.OutputFps;
+				// 使用 Ceiling 并增加余量，与 Generator 中的计算保持一致，防止截断
+				int inputSamplesPerChannel = (int)Math.Ceiling((double)Generator.AudioDecoderSampleRate / Generator.OutputFps) + 2;
 				
 				// 输入音频帧缓冲区大小需要足够容纳 AAC 帧（通常 1024 采样）
 				int audioFrameBufferSize = Math.Max(inputSamplesPerChannel, _audioCtx->frame_size);
@@ -713,8 +713,6 @@ public class FfmpegExporter : IExporter
 					if (_needResample && _swrCtx != null)
 					{
 						// 填充输入帧（支持任意声道数：interleaved -> planar）
-						// 输入数据格式：[L0 R0 C0 LFE0 Lb0 Rb0] [L1 R1 C1 LFE1 Lb1 Rb1] ...
-						// 输出到 planar：data[0]=[L0 L1 ...], data[1]=[R0 R1 ...], ...
 						for (uint ch = 0; ch < inputChannels; ch++)
 						{
 							float* chData = (float*)_audioAvFrame->data[ch];
@@ -725,14 +723,18 @@ public class FfmpegExporter : IExporter
 						}
 						_audioAvFrame->nb_samples = samplesPerChannel;
 						
-						// 使用 swr_convert 进行重采样
-						// 计算预期输出采样数
-						int maxOutputSamples = (int)((long)samplesPerChannel * _actualAudioSampleRate / _inputAudioSampleRate) + 256;
+						// 计算预期输出采样数（考虑重采样器内部延迟）
+						// swr_get_delay 返回输入采样率下的延迟样本数
+						long delay = ffmpeg.swr_get_delay(_swrCtx, _inputAudioSampleRate);
+						int maxOutputSamples = (int)ffmpeg.av_rescale_rnd(
+							delay + samplesPerChannel, 
+							_actualAudioSampleRate, 
+							_inputAudioSampleRate, 
+							AVRounding.AV_ROUND_UP) + 64;
 						
 						// 确保重采样输出帧有足够空间
 						if (_resampledAudioFrame->nb_samples < maxOutputSamples)
 						{
-							// 重新分配缓冲区（使用用户设置的输出声道数）
 							ffmpeg.av_frame_unref(_resampledAudioFrame);
 							_resampledAudioFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLTP;
 							ffmpeg.av_channel_layout_default(&_resampledAudioFrame->ch_layout, outputChannels);
@@ -757,7 +759,7 @@ public class FfmpegExporter : IExporter
 							return;
 						}
 						
-						// 将重采样后的数据累积到输出缓冲区（支持单声道或双声道输出）
+						// 将重采样后的数据累积到输出缓冲区
 						float* outL = (float*)_resampledAudioFrame->data[0];
 						if (outputChannels == 1)
 						{
@@ -765,7 +767,7 @@ public class FfmpegExporter : IExporter
 							for (int i = 0; i < convertedSamples && outputAccumCount < outputBufferSize; i++)
 							{
 								outputAccumL[outputAccumCount] = outL[i];
-								outputAccumR[outputAccumCount] = outL[i]; // 复制到 R 以保持一致性
+								outputAccumR[outputAccumCount] = outL[i];
 								outputAccumCount++;
 							}
 						}
@@ -953,16 +955,35 @@ public class FfmpegExporter : IExporter
 		var writeTask = _frameChannel.Writer.WriteAsync(pendingFrame);
 		if (!writeTask.IsCompletedSuccessfully)
 		{
-			// 如果不能立即写入，使用异步等待但不阻塞主线程
-			// 通过 SpinWait 短暂等待，避免线程切换开销
+			// 如果不能立即写入，等待但添加超时检测
 			var spinner = new SpinWait();
+			var waitStart = System.Diagnostics.Stopwatch.StartNew();
+			int spinCount = 0;
+			
 			while (!writeTask.IsCompleted)
 			{
+				spinCount++;
 				spinner.SpinOnce();
+				
+				// 每 1000 次自旋检查一次超时
+				if (spinCount % 1000 == 0)
+				{
+					double waitMs = waitStart.Elapsed.TotalMilliseconds;
+					if (waitMs > 5000) // 5 秒超时
+					{
+						Logger.Error($"[FfmpegExporter] PushNewFrame 等待超时! 已等待 {waitMs:F0}ms, frame={_frameNum}, Channel可能已死锁");
+						// 尝试继续，不要无限等待
+						break;
+					}
+					if (waitMs > 1000 && spinCount % 10000 == 0)
+					{
+						Logger.Warning($"[FfmpegExporter] PushNewFrame 等待中: {waitMs:F0}ms, frame={_frameNum}");
+					}
+				}
+				
 				if (spinner.NextSpinWillYield)
 				{
-					// 已经自旋足够多次，让出 CPU
-					Thread.Sleep(0);
+					Thread.Sleep(1); // 改为 1ms，避免 CPU 空转
 				}
 			}
 		}

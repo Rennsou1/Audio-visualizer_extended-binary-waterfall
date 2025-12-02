@@ -1751,8 +1751,8 @@ public class Generator
                     Array.Clear(_audioSampleBuffer, readSamples, samplesThisFrame - readSamples);
                 }
 
-                // 将float PCM 写入输出缓冲供可视化使用
-                _outputAudioBuffer.LoadFromInterleavedFloats(_audioSampleBuffer, AudioDecoderChannelCount);
+                // 传递实际读取的采样数，避免多余的静音采样导致 clicking
+                _outputAudioBuffer.LoadFromInterleavedFloats(_audioSampleBuffer, AudioDecoderChannelCount, readSamples);
             }
             else
             {

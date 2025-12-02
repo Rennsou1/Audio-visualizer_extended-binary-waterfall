@@ -10,8 +10,12 @@ public class AudioBuffer
 
 	float[][] Samples { get; set; }
 	public int ChannelCount => Samples.Length;
+	// 缓冲区容量（每通道）
 	public int SampleCount => Samples[0].Length;
-	public int TotalSampleCount => SampleCount * ChannelCount;
+	// 实际有效数据长度（每通道），用于避免传递多余的静音采样导致 clicking
+	public int ValidSampleCount { get; private set; }
+	// 返回实际有效数据的总采样数（所有通道）
+	public int TotalSampleCount => ValidSampleCount * ChannelCount;
 
 	public AudioBuffer(int sampleCount, int channelCount)
 	{
@@ -25,6 +29,8 @@ public class AudioBuffer
 		{
 			Array.Copy(source.Samples[ch], Samples[ch], SampleCount);
 		}
+		// 复制实际有效数据长度
+		ValidSampleCount = source.ValidSampleCount;
 	}
 
 	public AudioBuffer Clear(int? sampleCount = null, int? channelCount = null)
@@ -37,6 +43,8 @@ public class AudioBuffer
 		{
 			Samples[ch] = new float[sampleCount.Value];
 		}
+		// 清空后有效数据长度为缓冲区大小（全零也是有效数据）
+		ValidSampleCount = sampleCount.Value;
 
 		return this;
 	}
@@ -96,7 +104,8 @@ public class AudioBuffer
 	
 	/// <param name="buffer"> PCM 浮点数组，范围通常在 [-1,1]</param>
 	/// <param name="channelCount">通道数，必须与当前缓冲区通道数一致</param>
-	public AudioBuffer LoadFromInterleavedFloats(float[] buffer, int channelCount)
+	/// <param name="actualSampleCount">实际有效采样数（总采样数，包括所有通道），-1 表示使用 buffer.Length</param>
+	public AudioBuffer LoadFromInterleavedFloats(float[] buffer, int channelCount, int actualSampleCount = -1)
 	{
 		// 通道数不匹配时直接抛异常，便于在接入阶段快速发现问题
 		if (channelCount != ChannelCount)
@@ -104,7 +113,9 @@ public class AudioBuffer
 			throw new InvalidOperationException($"Channel mismatch: buffer={channelCount}ch, AudioBuffer={ChannelCount}ch");
 		}
 
-		int samplesPerChannel = buffer.Length / channelCount;
+		// 如果指定了实际采样数，使用它；否则使用 buffer.Length
+		int effectiveLength = (actualSampleCount >= 0) ? actualSampleCount : buffer.Length;
+		int samplesPerChannel = effectiveLength / channelCount;
 		int maxSamples = SampleCount;
 		int totalSamples = Math.Min(samplesPerChannel, maxSamples);
 
@@ -131,6 +142,9 @@ public class AudioBuffer
 			Logger.Warning($"AudioBuffer: source has {samplesPerChannel} samples/ch, truncated to {maxSamples}. (后续相同警告将被抑制)");
 			_truncationWarningShown = true;
 		}
+
+		// 记录实际有效数据长度（关键：用于避免多余静音采样导致 clicking）
+		ValidSampleCount = totalSamples;
 
 		return this;
 	}
@@ -184,9 +198,10 @@ public class AudioBuffer
 	}
 
 	// 将音频数据复制到目标数组（避免每帧分配新数组）
+	// 只复制 ValidSampleCount 范围内的有效数据，避免多余静音导致 clicking
 	public void CopyTo(float[] destination)
 	{
-		int length = Math.Min(destination.Length, SampleCount * ChannelCount);
+		int length = Math.Min(destination.Length, ValidSampleCount * ChannelCount);
 		for (int i = 0; i < length; i++)
 		{
 			destination[i] = Samples[i % ChannelCount][i / ChannelCount];

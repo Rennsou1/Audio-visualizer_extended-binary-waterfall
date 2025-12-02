@@ -7,6 +7,10 @@
 		
 		<MinVerTagPrefix>v</MinVerTagPrefix>
 		<MinVerDefaultPreReleaseIdentifiers>dev</MinVerDefaultPreReleaseIdentifiers>
+		
+		<!-- 发布时禁用 PDB 符号输出 -->
+		<DebugSymbols Condition="'$(Configuration)'=='Release'">false</DebugSymbols>
+		<DebugType Condition="'$(Configuration)'=='Release'">none</DebugType>
 	</PropertyGroup>
 
 	<ItemGroup>

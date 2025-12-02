@@ -441,6 +441,8 @@ public class Generator
     public string ExporterId { get; set; } = null;
     // 硬件加速类型（仅适用于 FFmpeg 导出器）
     public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
+    // 编码质量预设（Speed=速度优先, Balanced=平衡, Quality=质量优先）
+    public EncodingQualityPreset EncodingPreset { get; set; } = EncodingQualityPreset.Speed;
     // NVENC 编码配置
     public string NvencPreset { get; set; } = "p1";             // P1 最快速度
     public string NvencTune { get; set; } = "ll";               // ll=低延迟模式
@@ -902,10 +904,16 @@ public class Generator
         // 如果是 FFmpeg 导出器，应用所有编码设置
         if (Exporter is FfmpegExporter ffmpegExporter)
         {
+            // 先应用编码质量预设（如果设置了）
+            if (EncodingPreset != EncodingQualityPreset.Speed)
+            {
+                ffmpegExporter.ApplyQualityPreset(EncodingPreset);
+            }
+            
             // 硬件加速设置
             ffmpegExporter.HardwareAccel = HardwareAccel;
             
-            // NVENC 配置
+            // NVENC 配置（仅在未应用预设或需要覆盖时设置）
             ffmpegExporter.NvencPreset = NvencPreset;
             ffmpegExporter.NvencTune = NvencTune;
             ffmpegExporter.NvencRateControl = NvencRateControl;
@@ -914,6 +922,7 @@ public class Generator
             ffmpegExporter.NvencSpatialAQ = NvencSpatialAQ;
             ffmpegExporter.NvencAQStrength = NvencAQStrength;
             ffmpegExporter.NvencLookahead = NvencLookahead;
+            ffmpegExporter.NvencZeroLatency = NvencZeroLatency;
             
             // 视频编码参数
             ffmpegExporter.OutputVideoBitRate = VideoBitrate;
@@ -931,7 +940,7 @@ public class Generator
             // 输出容器格式
             ffmpegExporter.OutputFormat = OutputFormat;
             
-            Logger.Debug($"FFmpeg: Codec={VideoCodecIndex}, HW={HardwareAccel}, RC={RateControlMode}, CRF={CrfValue}, Bitrate={VideoBitrate/1_000_000}Mbps");
+            Logger.Debug($"FFmpeg: Codec={VideoCodecIndex}, HW={HardwareAccel}, Preset={NvencPreset}, RC={RateControlMode}, CRF={CrfValue}, Bitrate={VideoBitrate/1_000_000}Mbps, Lookahead={NvencLookahead}");
         }
 
         if (AdditionalCliArguments.Count > 0)
@@ -1339,7 +1348,7 @@ public class Generator
     // 总生成流程
     public void Generate()
     {
-        // 极端性能优化：配置运行时和线程池
+        // 配置运行时和线程池
         ConfigureHighPerformanceMode();
         
         _timer.Start();
@@ -1455,7 +1464,7 @@ public class Generator
         long totalFrames;
         
         // 使用浮点数精确计算每帧采样数，避免整数除法的精度丢失
-        // 注意：使用解码器声道数，因为我们读取的是解码器的数据
+        // 注意：使用解码器声道数，因为读取的是解码器的数据
         double exactSamplesPerFrame = (double)AudioDecoderSampleRate / OutputFps * AudioDecoderChannelCount;
         // 用于整数计算的近似值
         int decoderSamplesPerFrame = (int)Math.Ceiling(exactSamplesPerFrame);
@@ -1761,67 +1770,24 @@ public class Generator
             float subfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
             float minSubfileY = rightPanelTop;
 
-            // 检查是否需要刷新子文件列表缓存（窗口滚动或歌曲切换）
-            bool needsListRefresh = _subfileListCache == null ||
-                Math.Abs(_cachedSubfileWindowIndex - subfileWindowIndex) > 0.02f ||
-                _cachedCurrentSubfileKey != currentSubfileKey ||
-                _cachedFirstSubfileIndex != firstSubfileIndex ||
-                _cachedLastSubfileIndex != lastSubfileIndex;
-            
-            if (needsListRefresh)
-            {
-                // 释放旧缓存
-                _subfileListCache?.Dispose();
-                _subfileListCache = new SKBitmap(OutputVideoWidth, OutputVideoHeight, SKColorType.Bgra8888, SKAlphaType.Premul);
-                using var listCanvas = new SKCanvas(_subfileListCache);
-                listCanvas.Clear(SKColors.Transparent);
-                
-                // 预渲染子文件列表静态文本
-                float cacheSubfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
-                for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
-                {
-                    if (sfi < 0 || sfi >= _subfiles.Count) { cacheSubfileY += subfileRowH; continue; }
-                    if (cacheSubfileY < minSubfileY) { cacheSubfileY += subfileRowH; continue; }
-
-                    var subfile = _subfiles[sfi];
-                    bool isMainSubfile = sfi == currentSubfileKey;
-
-                    // 播放标记
-                    listCanvas.DrawTextAndCache(_typeface, _fontSize24, isMainSubfile ? "▶" : " ", 
-                        subfileX1, cacheSubfileY, SKColors.White, HorizontalAlign.Left, VerticalAlign.Center);
-                    // 文件名和元数据
-                    listCanvas.DrawTextAndCache(_typeface, _fontSize24,
-                        $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}",
-                        subfileX1 + 24 * s, cacheSubfileY, SKColors.White, HorizontalAlign.Left, VerticalAlign.Center);
-                    // 文件大小
-                    listCanvas.DrawTextAndCache(_typeface, _fontSize24, Utils.ToByteSizeString(subfile.Length),
-                        subfileX2, cacheSubfileY, SKColors.DimGray, HorizontalAlign.Right, VerticalAlign.Center);
-
-                    cacheSubfileY += subfileRowH;
-                }
-                
-                _cachedSubfileWindowIndex = subfileWindowIndex;
-                _cachedCurrentSubfileKey = currentSubfileKey;
-                _cachedFirstSubfileIndex = firstSubfileIndex;
-                _cachedLastSubfileIndex = lastSubfileIndex;
-            }
-            
-            // 绘制缓存的子文件列表
-            if (_subfileListCache != null)
-            {
-                _frameCanvas.DrawBitmap(_subfileListCache, 0, 0, _imagePaint);
-            }
-            
-            // 只动态绘制当前播放项的进度（每帧变化）
-            subfileY = listTop + subfileRowH / 2f + subfileRowH * 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
+            // 直接绘制子文件列表（预渲染缓存反而更慢）
             for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
             {
                 if (sfi < 0 || sfi >= _subfiles.Count) { subfileY += subfileRowH; continue; }
                 if (subfileY < minSubfileY) { subfileY += subfileRowH; continue; }
 
-                if (sfi == currentSubfileKey)
+                var subfile = _subfiles[sfi];
+                bool isMainSubfile = sfi == currentSubfileKey;
+
+                DrawText(subfileX1, subfileY, _fontSize24, isMainSubfile ? "▶" : " ", SKColors.White, VerticalAlign.Center);
+                DrawText(subfileX1 + 24 * s, subfileY, _fontSize24,
+                    $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}",
+                    SKColors.White, VerticalAlign.Center);
+                DrawText(subfileX2, subfileY, _fontSize24, Utils.ToByteSizeString(subfile.Length),
+                    SKColors.DimGray, VerticalAlign.Center, HorizontalAlign.Right);
+
+                if (isMainSubfile)
                 {
-                    var subfile = _subfiles[sfi];
                     double currentAudioTimeLocal = (double)frameNumber / OutputFps;
                     float percentOfSubfile;
 
@@ -1844,8 +1810,8 @@ public class Generator
                         $"{(int)(percentOfSubfile * 100)} %", SKColors.White,
                         VerticalAlign.Center, HorizontalAlign.Center);
                     _frameCanvas.DrawProgressBar(percentOfSubfile, (int)(subfileX1 + 60 * s), subfileX2, progressY);
-                    break;
                 }
+
                 subfileY += subfileRowH;
             }
 
@@ -1901,21 +1867,9 @@ public class Generator
                 _frameCanvas.DrawRect(new SKRect(0, shadowY2 - gradientHeight, OutputVideoWidth, shadowY2), _gradientPaint);
             }
 
-            // 专辑标题只在歌曲切换时更新
-            if (needsListRefresh || _albumHeaderCache == null)
-            {
-                _albumHeaderCache?.Dispose();
-                _albumHeaderCache = new SKBitmap(OutputVideoWidth, 100, SKColorType.Bgra8888, SKAlphaType.Premul);
-                using var headerCanvas = new SKCanvas(_albumHeaderCache);
-                headerCanvas.Clear(SKColors.Transparent);
-                headerCanvas.DrawTextAndCache(_typeface, _fontSize24,
-                    Utils.TruncateString(albumHeaderText ?? string.Empty, 72),
-                    subfileX1 + 40, 50, new SKColor(105, 105, 105), HorizontalAlign.Left, VerticalAlign.Center);
-            }
-            if (_albumHeaderCache != null)
-            {
-                _frameCanvas.DrawBitmap(_albumHeaderCache, 0, rightPanelTop - 74f, _imagePaint);
-            }
+            // 专辑标题直接绘制
+            DrawText(subfileX1 + 40, rightPanelTop - 24f, _fontSize24,
+                Utils.TruncateString(albumHeaderText ?? string.Empty, 72), new SKColor(105, 105, 105), VerticalAlign.Center);
 
             // 确保静态UI层已缓存，然后绘制
             EnsureStaticUILayerCached(avSettingsString, readSpeedString);

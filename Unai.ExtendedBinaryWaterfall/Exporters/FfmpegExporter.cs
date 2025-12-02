@@ -55,7 +55,10 @@ public class FfmpegExporter : IExporter
 	private Channel<PendingFrame> _frameChannel;
 	private Task _encoderTask;
 	private CancellationTokenSource _encoderCts;
-	private const int MaxQueueSize = 256;  // 大缓冲区最大化吞吐量
+	private const int MaxQueueSize = 384;  // 增大缓冲区以改善推送延迟
+	
+	// 背压策略：DropOldest=丢弃旧帧保持实时性，Wait=等待确保所有帧
+	public BoundedChannelFullMode ChannelBackpressureMode { get; set; } = BoundedChannelFullMode.Wait;
 	
 	// 帧数据对象池（减少 GC 压力）
 	private ConcurrentBag<PendingFrame> _framePool = new();
@@ -119,16 +122,16 @@ public class FfmpegExporter : IExporter
 	public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
 
 	// NVENC 编码配置
-	// P1=最快, P2=快速, P4=平衡, P7=最慢
+	// P1=最快低质量, P3=快速平衡, P4=平衡, P6=质量优先, P7=最慢最高质量
 	public string NvencPreset { get; set; } = "p1";       // P1 最快速度
-	public string NvencTune { get; set; } = "ll";         // ll=低延迟模式
-	public string NvencRateControl { get; set; } = "vbr"; // vbr=可变比特率
-	public int NvencBFrames { get; set; } = 0;            // B帧=0
-	public bool NvencTemporalAQ { get; set; } = false;    // 关闭时域AQ
-	public bool NvencSpatialAQ { get; set; } = false;     // 关闭空域AQ
-	public int NvencAQStrength { get; set; } = 0;         // AQ强度=0
-	public int NvencLookahead { get; set; } = 0;          // Lookahead=0
-	public bool NvencZeroLatency { get; set; } = true;    // 零延迟模式
+	public string NvencTune { get; set; } = "ll";         // ll=低延迟, hq=高质量
+	public string NvencRateControl { get; set; } = "vbr"; // vbr=可变比特率, cbr=恒定比特率
+	public int NvencBFrames { get; set; } = 0;            // B帧数（0=禁用, 1-3=启用B帧提高压缩率）
+	public bool NvencTemporalAQ { get; set; } = false;    // 时域AQ（改善场景切换质量）
+	public bool NvencSpatialAQ { get; set; } = false;     // 空域AQ（改善复杂区域质量）
+	public int NvencAQStrength { get; set; } = 0;         // AQ强度=0-15
+	public int NvencLookahead { get; set; } = 0;          // Lookahead=0-32（10-16推荐用于质量优先）
+	public bool NvencZeroLatency { get; set; } = true;    // 零延迟模式（禁用可改善质量）
 	
 	// 视频编码参数
 	public int VideoCodecIndex { get; set; } = 0;
@@ -157,37 +160,43 @@ public class FfmpegExporter : IExporter
 		switch (preset)
 		{
 			case EncodingQualityPreset.Speed:
-				// 速度
-				NvencPreset = "p1";           // 映射到 fast
-				NvencBFrames = 0;             // 禁用B帧
+				// 速度优先：最快编码，最小延迟
+				NvencPreset = "p1";           // 最快预设
+				NvencTune = "ll";             // 低延迟调优
+				NvencBFrames = 0;             // 禁用B帧（显著提高速度）
 				NvencTemporalAQ = false;      // 禁用时域AQ
 				NvencSpatialAQ = false;       // 禁用空域AQ
 				NvencLookahead = 0;           // 禁用前瞻
 				NvencZeroLatency = true;      // 零延迟模式
-				Logger.Info("已应用速度预设");
+				ChannelBackpressureMode = BoundedChannelFullMode.Wait;  // 确保所有帧
+				Logger.Info("已应用速度预设: p1, bf=0, zerolatency=on");
 				break;
 				
 			case EncodingQualityPreset.Balanced:
-				// 平衡模式
-				NvencPreset = "p4";           // 映射到 medium
-				NvencBFrames = 2;             // 2个B帧
+				// 平衡模式：速度与质量的折中
+				NvencPreset = "p3";           // 快速预设（比 p4 快，比 p1 质量更好）
+				NvencTune = "hq";             // 高质量调优
+				NvencBFrames = 1;             // 1个B帧（平衡压缩率和延迟）
 				NvencTemporalAQ = true;       // 启用时域AQ
 				NvencSpatialAQ = false;       // 禁用空域AQ
-				NvencLookahead = 8;           // 8帧前瞻
-				NvencZeroLatency = false;     // 正常延迟
-				Logger.Info("已应用平衡预设");
+				NvencLookahead = 10;          // 10帧前瞻（NVIDIA 推荐）
+				NvencZeroLatency = false;     // 允许适度延迟
+				ChannelBackpressureMode = BoundedChannelFullMode.Wait;
+				Logger.Info("已应用平衡预设: p3, bf=1, lookahead=10");
 				break;
 				
 			case EncodingQualityPreset.Quality:
-				// 质量优先
-				NvencPreset = "p6";           // 映射到 slow
-				NvencBFrames = 3;             // 3个B帧
+				// 质量优先：最佳压缩率和图像质量
+				NvencPreset = "p6";           // 慢速预设（高质量）
+				NvencTune = "hq";             // 高质量调优
+				NvencBFrames = 3;             // 3个B帧（最佳压缩率）
 				NvencTemporalAQ = true;       // 启用时域AQ
 				NvencSpatialAQ = true;        // 启用空域AQ
 				NvencAQStrength = 8;          // AQ强度
-				NvencLookahead = 20;          // 20帧前瞻
-				NvencZeroLatency = false;     // 正常延迟
-				Logger.Info("已应用质量预设");
+				NvencLookahead = 16;          // 16帧前瞻（最佳质量）
+				NvencZeroLatency = false;     // 允许延迟
+				ChannelBackpressureMode = BoundedChannelFullMode.Wait;
+				Logger.Info("已应用质量预设: p6, bf=3, lookahead=16, spatial-aq=on");
 				break;
 		}
 	}
@@ -393,7 +402,7 @@ public class FfmpegExporter : IExporter
 			if (encoderName == "h264_nvenc" || encoderName == "hevc_nvenc")
 			{
 				// 预设名称（使用 FFmpeg 支持的标准名称）
-				// p1=最快, ll=低延迟, llhp=低延迟高性能
+				// p1=最快低质量, p3=快速平衡, p4=平衡, p6=质量优先, p7=最慢最高质量
 				string preset = NvencPreset switch
 				{
 					"p1" => "p1",        // 最快预设
@@ -407,8 +416,15 @@ public class FfmpegExporter : IExporter
 				};
 				ffmpeg.av_dict_set(&videoEncOpts, "preset", preset, 0);
 				
-				// 低延迟调优（最大化速度）
-				ffmpeg.av_dict_set(&videoEncOpts, "tune", "ll", 0);
+				// 调优模式（ll=低延迟, hq=高质量）
+				string tune = NvencTune switch
+				{
+					"ll" => "ll",        // 低延迟
+					"hq" => "hq",        // 高质量
+					"lossless" => "lossless",  // 无损
+					_ => "ll"
+				};
+				ffmpeg.av_dict_set(&videoEncOpts, "tune", tune, 0);
 				
 				// 码率控制
 				string rc = NvencRateControl switch
@@ -421,26 +437,33 @@ public class FfmpegExporter : IExporter
 				};
 				ffmpeg.av_dict_set(&videoEncOpts, "rc", rc, 0);
 				
-				// B帧=0（禁用B帧显著提高速度）
+				// B帧配置（0=禁用提高速度，1-3=启用提高压缩率）
 				ffmpeg.av_dict_set(&videoEncOpts, "bf", NvencBFrames.ToString(), 0);
 				
-				// 禁用双向参考帧（提高速度）
-				ffmpeg.av_dict_set(&videoEncOpts, "b_ref_mode", "0", 0);
+				// B帧参考模式（0=禁用双向参考帧提高速度，middle=启用提高质量）
+				if (NvencBFrames > 0)
+					ffmpeg.av_dict_set(&videoEncOpts, "b_ref_mode", "middle", 0);
+				else
+					ffmpeg.av_dict_set(&videoEncOpts, "b_ref_mode", "0", 0);
 				
-				// 零延迟模式
+				// 零延迟模式（禁用可改善压缩率和质量）
 				if (NvencZeroLatency)
 				{
 					ffmpeg.av_dict_set(&videoEncOpts, "delay", "0", 0);
 					ffmpeg.av_dict_set(&videoEncOpts, "zerolatency", "1", 0);
 				}
 				
-				// Lookahead（0=禁用）
-				if (NvencLookahead >= 0)
+				// Lookahead 前瞻分析（0=禁用，10-16=推荐用于质量优先）
+				if (NvencLookahead > 0)
 					ffmpeg.av_dict_set(&videoEncOpts, "rc-lookahead", NvencLookahead.ToString(), 0);
 				
-				// 自适应量化
+				// 自适应量化（改善复杂区域和场景切换的质量）
 				if (NvencSpatialAQ)
+				{
 					ffmpeg.av_dict_set(&videoEncOpts, "spatial-aq", "1", 0);
+					if (NvencAQStrength > 0)
+						ffmpeg.av_dict_set(&videoEncOpts, "aq-strength", NvencAQStrength.ToString(), 0);
+				}
 				if (NvencTemporalAQ)
 					ffmpeg.av_dict_set(&videoEncOpts, "temporal-aq", "1", 0);
 				
@@ -453,7 +476,7 @@ public class FfmpegExporter : IExporter
 				// 强制关键帧以支持视频定位
 				ffmpeg.av_dict_set(&videoEncOpts, "forced-idr", "1", 0);
 				
-				Logger.Info($"NVENC 配置: preset={preset}, tune=ll, rc={rc}, bf={NvencBFrames}, surfaces=64, zerolatency={NvencZeroLatency}");
+				Logger.Info($"NVENC 配置: preset={preset}, tune={tune}, rc={rc}, bf={NvencBFrames}, lookahead={NvencLookahead}, zerolatency={NvencZeroLatency}");
 			}
 			else if (encoderName == "h264_qsv" || encoderName == "hevc_qsv")
 			{
@@ -955,9 +978,10 @@ public class FfmpegExporter : IExporter
 	private void StartAsyncEncoder()
 	{
 		// 使用高性能 Channel（比 BlockingCollection 快 2-3 倍）
+		// 背压策略：Wait=等待确保所有帧, DropOldest=丢弃旧帧保持实时性
 		_frameChannel = Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(MaxQueueSize)
 		{
-			FullMode = BoundedChannelFullMode.Wait,
+			FullMode = ChannelBackpressureMode,
 			SingleReader = true,
 			SingleWriter = true
 		});

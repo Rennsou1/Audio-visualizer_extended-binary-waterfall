@@ -17,6 +17,12 @@ public class AudioFrameResizer<T>
 	// 将输入数据推入缓冲区，当缓冲区满时调用 OutputCallback
 	public void Push(T[] input)
 	{
+		Push(input.AsSpan());
+	}
+	
+	// 重载：接受 Span 避免数组分配
+	public void Push(ReadOnlySpan<T> input)
+	{
 		int inputOfs = 0;
 		
 		while (inputOfs < input.Length)
@@ -25,8 +31,8 @@ public class AudioFrameResizer<T>
 			int spaceLeft = BufferLength - _bufOfs;
 			int toCopy = Math.Min(spaceLeft, input.Length - inputOfs);
 			
-			// 复制数据到缓冲区
-			Array.Copy(input, inputOfs, _outputBuffer, _bufOfs, toCopy);
+			// 复制数据到缓冲区（使用 Span.CopyTo 比 Array.Copy 更高效）
+			input.Slice(inputOfs, toCopy).CopyTo(_outputBuffer.AsSpan(_bufOfs, toCopy));
 			inputOfs += toCopy;
 			_bufOfs += toCopy;
 			

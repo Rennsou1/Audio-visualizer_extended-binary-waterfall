@@ -38,6 +38,8 @@
 		<PackageReference Include="System.Management" Version="10.0.0-rc.1.25451.107" />
 		<!-- libyuv 色彩空间转换 -->
 		<PackageReference Include="Lennox.LibYuvSharp" Version="1.0.4" />
+		<!-- 对象池 -->
+		<PackageReference Include="Microsoft.Extensions.ObjectPool" Version="9.0.0" />
 	</ItemGroup>
 
 </Project>

@@ -7,6 +7,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using FFmpeg.AutoGen;
 using Lennox.LibYuvSharp;
+using Microsoft.Extensions.ObjectPool;
 using SkiaSharp;
 
 namespace Unai.ExtendedBinaryWaterfall.Exporters;
@@ -29,8 +30,8 @@ public enum EncodingQualityPreset
 	Quality   // 质量
 }
 
-// 异步编码帧数据
-public class PendingFrame
+// 异步编码帧数据（实现 IResettable 以支持 ObjectPool 自动重置）
+public class PendingFrame : IResettable
 {
 	public byte[] PixelData;        // 像素数据副本
 	public int Width;
@@ -40,6 +41,15 @@ public class PendingFrame
 	public int AudioChannels;
 	public long VideoPts;           // 视频 PTS
 	public long AudioPts;           // 音频 PTS
+	
+	// IResettable 实现：归还到池时自动重置
+	public bool TryReset()
+	{
+		PixelData = null;
+		AudioSamples = null;
+		AudioSampleCount = 0;
+		return true;
+	}
 }
 
 [Exporter("ffmpeg", "FFmpeg Stream", "Use FFmpeg libraries to encode audio and video data and output it in Matroska format.")]
@@ -60,13 +70,13 @@ public class FfmpegExporter : IExporter
 	// 背压策略：DropOldest=丢弃旧帧保持实时性，Wait=等待确保所有帧
 	public BoundedChannelFullMode ChannelBackpressureMode { get; set; } = BoundedChannelFullMode.Wait;
 	
-	// 帧数据对象池（减少 GC 压力）
-	private ConcurrentBag<PendingFrame> _framePool = new();
-	private ConcurrentBag<byte[]> _pixelBufferPool = new();
-	private ConcurrentBag<float[]> _audioBufferPool = new();
+	// 对象池（替代 ConcurrentBag，减少锁竞争）
+	private ObjectPool<PendingFrame> _framePool;
+	private ConcurrentQueue<byte[]> _pixelBufferPool = new();
+	private ConcurrentQueue<float[]> _audioBufferPool = new();
 	
 	// 预分配对象池
-	private const int PreallocPoolSize = 300;  // 增大预分配数量以匹配管道深度
+	private const int PreallocPoolSize = 256;  // 对象池最大保留数量
 
 	private unsafe AVFormatContext* _fmtCtx;
 
@@ -101,10 +111,13 @@ public class FfmpegExporter : IExporter
 	
 	// 性能诊断计时器
 	private readonly System.Diagnostics.Stopwatch _perfTimer = new();
-	private double _totalSwsTime = 0;
-	private double _totalEncodeTime = 0;
-	private double _totalAudioTime = 0;
-	private int _perfSampleCount = 0;
+	// 使用滑动窗口统计（避免长时间运行后累加器精度问题）
+	private const int PerfWindowSize = 100;
+	private double _windowSwsTime = 0;
+	private double _windowEncodeTime = 0;
+	private double _windowAudioTime = 0;
+	private int _windowSampleCount = 0;
+	private int _totalFrameCount = 0;
 
 	public Generator Generator { get; set; }
 	
@@ -470,13 +483,26 @@ public class FfmpegExporter : IExporter
 				// GPU设备选择
 				ffmpeg.av_dict_set(&videoEncOpts, "gpu", "0", 0);
 				
-				// 增加编码器表面缓冲区数量（提高并行度）
-				ffmpeg.av_dict_set(&videoEncOpts, "surfaces", "64", 0);
+				// 编码器表面缓冲区数量（平衡并行度和延迟）
+				// 32 足够 60fps 编码，减少内存占用和延迟
+				ffmpeg.av_dict_set(&videoEncOpts, "surfaces", "32", 0);
 				
 				// 强制关键帧以支持视频定位
 				ffmpeg.av_dict_set(&videoEncOpts, "forced-idr", "1", 0);
 				
-				Logger.Info($"NVENC 配置: preset={preset}, tune={tune}, rc={rc}, bf={NvencBFrames}, lookahead={NvencLookahead}, zerolatency={NvencZeroLatency}");
+				// 禁用场景切换检测（减少延迟波动）
+				ffmpeg.av_dict_set(&videoEncOpts, "no-scenecut", "1", 0);
+				
+				// 严格 GOP（确保固定关键帧间隔）
+				ffmpeg.av_dict_set(&videoEncOpts, "strict_gop", "1", 0);
+				
+				// 2pass 多码率编码分配（提高码率利用效率）
+				ffmpeg.av_dict_set(&videoEncOpts, "multipass", "0", 0);
+				
+				// 禁用加权预测（减少编码复杂度）
+				ffmpeg.av_dict_set(&videoEncOpts, "weighted_pred", "0", 0);
+				
+				Logger.Info($"NVENC 配置: preset={preset}, tune={tune}, rc={rc}, bf={NvencBFrames}, lookahead={NvencLookahead}, zerolatency={NvencZeroLatency}, surfaces=32");
 			}
 			else if (encoderName == "h264_qsv" || encoderName == "hevc_qsv")
 			{
@@ -906,15 +932,12 @@ public class FfmpegExporter : IExporter
 			StartAsyncEncoder();
 		}
 		
-		// 获取或创建帧数据对象（从对象池）
-		if (!_framePool.TryTake(out var pendingFrame))
-		{
-			pendingFrame = new PendingFrame();
-		}
+		// 获取帧数据对象（从 ObjectPool）
+		var pendingFrame = _framePool.Get();
 		
-		// 获取或创建像素缓冲区（从对象池）
+		// 获取或创建像素缓冲区（从队列池）
 		int pixelSize = videoFrame.Width * videoFrame.Height * 4;
-		if (!_pixelBufferPool.TryTake(out var pixelBuffer) || pixelBuffer.Length < pixelSize)
+		if (!_pixelBufferPool.TryDequeue(out var pixelBuffer) || pixelBuffer.Length < pixelSize)
 		{
 			pixelBuffer = new byte[pixelSize];
 		}
@@ -930,7 +953,7 @@ public class FfmpegExporter : IExporter
 		if (_audioEnabled && audioFrame != null)
 		{
 			int audioLen = audioFrame.TotalSampleCount;
-			if (!_audioBufferPool.TryTake(out var audioBuffer) || audioBuffer.Length < audioLen)
+			if (!_audioBufferPool.TryDequeue(out var audioBuffer) || audioBuffer.Length < audioLen)
 			{
 				audioBuffer = new float[audioLen];
 			}
@@ -947,7 +970,7 @@ public class FfmpegExporter : IExporter
 		// 设置 PTS
 		pendingFrame.VideoPts = _frameNum;
 		
-		// 将帧加入编码 Channel（高性能非阻塞）
+		// 将帧加入编码 Channel（非阻塞）
 		// 使用 ValueTask 避免分配，且不阻塞渲染线程
 		var writeTask = _frameChannel.Writer.WriteAsync(pendingFrame);
 		if (!writeTask.IsCompletedSuccessfully)
@@ -977,7 +1000,11 @@ public class FfmpegExporter : IExporter
 	// 启动异步编码线程
 	private void StartAsyncEncoder()
 	{
-		// 使用高性能 Channel（比 BlockingCollection 快 2-3 倍）
+		// 初始化 ObjectPool
+		var poolPolicy = new DefaultPooledObjectPolicy<PendingFrame>();
+		_framePool = new DefaultObjectPool<PendingFrame>(poolPolicy, PreallocPoolSize);
+		
+		// 使用 Channel（比 BlockingCollection 快 2-3 倍）
 		// 背压策略：Wait=等待确保所有帧, DropOldest=丢弃旧帧保持实时性
 		_frameChannel = Channel.CreateBounded<PendingFrame>(new BoundedChannelOptions(MaxQueueSize)
 		{
@@ -987,14 +1014,14 @@ public class FfmpegExporter : IExporter
 		});
 		_encoderCts = new CancellationTokenSource();
 		
-		// 预分配对象池（减少 GC）
+		// 预分配缓冲区池（减少 GC）
+		// 注意：_framePool 是 ObjectPool，会自动管理对象创建
 		int pixelSize = Generator.OutputVideoWidth * Generator.OutputVideoHeight * 4;
 		int audioSize = Generator.AudioDecoderSampleRate / Generator.OutputFps * Generator.AudioDecoderChannelCount * 2;
 		for (int i = 0; i < PreallocPoolSize; i++)
 		{
-			_framePool.Add(new PendingFrame());
-			_pixelBufferPool.Add(new byte[pixelSize]);
-			_audioBufferPool.Add(new float[audioSize]);
+			_pixelBufferPool.Enqueue(new byte[pixelSize]);
+			_audioBufferPool.Enqueue(new float[audioSize]);
 		}
 		
 		// 强制进行一次完整 GC，清理启动时的临时对象
@@ -1010,7 +1037,7 @@ public class FfmpegExporter : IExporter
 			TaskScheduler.Default
 		).Unwrap();
 		
-		Logger.Info($"高性能编码器已启动，Channel 缓冲: {MaxQueueSize} 帧，预分配池: {PreallocPoolSize} 对象");
+		Logger.Info($"编码器已启动，Channel 缓冲: {MaxQueueSize} 帧，预分配池: {PreallocPoolSize} 对象");
 	}
 	
 	// 异步编码循环（在后台线程运行）
@@ -1081,7 +1108,8 @@ public class FfmpegExporter : IExporter
 					frame.Width, frame.Height);
 			}
 		}
-		_totalSwsTime += _perfTimer.Elapsed.TotalMilliseconds;
+		double swsTime = _perfTimer.Elapsed.TotalMilliseconds;
+		_windowSwsTime += swsTime;
 
 		_videoAvFrame->time_base.num = _videoCtx->time_base.num;
 		_videoAvFrame->time_base.den = _videoCtx->time_base.den;
@@ -1091,47 +1119,56 @@ public class FfmpegExporter : IExporter
 		// 计时：视频编码
 		_perfTimer.Restart();
 		DoEncode(_videoCtx, _videoStream, _videoAvFrame, _videoAvPacket);
-		_totalEncodeTime += _perfTimer.Elapsed.TotalMilliseconds;
+		double encodeTime = _perfTimer.Elapsed.TotalMilliseconds;
+		_windowEncodeTime += encodeTime;
 
 		// 计时：音频处理
 		_perfTimer.Restart();
 		if (_audioEnabled && frame.AudioSamples != null && frame.AudioSampleCount > 0)
 		{
-			// 使用 ArrayPool 租用缓冲区
-			var audioCopy = ArrayPool<float>.Shared.Rent(frame.AudioSampleCount);
-			Array.Copy(frame.AudioSamples, audioCopy, frame.AudioSampleCount);
-			_audioQueue.Push(new ArraySegment<float>(audioCopy, 0, frame.AudioSampleCount).ToArray());
-			ArrayPool<float>.Shared.Return(audioCopy);
+			// 直接使用 ReadOnlySpan 避免内存分配（AudioSamples 已经是从对象池获取的缓冲区）
+			// 使用 AsSpan 创建视图，避免 .ToArray() 导致的内存分配
+			ReadOnlySpan<float> audioSpan = frame.AudioSamples.AsSpan(0, frame.AudioSampleCount);
+			_audioQueue.Push(audioSpan);
 		}
-		_totalAudioTime += _perfTimer.Elapsed.TotalMilliseconds;
+		double audioTime = _perfTimer.Elapsed.TotalMilliseconds;
+		_windowAudioTime += audioTime;
 		
-		// 每 100 帧输出性能统计
-		_perfSampleCount++;
-		if (_perfSampleCount % 100 == 0)
+		// 滑动窗口性能统计（每 100 帧重置，避免累加器精度问题）
+		_windowSampleCount++;
+		_totalFrameCount++;
+		if (_windowSampleCount >= PerfWindowSize)
 		{
-			double avgSws = _totalSwsTime / _perfSampleCount;
-			double avgEncode = _totalEncodeTime / _perfSampleCount;
-			double avgAudio = _totalAudioTime / _perfSampleCount;
-			Logger.Info($"[性能] sws_scale: {avgSws:F2}ms, 编码: {avgEncode:F2}ms, 音频: {avgAudio:F2}ms (avg/frame)");
+			double avgSws = _windowSwsTime / _windowSampleCount;
+			double avgEncode = _windowEncodeTime / _windowSampleCount;
+			double avgAudio = _windowAudioTime / _windowSampleCount;
+			Logger.Info($"[性能] sws_scale: {avgSws:F2}ms, 编码: {avgEncode:F2}ms, 音频: {avgAudio:F2}ms (avg/frame, window={_totalFrameCount})");
+			
+			// 重置滑动窗口
+			_windowSwsTime = 0;
+			_windowEncodeTime = 0;
+			_windowAudioTime = 0;
+			_windowSampleCount = 0;
 		}
 	}
 	
 	// 将帧数据对象归还到对象池
 	private void ReturnToPool(PendingFrame frame)
 	{
-		// 像素缓冲区可以安全归还
+		// 像素缓冲区归还到队列池
 		if (frame.PixelData != null)
 		{
-			_pixelBufferPool.Add(frame.PixelData);
+			_pixelBufferPool.Enqueue(frame.PixelData);
 			frame.PixelData = null;
 		}
-		// 音频缓冲区也可以归还（数据已经被复制）
+		// 音频缓冲区归还到队列池
 		if (frame.AudioSamples != null)
 		{
-			_audioBufferPool.Add(frame.AudioSamples);
+			_audioBufferPool.Enqueue(frame.AudioSamples);
 			frame.AudioSamples = null;
 		}
-		_framePool.Add(frame);
+		// 帧对象归还到 ObjectPool（会自动调用 TryReset）
+		_framePool.Return(frame);
 	}
 
 	public unsafe void Finish()

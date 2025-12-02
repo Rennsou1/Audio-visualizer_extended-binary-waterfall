@@ -466,7 +466,17 @@ public class Generator
     public int AudioCodecIndex { get; set; } = 0;               // 0=AAC
     // 输出格式
     public string OutputFormat { get; set; } = "matroska";      // matroska, mp4, webm, mov, avi
-    public int InputBytesPerSecond { get; set; } = 48000 * 2;
+    
+    // 瀑布视窗时间跨度（毫秒），控制瀑布滚动速度
+    // 值越大，瀑布显示的时间范围越长
+    // 默认值 2730ms 对应原始 InputBytesPerSecond = 96000
+    [CliParameter("Waterfall window duration in milliseconds", "waterfall-window-ms")]
+    public int WaterfallWindowMs { get; set; } = 2730;
+    
+    // 根据瀑布视窗时间计算每秒字节数（瀑布滚动速度）
+    // 公式：InputBytesPerSecond = WaterfallFrameLength * 1000 / WaterfallWindowMs
+    public int InputBytesPerSecond => WaterfallFrameLength * 1000 / Math.Max(1, WaterfallWindowMs);
+    
     public string FontName { get; set; } = null;
     [CliParameter("Font Antialiasing", "font-antialiasing")]
     public bool FontAntialiasing { get => _fontAntialiasing; set => _fontAntialiasing = value; }
@@ -665,11 +675,13 @@ public class Generator
                         totalFileSize += new System.IO.FileInfo(path).Length;
                 }
                 
-                // 计算 InputBytesPerSecond（所有文件总大小 / 总时长）
+                // 根据总文件大小和总时长计算 WaterfallWindowMs（瀑布视窗时间）
                 if (totalDuration > 0.1)
                 {
-                    InputBytesPerSecond = (int)(totalFileSize / totalDuration);
-                    Logger.Info($"Multi-file InputBytesPerSecond: {InputBytesPerSecond} ({totalFileSize} bytes / {totalDuration:F2}s)");
+                    int calculatedBytesPerSecond = (int)(totalFileSize / totalDuration);
+                    // WaterfallWindowMs = WaterfallFrameLength * 1000 / InputBytesPerSecond
+                    WaterfallWindowMs = WaterfallFrameLength * 1000 / Math.Max(1, calculatedBytesPerSecond);
+                    Logger.Info($"Multi-file WaterfallWindowMs: {WaterfallWindowMs}ms (InputBytesPerSecond={InputBytesPerSecond})");
                 }
                 
                 // 初始化多文件二进制源用于瀑布可视化
@@ -686,7 +698,7 @@ public class Generator
                 AudioDecoderSampleRate = wf.SampleRate;
                 AudioDecoderChannelCount = wf.Channels;
 
-                // 计算 InputBytesPerSecond
+                // 根据音频时长计算 WaterfallWindowMs（瀑布视窗时间）
                 long decodedBytes = _audioWaveSource.Length;
                 int bytesPerSecond = wf.BytesPerSecond;
                 if (decodedBytes > 0 && bytesPerSecond > 0 && InputFileStream != null && InputFileStream.Length > 0)
@@ -694,7 +706,9 @@ public class Generator
                     double durationSeconds = decodedBytes / (double)bytesPerSecond;
                     if (durationSeconds > 0.1)
                     {
-                        InputBytesPerSecond = (int)(InputFileStream.Length / durationSeconds);
+                        int calculatedBytesPerSecond = (int)(InputFileStream.Length / durationSeconds);
+                        WaterfallWindowMs = WaterfallFrameLength * 1000 / Math.Max(1, calculatedBytesPerSecond);
+                        Logger.Info($"Single-file WaterfallWindowMs: {WaterfallWindowMs}ms (InputBytesPerSecond={InputBytesPerSecond})");
                     }
                 }
 
@@ -1365,7 +1379,7 @@ public class Generator
         OnFinish?.Invoke();
     }
     
-    // 配置高性能模式：调整线程池、GC 和运行时设置
+    // 配置模式：调整线程池、GC 和运行时设置
     private static void ConfigureHighPerformanceMode()
     {
         // 大幅增加线程池线程数（完全利用多核 CPU）
@@ -1739,7 +1753,10 @@ public class Generator
 
             if (currentSubfileKey >= 0)
             {
-                subfileWindowIndex = 0.2f * subfileWindowIndex + 0.8f * currentSubfileKey;
+                // 列表居中逻辑：前3个文件从开头往下移动，第3个之后固定在第3行位置
+                // 当播放第3个及之后时，窗口索引=currentSubfileKey-2（当前项固定在第3行）
+                float targetWindowIndex = currentSubfileKey < 3 ? 0 : currentSubfileKey - 2;
+                subfileWindowIndex = 0.2f * subfileWindowIndex + 0.8f * targetWindowIndex;
             }
 
             // 5. 实际绘制一帧：左侧瀑布 + 右侧上部列表 + 右下音频可视化 + 顶/底渐变 + 文字信息

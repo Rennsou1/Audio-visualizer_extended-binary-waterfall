@@ -25,7 +25,9 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
     private long _position;
     private bool _isDisposed;
     private int _channels;
-    private int _sampleRate;
+    private int _sampleRate;           // 原始采样率
+    private int _targetSampleRate;     // 目标采样率（可能与原始不同）
+    private int _targetChannels;       // 目标声道数
     
     // 简单线性缓冲区（取代复杂的环形缓冲区）
     private float[] _buffer;
@@ -37,9 +39,14 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
     private static bool _ffmpegInitialized = false;
     private static readonly object _initLock = new object();
     
-    public FfmpegAudioDecoder(string filePath)
+    // 构造函数，支持指定目标采样率和声道数（用于多文件混合时统一格式）
+    // targetSampleRate <= 0 表示使用原始采样率
+    // targetChannels <= 0 表示使用原始声道数
+    public FfmpegAudioDecoder(string filePath, int targetSampleRate = 0, int targetChannels = 0)
     {
         _filePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
+        _targetSampleRate = targetSampleRate;
+        _targetChannels = targetChannels;
         
         if (!File.Exists(filePath))
             throw new FileNotFoundException("音频文件不存在", filePath);
@@ -139,37 +146,66 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
         if (_channels <= 0) _channels = 2;
         _sampleRate = _codecCtx->sample_rate;
         
-        // 创建 WaveFormat（输出为 interleaved float）
-        _waveFormat = new WaveFormat(_sampleRate, 32, _channels, AudioEncoding.IeeeFloat);
+        // 如果指定了目标采样率/声道数，使用目标值；否则使用原始值
+        if (_targetSampleRate <= 0) _targetSampleRate = _sampleRate;
+        if (_targetChannels <= 0) _targetChannels = _channels;
+        
+        // 创建 WaveFormat（输出为 interleaved float，使用目标采样率和声道数）
+        _waveFormat = new WaveFormat(_targetSampleRate, 32, _targetChannels, AudioEncoding.IeeeFloat);
         
         // 计算总长度（采样数 × 声道数）
+        // Opus 等格式可能没有准确的 duration 元数据，需要多种回退方案
         long duration = audioStream->duration;
-        if (duration <= 0 && _formatCtx->duration > 0)
-        {
-            var avTimeBase = new AVRational { num = 1, den = ffmpeg.AV_TIME_BASE };
-            duration = ffmpeg.av_rescale_q(_formatCtx->duration, avTimeBase, audioStream->time_base);
-        }
         
+        // 方案1：使用流的 duration（最准确）
         if (duration > 0)
         {
             _length = ffmpeg.av_rescale_q(duration, audioStream->time_base, 
-                new AVRational { num = 1, den = _sampleRate }) * _channels;
+                new AVRational { num = 1, den = _targetSampleRate }) * _targetChannels;
         }
-        else
+        // 方案2：使用容器的 duration（AV_TIME_BASE 单位）
+        else if (_formatCtx->duration > 0)
         {
-            _length = (long)(_formatCtx->duration / 1000000.0 * _sampleRate * _channels);
+            // _formatCtx->duration 是微秒单位 (AV_TIME_BASE = 1000000)
+            double durationSec = _formatCtx->duration / (double)ffmpeg.AV_TIME_BASE;
+            _length = (long)(durationSec * _targetSampleRate * _targetChannels);
+        }
+        // 方案3：尝试通过比特率估算
+        else if (_formatCtx->bit_rate > 0)
+        {
+            long fileSizeBytes = 0;
+            if (_formatCtx->pb != null)
+            {
+                fileSizeBytes = ffmpeg.avio_size(_formatCtx->pb);
+            }
+            if (fileSizeBytes > 0)
+            {
+                double durationSec = fileSizeBytes * 8.0 / _formatCtx->bit_rate;
+                _length = (long)(durationSec * _targetSampleRate * _targetChannels);
+                Logger.Debug($"[FfmpegAudioDecoder] 使用比特率估算时长: {durationSec:F2}s");
+            }
+        }
+        
+        // 最终检查：确保 length 有效
+        if (_length <= 0)
+        {
+            // 默认设置为 10 分钟（避免返回 0）
+            _length = (long)(600.0 * _targetSampleRate * _targetChannels);
+            Logger.Warning($"[FfmpegAudioDecoder] 无法获取 {Path.GetFileName(_filePath)} 的时长，使用默认值");
         }
         
         // 分配帧和包
         _frame = ffmpeg.av_frame_alloc();
         _packet = ffmpeg.av_packet_alloc();
         
-        // 分配转换后的帧
+        // 分配转换后的帧（使用目标参数）
         _convertedFrame = ffmpeg.av_frame_alloc();
         _convertedFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLT; // interleaved float
-        _convertedFrame->ch_layout = _codecCtx->ch_layout;
-        _convertedFrame->sample_rate = _sampleRate;
-        _convertedFrame->nb_samples = 8192; // 初始大小
+        ffmpeg.av_channel_layout_default(&_convertedFrame->ch_layout, _targetChannels);
+        _convertedFrame->sample_rate = _targetSampleRate;
+        // 计算重采样后的预期大小（考虑采样率变化）
+        int resampleRatio = (_targetSampleRate > _sampleRate) ? (_targetSampleRate / _sampleRate + 1) : 1;
+        _convertedFrame->nb_samples = 8192 * resampleRatio;
         ret = ffmpeg.av_frame_get_buffer(_convertedFrame, 0);
         if (ret < 0)
         {
@@ -179,27 +215,33 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
         // 初始化重采样器（统一转换为 interleaved float）
         InitializeResampler();
         
-        // 初始化简单缓冲区（足够容纳多帧数据）
-        _buffer = new float[_sampleRate * _channels * 2]; // 约 2 秒的数据
+        // 初始化简单缓冲区（足够容纳多帧数据，基于目标参数）
+        _buffer = new float[_targetSampleRate * _targetChannels * 2]; // 约 2 秒的数据
         _bufferOffset = 0;
         _bufferLength = 0;
         
+        // 日志显示原始格式和目标格式
+        bool needResample = (_sampleRate != _targetSampleRate) || (_channels != _targetChannels);
+        string resampleInfo = needResample 
+            ? $" -> 重采样到 {_targetSampleRate}Hz {_targetChannels}ch"
+            : " (无需重采样)";
         Logger.Info($"[FfmpegAudioDecoder] 打开文件: {Path.GetFileName(_filePath)}, " +
-                   $"SampleRate={_sampleRate}, Channels={_channels}, Duration={TimeSpan.FromSeconds((double)_length / _channels / _sampleRate)}");
+                   $"原始={_sampleRate}Hz {_channels}ch{resampleInfo}, Duration={TimeSpan.FromSeconds((double)_length / _targetChannels / _targetSampleRate)}");
     }
     
-    // 初始化重采样器：将任何输入格式转换为 interleaved float
+    // 初始化重采样器：将任何输入格式转换为目标采样率/声道数的 interleaved float
     private void InitializeResampler()
     {
         // 使用 swr_alloc_set_opts2 一次性设置所有参数
         SwrContext* swrCtx = null;
         AVChannelLayout inLayout = _codecCtx->ch_layout;
-        AVChannelLayout outLayout = _codecCtx->ch_layout;
+        AVChannelLayout outLayout = new AVChannelLayout();
+        ffmpeg.av_channel_layout_default(&outLayout, _targetChannels);
         
         int ret = ffmpeg.swr_alloc_set_opts2(
             &swrCtx,
-            &outLayout, AVSampleFormat.AV_SAMPLE_FMT_FLT, _sampleRate,  // 输出：interleaved float
-            &inLayout, _codecCtx->sample_fmt, _sampleRate,              // 输入：原始格式
+            &outLayout, AVSampleFormat.AV_SAMPLE_FMT_FLT, _targetSampleRate,  // 输出：目标采样率的 interleaved float
+            &inLayout, _codecCtx->sample_fmt, _sampleRate,                     // 输入：原始格式和采样率
             0, null);
         
         if (ret < 0 || swrCtx == null)
@@ -213,6 +255,12 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
         if (ret < 0)
         {
             throw new InvalidOperationException($"无法初始化重采样器: {GetErrorMessage(ret)}");
+        }
+        
+        // 如果需要重采样，打印日志
+        if (_sampleRate != _targetSampleRate || _channels != _targetChannels)
+        {
+            Logger.Debug($"[FfmpegAudioDecoder] 重采样: {_sampleRate}Hz {_channels}ch -> {_targetSampleRate}Hz {_targetChannels}ch");
         }
     }
     
@@ -228,11 +276,12 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
             if (value < 0) value = 0;
             if (value > _length) value = _length;
             
-            // 转换采样位置为时间戳
-            long samplePos = value / _channels;
+            // 转换采样位置为时间戳（使用目标声道数和采样率，因为 _length 和 _position 基于目标格式）
+            long samplePos = value / _targetChannels;
             var audioStream = _formatCtx->streams[_audioStreamIndex];
+            // 将目标采样率的位置转换为原始采样率的时间戳
             long timestamp = ffmpeg.av_rescale_q(samplePos, 
-                new AVRational { num = 1, den = _sampleRate }, audioStream->time_base);
+                new AVRational { num = 1, den = _targetSampleRate }, audioStream->time_base);
             
             int ret = ffmpeg.av_seek_frame(_formatCtx, _audioStreamIndex, timestamp, ffmpeg.AVSEEK_FLAG_BACKWARD);
             if (ret >= 0)
@@ -263,8 +312,8 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
             if (available > 0)
             {
                 int toCopy = Math.Min(count - totalRead, available);
-                // 确保是声道数的整数倍
-                toCopy = (toCopy / _channels) * _channels;
+                // 确保是目标声道数的整数倍
+                toCopy = (toCopy / _targetChannels) * _targetChannels;
                 
                 if (toCopy > 0)
                 {
@@ -303,6 +352,11 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
     
     // 是否已经发送了 EOF 包
     private bool _flushSent = false;
+    // 是否已经刷新了重采样器缓冲区
+    private bool _resamplerFlushed = false;
+    
+    // 公开 EOF 状态（供 MultiFileAudioSource 使用）
+    public bool IsEof => _eof;
     
     // 解码数据填充缓冲区
     private bool FillBuffer()
@@ -424,14 +478,87 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
             ConvertAndBuffer();
             return true;
         }
+        
+        // 解码器已排空，现在刷新重采样器缓冲区
+        if (!_resamplerFlushed)
+        {
+            FlushResampler();
+            _resamplerFlushed = true;
+        }
         return false;
     }
     
-    // 将解码的帧转换为 interleaved float 并写入缓冲区
+    // 刷新重采样器缓冲区，获取残留的采样数据
+    private void FlushResampler()
+    {
+        if (_swrCtx == null) return;
+        
+        // 获取重采样器内部缓冲区中的残留采样数
+        long delay = ffmpeg.swr_get_delay(_swrCtx, _targetSampleRate);
+        if (delay <= 0) return;
+        
+        int maxOutputSamples = (int)delay + 64;
+        int totalFloats = maxOutputSamples * _targetChannels;
+        
+        // 确保缓冲区有足够空间
+        if (_bufferLength + totalFloats > _buffer.Length)
+        {
+            return;
+        }
+        
+        // 确保转换帧有足够空间
+        if (_convertedFrame->nb_samples < maxOutputSamples)
+        {
+            ffmpeg.av_frame_unref(_convertedFrame);
+            _convertedFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLT;
+            ffmpeg.av_channel_layout_default(&_convertedFrame->ch_layout, _targetChannels);
+            _convertedFrame->sample_rate = _targetSampleRate;
+            _convertedFrame->nb_samples = maxOutputSamples;
+            int ret = ffmpeg.av_frame_get_buffer(_convertedFrame, 0);
+            if (ret < 0) return;
+        }
+        
+        // 刷新重采样器（传入 NULL 输入）
+        byte** outData = (byte**)&_convertedFrame->data;
+        int converted = ffmpeg.swr_convert(_swrCtx, outData, maxOutputSamples, null, 0);
+        
+        if (converted > 0)
+        {
+            // 复制残留数据到缓冲区
+            float* srcPtr = (float*)_convertedFrame->data[0];
+            int floatsToCopy = converted * _targetChannels;
+            
+            if (_bufferLength + floatsToCopy > _buffer.Length)
+            {
+                floatsToCopy = _buffer.Length - _bufferLength;
+                floatsToCopy = (floatsToCopy / _targetChannels) * _targetChannels;
+            }
+            
+            for (int i = 0; i < floatsToCopy; i++)
+            {
+                _buffer[_bufferLength + i] = srcPtr[i];
+            }
+            _bufferLength += floatsToCopy;
+            
+            Logger.Debug($"[FfmpegAudioDecoder] 刷新重采样器: 获取 {converted} 个残留采样");
+        }
+    }
+    
+    // 将解码的帧转换为目标格式的 interleaved float 并写入缓冲区
     private int ConvertAndBuffer()
     {
         int nbSamples = _frame->nb_samples;
-        int totalFloats = nbSamples * _channels;
+        
+        // 计算重采样后的输出样本数（考虑采样率变化）
+        // 使用 swr_get_delay 获取重采样器内部延迟，确保精确计算
+        long delay = ffmpeg.swr_get_delay(_swrCtx, _sampleRate);
+        int maxOutputSamples = (int)ffmpeg.av_rescale_rnd(
+            delay + nbSamples,
+            _targetSampleRate,
+            _sampleRate,
+            AVRounding.AV_ROUND_UP) + 64; // 额外预留空间
+        
+        int totalFloats = maxOutputSamples * _targetChannels;
         
         // 确保缓冲区有足够空间
         if (_bufferLength + totalFloats > _buffer.Length)
@@ -441,14 +568,14 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
             return 0;
         }
         
-        // 确保转换帧有足够空间
-        if (_convertedFrame->nb_samples < nbSamples)
+        // 确保转换帧有足够空间（使用目标参数）
+        if (_convertedFrame->nb_samples < maxOutputSamples)
         {
             ffmpeg.av_frame_unref(_convertedFrame);
             _convertedFrame->format = (int)AVSampleFormat.AV_SAMPLE_FMT_FLT;
-            _convertedFrame->ch_layout = _codecCtx->ch_layout;
-            _convertedFrame->sample_rate = _sampleRate;
-            _convertedFrame->nb_samples = nbSamples + 256; // 预留空间
+            ffmpeg.av_channel_layout_default(&_convertedFrame->ch_layout, _targetChannels);
+            _convertedFrame->sample_rate = _targetSampleRate;
+            _convertedFrame->nb_samples = maxOutputSamples;
             int ret = ffmpeg.av_frame_get_buffer(_convertedFrame, 0);
             if (ret < 0)
             {
@@ -457,16 +584,23 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
             }
         }
         
-        // 使用 swr_convert 进行格式转换
+        // 使用 swr_convert 进行格式和采样率转换
         byte** outData = (byte**)&_convertedFrame->data;
-        int converted = ffmpeg.swr_convert(_swrCtx, outData, nbSamples, _frame->extended_data, nbSamples);
+        int converted = ffmpeg.swr_convert(_swrCtx, outData, maxOutputSamples, _frame->extended_data, nbSamples);
         
         if (converted > 0)
         {
             // 复制转换后的数据到缓冲区
             // AV_SAMPLE_FMT_FLT 是 interleaved 格式，数据在 data[0]
             float* srcPtr = (float*)_convertedFrame->data[0];
-            int floatsToCopy = converted * _channels;
+            int floatsToCopy = converted * _targetChannels;
+            
+            // 确保不超出缓冲区
+            if (_bufferLength + floatsToCopy > _buffer.Length)
+            {
+                floatsToCopy = _buffer.Length - _bufferLength;
+                floatsToCopy = (floatsToCopy / _targetChannels) * _targetChannels;
+            }
             
             for (int i = 0; i < floatsToCopy; i++)
             {
@@ -476,7 +610,7 @@ public unsafe class FfmpegAudioDecoder : ISampleSource
         }
         
         ffmpeg.av_frame_unref(_frame);
-        return converted > 0 ? converted * _channels : 0;
+        return converted > 0 ? converted * _targetChannels : 0;
     }
     
     // 获取 FFmpeg 错误消息

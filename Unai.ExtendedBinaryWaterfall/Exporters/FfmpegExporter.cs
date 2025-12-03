@@ -693,9 +693,11 @@ public class FfmpegExporter : IExporter
 				int aacFrameSize = _audioCtx->frame_size; // AAC 通常是 1024
 				
 				// 重采样后的输出累积缓冲区（累积到 AAC 帧大小后再编码）
-				// 需要足够大的缓冲区来存储重采样后的数据
+				// 关键：缓冲区必须能容纳至少一个视频帧的音频数据（非60fps时每帧采样数更多）
 				int resampleRatio = _needResample ? (_actualAudioSampleRate / _inputAudioSampleRate + 2) : 1;
-				int outputBufferSize = aacFrameSize * resampleRatio * 2;
+				// 计算最大可能的每帧采样数（考虑最低帧率如 24fps）
+				int maxSamplesPerFrame = (_inputAudioSampleRate / 24 + 1) * inputChannels;
+				int outputBufferSize = Math.Max(aacFrameSize * resampleRatio * 2, maxSamplesPerFrame * 2);
 				float[] outputAccumL = new float[outputBufferSize];
 				float[] outputAccumR = new float[outputBufferSize];
 				int outputAccumCount = 0;
@@ -712,13 +714,31 @@ public class FfmpegExporter : IExporter
 					
 					if (_needResample && _swrCtx != null)
 					{
-						// 填充输入帧（支持任意声道数：interleaved -> planar）
-						for (uint ch = 0; ch < inputChannels; ch++)
+						// 填充输入帧（interleaved -> planar，优化：使用指针批量复制）
+						if (inputChannels == 2)
 						{
-							float* chData = (float*)_audioAvFrame->data[ch];
-							for (int i = 0; i < samplesPerChannel; i++)
+							// 立体声特化路径：直接指针操作，避免模运算
+							float* chL = (float*)_audioAvFrame->data[0];
+							float* chR = (float*)_audioAvFrame->data[1];
+							fixed (float* src = buf)
 							{
-								chData[i] = buf[i * inputChannels + (int)ch];
+								for (int i = 0; i < samplesPerChannel; i++)
+								{
+									chL[i] = src[i * 2];
+									chR[i] = src[i * 2 + 1];
+								}
+							}
+						}
+						else
+						{
+							// 通用多声道路径
+							for (uint ch = 0; ch < inputChannels; ch++)
+							{
+								float* chData = (float*)_audioAvFrame->data[ch];
+								for (int i = 0; i < samplesPerChannel; i++)
+								{
+									chData[i] = buf[i * inputChannels + (int)ch];
+								}
 							}
 						}
 						_audioAvFrame->nb_samples = samplesPerChannel;
@@ -759,59 +779,79 @@ public class FfmpegExporter : IExporter
 							return;
 						}
 						
-						// 将重采样后的数据累积到输出缓冲区
+						// 将重采样后的数据累积到输出缓冲区（优化：使用 Buffer.MemoryCopy）
+						int toCopy = Math.Min(convertedSamples, outputBufferSize - outputAccumCount);
+						int copyBytes = toCopy * sizeof(float);
+						
 						float* outL = (float*)_resampledAudioFrame->data[0];
+						fixed (float* dstL = &outputAccumL[outputAccumCount])
+						{
+							Buffer.MemoryCopy(outL, dstL, copyBytes, copyBytes);
+						}
+						
 						if (outputChannels == 1)
 						{
-							// 单声道输出
-							for (int i = 0; i < convertedSamples && outputAccumCount < outputBufferSize; i++)
+							// 单声道：左右相同
+							fixed (float* dstR = &outputAccumR[outputAccumCount])
 							{
-								outputAccumL[outputAccumCount] = outL[i];
-								outputAccumR[outputAccumCount] = outL[i];
-								outputAccumCount++;
+								Buffer.MemoryCopy(outL, dstR, copyBytes, copyBytes);
 							}
 						}
 						else
 						{
-							// 双声道输出
+							// 双声道
 							float* outR = (float*)_resampledAudioFrame->data[1];
-							for (int i = 0; i < convertedSamples && outputAccumCount < outputBufferSize; i++)
+							fixed (float* dstR = &outputAccumR[outputAccumCount])
 							{
-								outputAccumL[outputAccumCount] = outL[i];
-								outputAccumR[outputAccumCount] = outR[i];
-								outputAccumCount++;
+								Buffer.MemoryCopy(outR, dstR, copyBytes, copyBytes);
 							}
 						}
+						outputAccumCount += toCopy;
 					}
 					else
 					{
 						// 无需重采样（采样率和声道数相同），直接累积
-						// 此时 inputChannels == outputChannels
-						for (int i = 0; i < samplesPerChannel && outputAccumCount < outputBufferSize; i++)
+						// 使用 fixed 指针避免边界检查
+						int toCopy = Math.Min(samplesPerChannel, outputBufferSize - outputAccumCount);
+						if (inputChannels == 2)
 						{
-							// 左声道 (或单声道)
-							outputAccumL[outputAccumCount] = buf[i * inputChannels];
-							// 右声道 (如果有)
-							outputAccumR[outputAccumCount] = (inputChannels >= 2) ? buf[i * inputChannels + 1] : buf[i * inputChannels];
-							outputAccumCount++;
+							fixed (float* srcPtr = buf)
+							fixed (float* dstL = &outputAccumL[outputAccumCount])
+							fixed (float* dstR = &outputAccumR[outputAccumCount])
+							{
+								for (int i = 0; i < toCopy; i++)
+								{
+									dstL[i] = srcPtr[i * 2];
+									dstR[i] = srcPtr[i * 2 + 1];
+								}
+							}
 						}
+						else
+						{
+							// 单声道或多声道
+							for (int i = 0; i < toCopy; i++)
+							{
+								outputAccumL[outputAccumCount + i] = buf[i * inputChannels];
+								outputAccumR[outputAccumCount + i] = (inputChannels >= 2) ? buf[i * inputChannels + 1] : buf[i * inputChannels];
+							}
+						}
+						outputAccumCount += toCopy;
 					}
 					
 					// 当累积够 AAC 帧大小时，编码输出
 					while (outputAccumCount >= aacFrameSize)
 					{
-						// 填充编码帧（支持单声道或双声道）
-						float* encL = (float*)_resampledAudioFrame->data[0];
-						for (int i = 0; i < aacFrameSize; i++)
+						// 填充编码帧（使用 Buffer.BlockCopy 替代逐元素复制）
+						int byteCount = aacFrameSize * sizeof(float);
+						fixed (float* srcL = outputAccumL)
 						{
-							encL[i] = outputAccumL[i];
+							Buffer.MemoryCopy(srcL, _resampledAudioFrame->data[0], byteCount, byteCount);
 						}
 						if (outputChannels >= 2)
 						{
-							float* encR = (float*)_resampledAudioFrame->data[1];
-							for (int i = 0; i < aacFrameSize; i++)
+							fixed (float* srcR = outputAccumR)
 							{
-								encR[i] = outputAccumR[i];
+								Buffer.MemoryCopy(srcR, _resampledAudioFrame->data[1], byteCount, byteCount);
 							}
 						}
 						_resampledAudioFrame->nb_samples = aacFrameSize;
@@ -820,9 +860,10 @@ public class FfmpegExporter : IExporter
 						DoEncode(_audioCtx, _audioStream, _resampledAudioFrame, _audioAvPacket);
 						_audioSampleCount += aacFrameSize;
 						
-						// 移除已处理的数据
-						Array.Copy(outputAccumL, aacFrameSize, outputAccumL, 0, outputAccumCount - aacFrameSize);
-						Array.Copy(outputAccumR, aacFrameSize, outputAccumR, 0, outputAccumCount - aacFrameSize);
+						// 移除已处理的数据（使用 Buffer.BlockCopy）
+						int remainingBytes = (outputAccumCount - aacFrameSize) * sizeof(float);
+						Buffer.BlockCopy(outputAccumL, aacFrameSize * sizeof(float), outputAccumL, 0, remainingBytes);
+						Buffer.BlockCopy(outputAccumR, aacFrameSize * sizeof(float), outputAccumR, 0, remainingBytes);
 						outputAccumCount -= aacFrameSize;
 					}
 				};
@@ -922,9 +963,12 @@ public class FfmpegExporter : IExporter
 			pixelBuffer = new byte[pixelSize];
 		}
 		
-		// 从 SKBitmap 复制像素数据
-		ReadOnlySpan<byte> pixels = videoFrame.GetPixelSpan();
-		pixels.CopyTo(pixelBuffer);
+		// 从 SKBitmap 复制像素数据（使用 Buffer.MemoryCopy）
+		IntPtr srcPtr = videoFrame.GetPixels();
+		fixed (byte* dstPtr = pixelBuffer)
+		{
+			Buffer.MemoryCopy((void*)srcPtr, dstPtr, pixelSize, pixelSize);
+		}
 		pendingFrame.PixelData = pixelBuffer;
 		pendingFrame.Width = videoFrame.Width;
 		pendingFrame.Height = videoFrame.Height;

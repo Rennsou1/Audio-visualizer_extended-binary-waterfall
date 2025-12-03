@@ -576,6 +576,9 @@ public class Generator
     [CliParameter("Spectrum attack time in milliseconds", "spectrum-attack-ms")]
     public float SpectrumAttackMs { get; set; } = 10f; // 频谱上升时间（毫秒）
 
+    [CliParameter("Spectrum slope in dB/octave (0=flat, 3=pink noise flat, 4.5=SPAN default)", "spectrum-slope")]
+    public float SpectrumSlope { get; set; } = 4.5f; // 频谱斜率（dB/octave），默认 4.5
+
     [CliParameter("Spectrum release time in milliseconds", "spectrum-release-ms")]
     public float SpectrumReleaseMs { get; set; } = 150f; // 频谱下降时间（毫秒）
 
@@ -750,11 +753,12 @@ public class Generator
             if (InputFilePaths != null && InputFilePaths.Count > 1)
             {
                 Logger.Info($"Using multi-file audio source with {InputFilePaths.Count} files");
-                _multiFileAudioSource = new MultiFileAudioSource(InputFilePaths);
+                // 直接输出到用户指定的目标采样率和声道数，避免 FfmpegExporter 再次重采样
+                _multiFileAudioSource = new MultiFileAudioSource(InputFilePaths, targetOutputSampleRate, targetOutputChannelCount);
                 _audioSampleSource = _multiFileAudioSource;
                 
                 var wf = _multiFileAudioSource.WaveFormat;
-                // 保存解码器原始参数（用于 FFmpeg 重采样）
+                // 解码器输出的就是目标格式（已在 MultiFileAudioSource 中完成重采样）
                 AudioDecoderSampleRate = wf.SampleRate;
                 AudioDecoderChannelCount = wf.Channels;
                 
@@ -821,7 +825,7 @@ public class Generator
             _audioSampleBuffer = new float[decoderSamplesPerChannel * AudioDecoderChannelCount];
             _inputAudioBuffer = new(decoderSamplesPerChannel, AudioDecoderChannelCount);
             
-            Logger.Info($"Audio decoder initialized: {AudioDecoderSampleRate}Hz, {AudioDecoderChannelCount}ch, {decoderSamplesPerChannel} samples/ch/frame");
+            Logger.Info($"Audio decoder initialized: {AudioDecoderSampleRate}Hz, {AudioDecoderChannelCount}ch, {decoderSamplesPerChannel} samples/ch/frame, OutputFps={OutputFps}");
         }
         catch (Exception ex)
         {
@@ -1097,6 +1101,7 @@ public class Generator
     }
 
     // 解析子文件列表，支持多文件队列
+    // 优化：同时计算波形 RMS，避免多次打开文件
     private void ParseSubfiles()
     {
         // 如果有多文件队列（超过1个文件），为每个文件创建子文件条目
@@ -1108,6 +1113,10 @@ public class Generator
             long currentOffset = 0;
             long actualByteOffset = 0;    // 实际文件字节偏移累加
             double currentAudioTime = 0;  // 累积音频时间（秒）
+            
+            // 波形计算参数
+            const int rmsCount = 256;
+            const int readBufferSize = 65536;
             
             foreach (var filePath in InputFilePaths)
             {
@@ -1121,22 +1130,86 @@ public class Generator
                 int audioSampleRate = 0;
                 int audioChannels = 0;
                 int audioBitDepth = 0;
+                // 波形数据
+                float[] waveformPeaks = null;
+                float audioPeak = 1.0f;
                 
                 try
                 {
                     actualFileSize = new System.IO.FileInfo(filePath).Length;
-                    using var tempSource = CodecFactory.Instance.GetCodec(filePath);
-                    var wf = tempSource.WaveFormat;
-                    durationSeconds = tempSource.Length / (double)wf.BytesPerSecond;
-                    fileLength = (long)(durationSeconds * InputBytesPerSecond);
-                    // 提取音频格式信息
+                    
+                    // 使用 FfmpegAudioDecoder 获取准确的音频时长和格式信息
+                    // 同时计算波形 RMS（一次打开完成两项工作）
+                    using var decoder = new FfmpegAudioDecoder(filePath);
+                    var wf = decoder.WaveFormat;
+                    
+                    // 获取格式信息
+                    long totalSamplesInFile = decoder.Length;
+                    int channelCount = wf.Channels;
                     audioSampleRate = wf.SampleRate;
-                    audioChannels = wf.Channels;
+                    audioChannels = channelCount;
                     audioBitDepth = wf.BitsPerSample;
+                    durationSeconds = (totalSamplesInFile / channelCount) / (double)audioSampleRate;
+                    fileLength = (long)(durationSeconds * InputBytesPerSecond);
+                    
+                    // 计算波形 RMS（在同一次解码中完成）
+                    if (totalSamplesInFile > 0)
+                    {
+                        long samplesPerSegment = totalSamplesInFile / rmsCount;
+                        if (samplesPerSegment < 1) samplesPerSegment = 1;
+                        
+                        double[] sumSquares = new double[rmsCount];
+                        long[] sampleCounts = new long[rmsCount];
+                        float[] buffer = new float[readBufferSize];
+                        long currentPosition = 0;
+                        float fileMaxPeak = 0f;
+                        int totalRead;
+                        
+                        while ((totalRead = decoder.Read(buffer, 0, readBufferSize)) > 0)
+                        {
+                            for (int i = 0; i < totalRead; i++)
+                            {
+                                int segmentIndex = (int)((currentPosition + i) / samplesPerSegment);
+                                if (segmentIndex >= rmsCount) segmentIndex = rmsCount - 1;
+                                
+                                float sample = buffer[i];
+                                float absVal = Math.Abs(sample);
+                                sumSquares[segmentIndex] += sample * sample;
+                                sampleCounts[segmentIndex]++;
+                                if (absVal > fileMaxPeak) fileMaxPeak = absVal;
+                            }
+                            currentPosition += totalRead;
+                        }
+                        
+                        audioPeak = fileMaxPeak > 0.001f ? fileMaxPeak : 1.0f;
+                        
+                        // 计算 RMS 并归一化
+                        waveformPeaks = new float[rmsCount];
+                        float globalMaxRms = 0f;
+                        for (int i = 0; i < rmsCount; i++)
+                        {
+                            if (sampleCounts[i] > 0)
+                            {
+                                float rms = (float)Math.Sqrt(sumSquares[i] / sampleCounts[i]);
+                                waveformPeaks[i] = rms;
+                                if (rms > globalMaxRms) globalMaxRms = rms;
+                            }
+                        }
+                        if (globalMaxRms > 0.0001f)
+                        {
+                            for (int i = 0; i < rmsCount; i++)
+                            {
+                                waveformPeaks[i] /= globalMaxRms;
+                            }
+                        }
+                    }
+                    
+                    Logger.Debug($"[ParseSubfiles] {System.IO.Path.GetFileName(filePath)}: duration={durationSeconds:F2}s, {audioSampleRate}Hz {audioChannels}ch, peak={audioPeak:F4}");
                 }
-                catch
+                catch (Exception ex)
                 {
                     // 无法获取时长时使用文件大小估算
+                    Logger.Warning($"[ParseSubfiles] 无法获取 {System.IO.Path.GetFileName(filePath)} 的音频信息: {ex.Message}");
                     actualFileSize = new System.IO.FileInfo(filePath).Length;
                     fileLength = actualFileSize;
                     durationSeconds = fileLength / (double)InputBytesPerSecond;
@@ -1155,6 +1228,9 @@ public class Generator
                 sf.AudioSampleRate = audioSampleRate;
                 sf.AudioChannels = audioChannels;
                 sf.AudioBitDepth = audioBitDepth;
+                // 设置波形数据（已在上面计算）
+                sf.WaveformPeaks = waveformPeaks;
+                sf.AudioPeak = audioPeak;
                 _subfiles.Add(sf);
                 
                 currentOffset += fileLength;
@@ -1330,18 +1406,138 @@ public class Generator
                         Logger.Debug($"Failed to decode album art for '{sf.FileName}': {picEx.Message}");
                     }
                 }
+                
+                // 如果元数据中没有封面，尝试从音频同目录查找封面图片
+                if (sf.Icon == null)
+                {
+                    sf.Icon = TryLoadCoverFromDirectory(sf.FileDirectory, sf.FileName);
+                }
             }
             catch (Exception ex)
             {
                 // 某些子文件路径不是实际音频文件时可能会抛异常，这里只做调试输出
                 Logger.Debug($"Failed to read metadata for subfile '{sf.Path}': {ex.Message}");
             }
+            
+            // 即使元数据读取失败，仍尝试从目录加载封面
+            if (sf.Icon == null && !string.IsNullOrWhiteSpace(sf.FileDirectory))
+            {
+                sf.Icon = TryLoadCoverFromDirectory(sf.FileDirectory, sf.FileName);
+            }
         }
+    }
+    
+    // 常见封面文件名（按优先级排序）
+    private static readonly string[] CoverFileNames = 
+    {
+        "cover", "folder", "front", "album", "artwork", "art", "scan", "booklet"
+    };
+    
+    // 常见图片扩展名
+    private static readonly string[] ImageExtensions = 
+    {
+        ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"
+    };
+    
+    // 尝试从指定目录加载封面图片
+    private SKBitmap TryLoadCoverFromDirectory(string directory, string audioFileName)
+    {
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            return null;
+        
+        try
+        {
+            // 1. 优先查找常见封面文件名
+            foreach (var baseName in CoverFileNames)
+            {
+                foreach (var ext in ImageExtensions)
+                {
+                    string coverPath = Path.Combine(directory, baseName + ext);
+                    if (System.IO.File.Exists(coverPath))
+                    {
+                        var bitmap = LoadImageSafely(coverPath);
+                        if (bitmap != null)
+                        {
+                            Logger.Debug($"Loaded cover from '{coverPath}' for '{audioFileName}'");
+                            return bitmap;
+                        }
+                    }
+                    
+                    // 也尝试大写首字母版本
+                    string coverPathCap = Path.Combine(directory, char.ToUpper(baseName[0]) + baseName[1..] + ext);
+                    if (System.IO.File.Exists(coverPathCap))
+                    {
+                        var bitmap = LoadImageSafely(coverPathCap);
+                        if (bitmap != null)
+                        {
+                            Logger.Debug($"Loaded cover from '{coverPathCap}' for '{audioFileName}'");
+                            return bitmap;
+                        }
+                    }
+                }
+            }
+            
+            // 2. 查找与音频文件同名的图片
+            if (!string.IsNullOrWhiteSpace(audioFileName))
+            {
+                string audioBaseName = Path.GetFileNameWithoutExtension(audioFileName);
+                foreach (var ext in ImageExtensions)
+                {
+                    string sameName = Path.Combine(directory, audioBaseName + ext);
+                    if (System.IO.File.Exists(sameName))
+                    {
+                        var bitmap = LoadImageSafely(sameName);
+                        if (bitmap != null)
+                        {
+                            Logger.Debug($"Loaded cover from '{sameName}' (same name as audio)");
+                            return bitmap;
+                        }
+                    }
+                }
+            }
+            
+            // 注：移除了"遍历目录所有图片"的兜底方案以提升性能
+            // 如果常见文件名和同名图片都找不到，则不加载封面
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"Failed to search cover in directory '{directory}': {ex.Message}");
+        }
+        
+        return null;
+    }
+    
+    // 安全加载图片（处理损坏或不支持的格式）
+    private SKBitmap LoadImageSafely(string path)
+    {
+        try
+        {
+            using var stream = System.IO.File.OpenRead(path);
+            var bitmap = SKBitmap.Decode(stream);
+            if (bitmap != null && bitmap.Width > 0 && bitmap.Height > 0)
+            {
+                return bitmap;
+            }
+            bitmap?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Logger.Debug($"Failed to decode image '{path}': {ex.Message}");
+        }
+        return null;
     }
 
     // 预计算所有子文件的波形 RMS 值（用于底部进度条显示）
     private void PrecomputeSubfileWaveforms()
     {
+        // 检查是否所有子文件都已有波形数据
+        bool allHaveWaveforms = _subfiles.All(sf => sf.WaveformPeaks != null);
+        if (allHaveWaveforms)
+        {
+            Logger.Info("Waveform data already computed in ParseSubfiles, skipping.");
+            return;
+        }
+        
         Logger.Info("Precomputing waveform RMS for subfiles…");
         
         // 每个子文件生成固定数量的 RMS 值
@@ -1351,14 +1547,15 @@ public class Generator
         
         foreach (var sf in _subfiles)
         {
+            // 跳过已有波形数据的文件
+            if (sf.WaveformPeaks != null) continue;
             if (sf == null || sf.Length <= 0) continue;
             if (string.IsNullOrWhiteSpace(sf.Path) || !System.IO.File.Exists(sf.Path)) continue;
             
             try
             {
-                // 使用 CSCore 解码音频文件获取真正的 PCM 采样
-                using var waveSource = CodecFactory.Instance.GetCodec(sf.Path);
-                using var sampleSource = waveSource.ToSampleSource();
+                // 使用 FfmpegAudioDecoder 解码音频文件获取 PCM 采样
+                using var sampleSource = new FfmpegAudioDecoder(sf.Path);
                 
                 // 获取音频总采样数
                 long totalSamples = sampleSource.Length;
@@ -1861,8 +2058,7 @@ public class Generator
                 _reusableScaledWaterfallCanvas = new SKCanvas(_reusableScaledWaterfall);
             }
 
-            // 复用 Canvas 绘制缩放瀑布
-            _reusableScaledWaterfallCanvas.Clear(SKColors.Transparent);
+            // 复用 Canvas 绘制缩放瀑布（DrawBitmap 会完全覆盖目标区域）
             var srcRect = new SKRect(0, 0, WaterfallWidth, WaterfallHeight);
             var dstRect = new SKRect(0, 0, WaterfallScaledWidth, WaterfallScaledHeight);
             _imagePaint.FilterQuality = SKFilterQuality.None; // 保持像素风格
@@ -2227,6 +2423,7 @@ public class Generator
         byte[] currentCoverHash = null;
         if (coverImage != null)
         {
+            // 有封面：缓存缩放后的封面
             if (_cachedScaledCover == null || _cachedCoverSubfileIndex != subfileIdx || _cachedCoverSize != targetSize)
             {
                 _cachedScaledCover?.Dispose();
@@ -2234,13 +2431,22 @@ public class Generator
                 using (var coverCanvas = new SKCanvas(_cachedScaledCover))
                 {
                     coverCanvas.Clear(SKColors.Transparent);
-                    // 使用复用画笔
+                    // 重要：绘制缓存封面时使用白色（不受过渡动画 alpha 影响）
+                    _coverPaint.Color = SKColors.White;
                     coverCanvas.DrawBitmap(coverImage, new SKRect(0, 0, targetSize, targetSize), _coverPaint);
                 }
                 _cachedCoverSubfileIndex = subfileIdx;
                 _cachedCoverSize = targetSize;
+                Logger.Debug($"Cached cover for subfile {subfileIdx}, size={targetSize}x{targetSize}");
             }
             currentCoverHash = ComputeImageHash(_cachedScaledCover);
+        }
+        else if (_cachedCoverSubfileIndex != subfileIdx)
+        {
+            // 无封面且歌曲已切换：清理缓存的封面（修复无法切换问题）
+            _cachedScaledCover?.Dispose();
+            _cachedScaledCover = null;
+            _cachedCoverSubfileIndex = subfileIdx;
         }
         
         // 检测歌曲切换（注意：这里 displayInfo/timeString 已经是新歌曲的信息）
@@ -2469,43 +2675,41 @@ public class Generator
         float progressX = waveformRect.Left + waveformRect.Width * trackProgress;
         float gapWidth = 4f * s;
         
-        // 波形滑动偏移（快到慢，animT 从 0 到 1）
-        // waveSlideOffset 在动画开始时最大，结束时为 0
+        // 波形滑动偏移
         float waveSlideOffset = isInTransition ? (1f - animT) * waveformHeight * 1.2f : 0f;
         byte currWaveAlpha = (byte)(255 * (isInTransition ? animT : 1f));
         byte prevWaveAlpha = (byte)(255 * (1f - animT));
         
-        // 同时绘制前一首波形和当前波形
+        // 使用 SKPath 批量绘制波形条
+        using var pathPrevWave = new SKPath();
+        using var pathPlayedWave = new SKPath();
+        using var pathUnplayedWave = new SKPath();
+        
         for (int i = 0; i < totalBars; i++)
         {
             float barX = waveformRect.Left + i * (barWidth + barSpacing);
             if (barX > progressX - gapWidth && barX < progressX + gapWidth) continue;
             
-            // 绘制前一首波形（从中间向上滑出 + 淡出）
+            // 前一首波形（从中间向上滑出 + 淡出）
             if (isInTransition && _prevWaveformPeaks != null && _prevWaveformPeaks.Length > 0)
             {
-                int prevPeakIndex = (int)((float)i / totalBars * _prevWaveformPeaks.Length);
-                prevPeakIndex = Math.Clamp(prevPeakIndex, 0, _prevWaveformPeaks.Length - 1);
+                int prevPeakIndex = Math.Clamp((int)((float)i / totalBars * _prevWaveformPeaks.Length), 0, _prevWaveformPeaks.Length - 1);
                 float prevHeightRatio = 0.15f + _prevWaveformPeaks[prevPeakIndex] * 0.85f;
                 float prevBarHeight = waveformHeight * prevHeightRatio * 0.85f;
-                // 向上滑出：从中间位置向上移动（减去偏移）
                 float prevBarY = waveformRect.Top + (waveformHeight - prevBarHeight) / 2f - waveSlideOffset;
                 
-                // 只在条形完全在区域内时绘制
                 if (prevBarY >= waveformRect.Top && prevBarY + prevBarHeight <= waveformRect.Top + waveformHeight)
                 {
-                    _fillPaint.Color = new SKColor(180, 180, 180, prevWaveAlpha);
-                    _frameCanvas.DrawRect(SKRect.Create(barX, prevBarY, barWidth, prevBarHeight), _fillPaint);
+                    pathPrevWave.AddRect(SKRect.Create(barX, prevBarY, barWidth, prevBarHeight));
                 }
             }
             
-            // 绘制当前波形（从下向上滑入 + 淡入）
+            // 当前波形（从下向上滑入 + 淡入）
             float heightRatio;
             bool hasRealWaveform = waveformPeaks != null && waveformPeaks.Length > 0;
             if (hasRealWaveform)
             {
-                int peakIndex = (int)((float)i / totalBars * waveformPeaks.Length);
-                peakIndex = Math.Clamp(peakIndex, 0, waveformPeaks.Length - 1);
+                int peakIndex = Math.Clamp((int)((float)i / totalBars * waveformPeaks.Length), 0, waveformPeaks.Length - 1);
                 heightRatio = 0.15f + waveformPeaks[peakIndex] * 0.85f;
             }
             else
@@ -2514,17 +2718,32 @@ public class Generator
             }
             
             float barHeight = waveformHeight * heightRatio * 0.85f;
-            // 从下滑入：从底部位置向上移动到中间（加上偏移，随着动画进行偏移减小）
             float barY = waveformRect.Top + (waveformHeight - barHeight) / 2f + waveSlideOffset;
             
-            // 只在条形完全在区域内时绘制
             if (barY >= waveformRect.Top && barY + barHeight <= waveformRect.Top + waveformHeight)
             {
-                _fillPaint.Color = barX < progressX
-                    ? new SKColor(100, 100, 100, currWaveAlpha)
-                    : new SKColor(220, 220, 220, currWaveAlpha);
-                _frameCanvas.DrawRect(SKRect.Create(barX, barY, barWidth, barHeight), _fillPaint);
+                if (barX < progressX)
+                    pathPlayedWave.AddRect(SKRect.Create(barX, barY, barWidth, barHeight));
+                else
+                    pathUnplayedWave.AddRect(SKRect.Create(barX, barY, barWidth, barHeight));
             }
+        }
+        
+        // 批量绘制（3次 DrawPath 替代 200+ 次 DrawRect）
+        if (isInTransition && !pathPrevWave.IsEmpty)
+        {
+            _fillPaint.Color = new SKColor(180, 180, 180, prevWaveAlpha);
+            _frameCanvas.DrawPath(pathPrevWave, _fillPaint);
+        }
+        if (!pathPlayedWave.IsEmpty)
+        {
+            _fillPaint.Color = new SKColor(100, 100, 100, currWaveAlpha);
+            _frameCanvas.DrawPath(pathPlayedWave, _fillPaint);
+        }
+        if (!pathUnplayedWave.IsEmpty)
+        {
+            _fillPaint.Color = new SKColor(220, 220, 220, currWaveAlpha);
+            _frameCanvas.DrawPath(pathUnplayedWave, _fillPaint);
         }
         
         // 播放头
@@ -2824,18 +3043,21 @@ public class Generator
             _audioMonoBuffer = new float[sampleCount];
         }
         
-        // SIMD 优化的声道混合
+        // 峰值归一化系数：将音频归一化到 [-1, 1] 范围
+        float peakNorm = _currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f;
+        
+        // SIMD 优化的声道混合 + 峰值归一化
         if (channelCount == 2 && Vector.IsHardwareAccelerated)
         {
-            // 立体声特化：使用 SIMD 向量化
+            // 立体声特化：SIMD 向量化 + 峰值归一化
             int vectorSize = Vector<float>.Count;
-            float scale = 0.5f;
+            float scale = 0.5f / peakNorm;
             int i = 0;
             
             // 每次处理 vectorSize 个采样
             for (; i <= sampleCount - vectorSize; i += vectorSize)
             {
-                // 解交错：左右声道分别相加并平均
+                // 解交错：左右声道分别相加并平均，同时归一化
                 for (int k = 0; k < vectorSize && i + k < sampleCount; k++)
                 {
                     int idx = (i + k) * 2;
@@ -2850,10 +3072,24 @@ public class Generator
                 _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
             }
         }
+        else if (channelCount == 2)
+        {
+            // 立体声回退：无 SIMD
+            float scale = 0.5f / peakNorm;
+            for (int i = 0; i < sampleCount; i++)
+            {
+                int idx = i * 2;
+                _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
+            }
+        }
         else
         {
-            // 通用多声道处理
-            float invChannelCount = 1f / channelCount;
+            // 多声道处理
+            // 使用 sqrt(channelCount) 而非 channelCount：
+            // - 非相关信号的能量累加是 sqrt(N) 倍
+            // - 环绕声通常只有部分声道活跃，直接除以 N 会导致振幅过小
+            float sqrtChannels = (float)Math.Sqrt(channelCount);
+            float scale = 1f / (sqrtChannels * peakNorm);
             for (int i = 0; i < sampleCount; i++)
             {
                 float sum = 0f;
@@ -2862,7 +3098,7 @@ public class Generator
                 {
                     sum += _audioInterleavedBuffer[baseIdx + ch];
                 }
-                _audioMonoBuffer[i] = sum * invChannelCount;
+                _audioMonoBuffer[i] = sum * scale;
             }
         }
 
@@ -2924,9 +3160,7 @@ public class Generator
             }
         }
 
-        // 使用当前歌曲峰值进行归一化（而不是窗口内最大值）
-        float normalizeFactor = _currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f;
-
+        // 已在 DrawAudioVisualizerSkia 中归一化
         float centerY = region.MidY;
         float amplitude = region.Height * 0.45f;
         float lineWidth = Math.Max(1.5f, WaveformLineWidth * ResolutionScale);
@@ -2943,8 +3177,8 @@ public class Generator
         {
             // 每个点对应的样本索引
             int sampleIdx = startIdx + (i * windowSize / pointCount);
-            // 使用全局峰值归一化
-            float v = samples[sampleIdx] / normalizeFactor;
+            // 直接使用已归一化的样本
+            float v = samples[sampleIdx];
             float x = region.Left + (i / (float)(pointCount - 1)) * region.Width;
             float y = centerY - v * amplitude;
             points[i] = new SKPoint(x, y);
@@ -2963,7 +3197,7 @@ public class Generator
         }
     }
 
-    // 频谱绘制：使用历史缓冲实现大 FFT 窗口 + 对数频率映射 + 时间平滑
+    // 频谱绘制
     private void DrawSpectrumSkia(SKRect region, float[] samples)
     {
         int fftSize = GetValidFftSize();
@@ -2974,6 +3208,7 @@ public class Generator
             _audioHistoryWritePos = 0;
         }
         
+        // samples 已在 DrawAudioVisualizerSkia 中归一化到 [-1, 1]
         for (int i = 0; i < samples.Length; i++)
         {
             _audioHistoryBuffer[_audioHistoryWritePos] = samples[i];
@@ -2990,26 +3225,29 @@ public class Generator
             _fftMagnitudes = new float[halfN];
         }
 
-        PrecomputeHannWindow(n);
+        // 使用 Blackman-Harris 窗口（比 Hann 窗口有更好的旁瓣抑制，-92dB vs -31dB）
+        PrecomputeBlackmanHarrisWindow(n);
 
         for (int i = 0; i < n; i++)
         {
             int idx = (_audioHistoryWritePos + i) % n;
-            _fftReal[i] = _audioHistoryBuffer[idx] * _hannWindow[i];
+            _fftReal[i] = _audioHistoryBuffer[idx] * _blackmanHarrisWindow[i];
             _fftImag[i] = 0;
         }
 
         ComputeFFT(_fftReal, _fftImag, n);
         ComputeMagnitudesSimd(_fftReal, _fftImag, _fftMagnitudes, halfN, n);
 
-        // 频率范围：20Hz ~ 采样率/2（覆盖完整频谱）
+        // 频率范围
         float freqPerBin = (float)AudioOutputSampleRate / n;
         float minFreq = 20f;
-        float maxFreq = AudioOutputSampleRate / 2f * 0.98f;
+        float nyquistFreq = AudioOutputSampleRate / 2f;
+        float maxFreq = nyquistFreq * 0.98f; // 保留 2% 余量避免混叠边缘
 
         int barCount = Math.Clamp(SpectrumBarCount, 16, 128);
         float[] bars = new float[barCount];
 
+        // 对数频率映射（符合人耳感知）
         float logMin = (float)Math.Log10(minFreq);
         float logMax = (float)Math.Log10(maxFreq);
         float logRange = logMax - logMin;
@@ -3020,6 +3258,7 @@ public class Generator
             float t1 = (i + 1) / (float)barCount;
             float freqLo = (float)Math.Pow(10, logMin + t0 * logRange);
             float freqHi = (float)Math.Pow(10, logMin + t1 * logRange);
+            float centerFreq = (float)Math.Sqrt(freqLo * freqHi); // 几何中心频率
 
             float binLo = freqLo / freqPerBin;
             float binHi = freqHi / freqPerBin;
@@ -3027,67 +3266,139 @@ public class Generator
             int bin1 = Math.Min(halfN - 1, (int)Math.Ceiling(binHi));
             if (bin1 < bin0) bin1 = bin0;
 
-            float maxMag = 0f;
+            // 使用 RMS（均方根）计算频带能量
+            float sumSq = 0f;
+            int binCount = 0;
             for (int k = bin0; k <= bin1; k++)
             {
-                if (_fftMagnitudes[k] > maxMag) maxMag = _fftMagnitudes[k];
+                sumSq += _fftMagnitudes[k] * _fftMagnitudes[k];
+                binCount++;
             }
+            float rmsMag = binCount > 0 ? (float)Math.Sqrt(sumSq / binCount) : 0f;
 
-            // 使用当前歌曲峰值进行缩放
-            float normalizedMag = maxMag / (_currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f);
-            float db = 20f * (float)Math.Log10(normalizedMag + 1e-10f);
-            // 使用 -40dB 到 0dB 的范围
-            bars[i] = Math.Clamp((db + 40f) / 40f, 0f, 1f);
+            // 转换为 dB（FFT 输入已在写入历史缓冲区时归一化）
+            float db = 20f * (float)Math.Log10(rmsMag + 1e-10f);
+            
+            // 斜率补偿（在 dB 域应用）
+            // 4.5 dB/oct = SPAN 默认值
+            if (SpectrumSlope > 0.01f || SpectrumSlope < -0.01f)
+            {
+                float octaveFromRef = (float)(Math.Log(centerFreq / 1000f) / Math.Log(2));
+                db += octaveFromRef * SpectrumSlope;
+            }
+            
+            // 映射到 0~1（-60dB ~ 0dB 动态范围）
+            // 60dB 范围更适合音乐可视化
+            bars[i] = Math.Clamp((db + 60f) / 60f, 0f, 1f);
         }
 
+        // 初始化平滑缓冲区
         if (_smoothedSpectrum == null || _smoothedSpectrum.Length != barCount)
         {
             _smoothedSpectrum = new float[barCount];
             Array.Copy(bars, _smoothedSpectrum, barCount);
         }
 
-        // 基于时间的指数衰减平滑（与帧率无关）
-        float dt = 1000f / OutputFps; // 每帧时间（毫秒）
+        // 指数平滑（基于时间常数 τ）
+        // 公式: output = previous + α * (current - previous)
+        // 其中 α = 1 - exp(-dt / τ)
+        // τ 时间后达到目标值的 63.2%（1 - 1/e）
+        float dt = 1000f / OutputFps; // 帧间隔（毫秒）
         
-        // 将用户参数解释为半衰期（衰减到50%的时间）
-        float attackHalfLife = Math.Max(0.1f, SpectrumAttackMs);   // 上升半衰期（毫秒）
-        float releaseHalfLife = Math.Max(0.1f, SpectrumReleaseMs); // 下降半衰期（毫秒）
+        // 时间常数（毫秒），最小 1ms 避免除零
+        float attackTau = Math.Max(1f, SpectrumAttackMs);
+        float releaseTau = Math.Max(1f, SpectrumReleaseMs);
         
-        // 计算平滑系数
-        float ln05 = -0.693147f; // ln(0.5)
-        float attackCoef = (float)Math.Exp(ln05 * dt / attackHalfLife);
-        float releaseCoef = (float)Math.Exp(ln05 * dt / releaseHalfLife);
+        // 计算平滑系数（α）
+        // attack: 信号上升时使用，较小的 τ = 更快响应
+        // release: 信号下降时使用，较大的 τ = 更慢衰减
+        float attackAlpha = 1f - (float)Math.Exp(-dt / attackTau);
+        float releaseAlpha = 1f - (float)Math.Exp(-dt / releaseTau);
         
         for (int i = 0; i < barCount; i++)
         {
-            if (bars[i] > _smoothedSpectrum[i])
+            float current = bars[i];
+            float previous = _smoothedSpectrum[i];
+            
+            // 根据信号方向选择不同的时间常数
+            if (current > previous)
             {
-                // 上升：使用 attack 半衰期
-                _smoothedSpectrum[i] = _smoothedSpectrum[i] * attackCoef + bars[i] * (1f - attackCoef);
+                // 信号上升：使用 attack（快速响应）
+                _smoothedSpectrum[i] = previous + attackAlpha * (current - previous);
             }
             else
             {
-                // 下降：使用 release 半衰期
-                _smoothedSpectrum[i] = _smoothedSpectrum[i] * releaseCoef + bars[i] * (1f - releaseCoef);
+                // 信号下降：使用 release（慢速衰减）
+                _smoothedSpectrum[i] = previous + releaseAlpha * (current - previous);
             }
         }
 
         float barWidth = region.Width / barCount;
-        float gap = barWidth * 0.15f;
+        float gap = barWidth * 0.12f;
         float actualWidth = barWidth - gap;
 
-        // 使用路径批量绘制所有频谱柱
-        using var path = new SKPath();
+        // 批量绘制频谱柱
+        using var barPath = new SKPath();
+        
         for (int i = 0; i < barCount; i++)
         {
-            float h = _smoothedSpectrum[i] * region.Height;
-            if (h < 0.5f) continue;
             float x = region.Left + i * barWidth + gap / 2f;
-            float y = region.Bottom - h;
-            path.AddRect(SKRect.Create(x, y, actualWidth, h));
+            float h = _smoothedSpectrum[i] * region.Height;
+            if (h >= 0.5f)
+            {
+                float y = region.Bottom - h;
+                barPath.AddRect(SKRect.Create(x, y, actualWidth, h));
+            }
         }
+        
+        // 绘制频谱柱（白色）
         _fillPaint.Color = SKColors.White;
-        _frameCanvas.DrawPath(path, _fillPaint);
+        _frameCanvas.DrawPath(barPath, _fillPaint);
+    }
+    
+    // Blackman-Harris 窗口（4-term，旁瓣抑制 -92dB）
+    private float[] _blackmanHarrisWindow = null;
+    private void PrecomputeBlackmanHarrisWindow(int n)
+    {
+        if (_blackmanHarrisWindow != null && _blackmanHarrisWindow.Length == n) return;
+        
+        _blackmanHarrisWindow = new float[n];
+        const double a0 = 0.35875;
+        const double a1 = 0.48829;
+        const double a2 = 0.14128;
+        const double a3 = 0.01168;
+        double factor = 2.0 * Math.PI / (n - 1);
+        
+        for (int i = 0; i < n; i++)
+        {
+            double t = factor * i;
+            _blackmanHarrisWindow[i] = (float)(a0 - a1 * Math.Cos(t) + a2 * Math.Cos(2 * t) - a3 * Math.Cos(3 * t));
+        }
+    }
+    
+    // A-weighting 曲线（IEC 61672:2003 标准）
+    // 模拟人耳对不同频率的敏感度差异
+    private float ComputeAWeighting(float freq)
+    {
+        // A-weighting 公式的简化版本
+        double f2 = freq * freq;
+        double f4 = f2 * f2;
+        
+        // 标准 A-weighting 传递函数
+        double ra = (12194.0 * 12194.0 * f4) /
+                    ((f2 + 20.6 * 20.6) *
+                     Math.Sqrt((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)) *
+                     (f2 + 12194.0 * 12194.0));
+        
+        // 归一化到 1kHz = 0dB
+        double ra1000 = (12194.0 * 12194.0 * 1e12) /
+                        ((1e6 + 20.6 * 20.6) *
+                         Math.Sqrt((1e6 + 107.7 * 107.7) * (1e6 + 737.9 * 737.9)) *
+                         (1e6 + 12194.0 * 12194.0));
+        
+        // 转换为线性增益
+        double aWeightDb = 20.0 * Math.Log10(ra / ra1000 + 1e-10);
+        return (float)Math.Pow(10, aWeightDb / 20.0);
     }
 
     private string BuildSubfileDisplayLine(SubFile subfile)

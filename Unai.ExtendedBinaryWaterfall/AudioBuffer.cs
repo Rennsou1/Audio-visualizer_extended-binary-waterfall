@@ -199,12 +199,35 @@ public class AudioBuffer
 
 	// 将音频数据复制到目标数组（避免每帧分配新数组）
 	// 只复制 ValidSampleCount 范围内的有效数据，避免多余静音导致 clicking
+	// 避免逐元素的模运算和除法，直接索引！！！！
 	public void CopyTo(float[] destination)
 	{
-		int length = Math.Min(destination.Length, ValidSampleCount * ChannelCount);
-		for (int i = 0; i < length; i++)
+		int samplesToCopy = Math.Min(destination.Length / ChannelCount, ValidSampleCount);
+		int channels = ChannelCount;
+		
+		// 立体声特化路径（最常见情况）
+		if (channels == 2)
 		{
-			destination[i] = Samples[i % ChannelCount][i / ChannelCount];
+			var left = Samples[0];
+			var right = Samples[1];
+			for (int s = 0; s < samplesToCopy; s++)
+			{
+				int dstIdx = s * 2;
+				destination[dstIdx] = left[s];
+				destination[dstIdx + 1] = right[s];
+			}
+		}
+		else
+		{
+			// 通用多声道路径
+			for (int s = 0; s < samplesToCopy; s++)
+			{
+				int baseIdx = s * channels;
+				for (int ch = 0; ch < channels; ch++)
+				{
+					destination[baseIdx + ch] = Samples[ch][s];
+				}
+			}
 		}
 	}
 }

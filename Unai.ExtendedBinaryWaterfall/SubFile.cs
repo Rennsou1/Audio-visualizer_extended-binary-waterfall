@@ -19,9 +19,10 @@ public class SubFile(string path, long startOffset, long length)
 	public int? TrackNumber { get; set; } = null;              // 第几首
 	public string TrackTitle { get; set; } = null;             // 曲名
 	public string ArtistName { get; set; } = null;             // 艺术家
-	public string ComposerName { get; set; } = null;           // 作曲家（这个优先显示而不是ArtistName）
+	public string ComposerName { get; set; } = null;           // 作曲家（这个优先显示而不是ArtistName~）
 	public string Genre { get; set; } = null;                  // 曲风
 	public float[] WaveformPeaks { get; set; } = null;        // 预计算的波形峰值数组（用于底部进度条显示）
+	public float AudioPeak { get; set; } = 1.0f;              // 歌曲的最大振幅峰值（用于波形和频谱归一化）
 
 	// 音频时间信息（用于进度条同步，单位：秒）
 	public double AudioStartTime { get; set; } = 0;           // 该子文件音频在总时间线中的开始时间
@@ -35,6 +36,7 @@ public class SubFile(string path, long startOffset, long length)
 	public int AudioSampleRate { get; set; } = 0;             // 音频采样率 (Hz)
 	public int AudioChannels { get; set; } = 0;               // 音频声道数
 	public int AudioBitDepth { get; set; } = 0;               // 音频位深 (bits)
+	public int AudioBitrate { get; set; } = 0;                // 音频比特率 (bps)
 
 	public string FileName => System.IO.Path.GetFileName(Path);
 	public string FileDirectory => System.IO.Path.GetDirectoryName(Path);

@@ -80,12 +80,12 @@ public class Generator
     private float _cachedGradientY2 = -1;
     private float _cachedGradientHeight = -1;
     
-    // 文本测量缓存（避免重复测量相同文本）
+    // 文本测量缓存
     private Dictionary<(string text, float fontSize), float> _textWidthCache = new();
     private const int MaxTextCacheSize = 2048;  // 增大缓存容量
     
     // 预渲染的静态 UI 元素
-    // 封面图片缓存（避免每帧 Clone + Resize）
+    // 封面图片缓存
     private SKBitmap _cachedScaledCover = null;
     private int _cachedCoverSubfileIndex = -1;
     private int _cachedCoverSize = 0;
@@ -94,7 +94,7 @@ public class Generator
     private SKBitmap _staticUILayer = null;
     private bool _staticUILayerValid = false;
     
-    // 子文件列表预渲染缓存（减少 DrawText 调用）
+    // 子文件列表预渲染缓存
     private SKBitmap _subfileListCache = null;
     private float _cachedSubfileWindowIndex = -999f;
     private int _cachedCurrentSubfileKey = -1;
@@ -106,10 +106,10 @@ public class Generator
     private SKBitmap _trackInfoCache = null;
     private int _cachedTrackInfoSubfileIndex = -1;
     
-    // 高级切换动画状态（基于时间）
-    private string _prevDisplayInfo = "";         // 前一首显示信息（用于字符动画）
+    // 切换动画状态（基于时间）
+    private string _prevDisplayInfo = "";         // 前一首显示信息
     private string _prevTimeString = "";          // 前一首时间字符串
-    private string _currentDisplayInfo = "";      // 当前显示信息（每帧更新，用于快速切换时保存）
+    private string _currentDisplayInfo = "";      // 当前显示信息
     private string _currentTimeString = "";       // 当前时间字符串
     private float[] _prevWaveformPeaks = null;    // 前一首波形数据
     private float[] _currentWaveformPeaks = null; // 当前波形数据
@@ -125,12 +125,18 @@ public class Generator
     private bool _prevHasComposer = false;        // 前一首是否有 Composer
     private bool _prevHasGenre = false;           // 前一首是否有 Genre
     
-    // 字符动画缓存（避免每帧分配列表）
+    // 字符动画缓存
     private readonly List<(char c, float x, float width)> _oldCharPositions = new();
     private readonly List<(char c, float x, float width)> _newCharPositions = new();
     
     // 波形点缓存（用于重用 SKPoint 数组）
     private SKPoint[] _waveformPointCache = null;
+    
+    // 当前歌曲的音频峰值（用于波形和频谱归一化）
+    private float _currentAudioPeak = 1.0f;
+    
+    // 波形触发状态（用于零交叉触发稳定）
+    private int _lastTriggerOffset = 0;              // 上一帧的触发偏移位置
     
     // 可复用的 Paint 对象（避免每帧创建）
     private readonly SKPaint _fillPaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
@@ -161,10 +167,10 @@ public class Generator
         _simdPosMask = new Vector<byte>(posPattern);
     }
     
-    // Ease-out 缓动函数（快到慢）
+    // Ease-out 缓动函数
     private static float EaseOutCubic(float t) => 1f - MathF.Pow(1f - t, 3f);
     
-    // Ease-in-out 缓动函数（适合字符动画）
+    // Ease-in-out 缓动函数
     private static float EaseInOutQuad(float t) => t < 0.5f ? 2f * t * t : 1f - MathF.Pow(-2f * t + 2f, 2f) / 2f;
     
     // 计算封面图像的简单哈希（用于比较是否相同）
@@ -268,7 +274,7 @@ public class Generator
         }
     }
     
-    // 确保帧画布已创建（复用 SKCanvas 避免重复分配）
+    // 确保帧画布已创建
     private void EnsureFrameCanvas()
     {
         if (_frameContent == null) return;
@@ -361,13 +367,13 @@ public class Generator
         // 颜色定义
         var dimGray = new SKColor(105, 105, 105);
         
-        // A/V SETTINGS 标签（左上角，x=32 左对齐）
+        // A/V SETTINGS 标签
         canvas.DrawTextAndCache(_typeface, _fontSize16, "A/V SETTINGS", 32, 32, dimGray, HorizontalAlign.Left, VerticalAlign.Top);
         
-        // ABS. OFFSET 标签（右上角，x=右边界，右对齐）
+        // ABS. OFFSET 标签
         canvas.DrawTextAndCache(_typeface, _fontSize16, "ABS. OFFSET", OutputVideoWidth - 32, 32, dimGray, HorizontalAlign.Right, VerticalAlign.Top);
         
-        // BITRATE 标签（ABS. OFFSET 左侧，间隔 240px，x=右边界，右对齐）
+        // BITRATE 标签
         canvas.DrawTextAndCache(_typeface, _fontSize16, "BITRATE", OutputVideoWidth - 280, 32, dimGray, HorizontalAlign.Right, VerticalAlign.Top);
         
         // 底部播放器固定标签
@@ -414,7 +420,7 @@ public class Generator
     public int CurrentFrameWidth => _frameContent?.Width ?? 0;
     public int CurrentFrameHeight => _frameContent?.Height ?? 0;
 
-    // 预览模式初始化（不需要导出器，？？？）
+    // 预览模式初始化（不需要导出器，以后要改）
     public void InitializeForPreview()
     {
         if (InputFileStream == null && !string.IsNullOrEmpty(InputFilePath))
@@ -452,7 +458,7 @@ public class Generator
     #region General Parameters
 
     public string InputFilePath { get; set; } = null;
-    // 多文件队列：如果设置了此列表，将按顺序播放所有音频文件
+    // 多文件队列
     public List<string> InputFilePaths { get; set; } = null;
     // 当前播放的音频文件索引（用于 UI 显示）
     public int CurrentAudioIndex { get; private set; } = 0;
@@ -464,17 +470,17 @@ public class Generator
     public string ExporterId { get; set; } = null;
     // 硬件加速类型（仅适用于 FFmpeg 导出器）
     public HardwareAccelType HardwareAccel { get; set; } = HardwareAccelType.Auto;
-    // 编码质量预设（Speed=速度优先, Balanced=平衡, Quality=质量优先）
+    // 编码质量预设
     public EncodingQualityPreset EncodingPreset { get; set; } = EncodingQualityPreset.Speed;
     // NVENC 编码配置
     public string NvencPreset { get; set; } = "p1";             // P1 最快速度
     public string NvencTune { get; set; } = "ll";               // ll=低延迟模式
     public string NvencRateControl { get; set; } = "vbr";       // vbr=可变比特率
-    public int NvencBFrames { get; set; } = 0;                  // B帧=0（禁用以提高速度）
+    public int NvencBFrames { get; set; } = 0;                  // B帧=0
     public bool NvencTemporalAQ { get; set; } = false;          // 关闭时域AQ
     public bool NvencSpatialAQ { get; set; } = false;           // 关闭空域AQ
-    public int NvencAQStrength { get; set; } = 0;               // AQ强度=0（已禁用）
-    public int NvencLookahead { get; set; } = 0;                // Lookahead=0（禁用前瞻）
+    public int NvencAQStrength { get; set; } = 0;               // AQ强度=0
+    public int NvencLookahead { get; set; } = 0;                // Lookahead=0
     public bool NvencZeroLatency { get; set; } = true;          // 零延迟模式
     // 视频编码参数
     public uint VideoBitrate { get; set; } = 20_000_000;        // 默认 20 Mbps
@@ -491,7 +497,6 @@ public class Generator
     public string OutputFormat { get; set; } = "matroska";      // matroska, mp4, webm, mov, avi
     
     // 瀑布视窗时间跨度（毫秒），控制瀑布滚动速度
-    // 值越大，瀑布显示的时间范围越长
     // 默认值 2730ms 对应原始 InputBytesPerSecond = 96000
     [CliParameter("Waterfall window duration in milliseconds", "waterfall-window-ms")]
     public int WaterfallWindowMs { get; set; } = 2730;
@@ -562,20 +567,20 @@ public class Generator
     [CliParameter("Waveform display mode (average, diffavg, left, right, stereo)", "waveform-mode")]
     public string WaveformMode { get; set; } = "average"; // 波形显示模式：average/diffavg/left/right/stereo
 
+    [CliParameter("Enable waveform trigger (zero-crossing) for stable display", "waveform-trigger")]
+    public bool WaveformTriggerEnabled { get; set; } = true; // 启用波形触发
+
     [CliParameter("Spectrum bar count", "spectrum-bars")]
     public int SpectrumBarCount { get; set; } = 64; // 频谱柱数量，范围 8~1024
 
-    [CliParameter("Spectrum smoothing factor (deprecated, use attack/release)", "spectrum-smoothing")]
-    public float SpectrumSmoothing { get; set; } = 0.6f; // 频谱平滑系数（已弃用）
-
     [CliParameter("Spectrum attack time in milliseconds", "spectrum-attack-ms")]
-    public float SpectrumAttackMs { get; set; } = 10f; // 频谱上升时间（毫秒），值越小响应越快
+    public float SpectrumAttackMs { get; set; } = 10f; // 频谱上升时间（毫秒）
 
     [CliParameter("Spectrum release time in milliseconds", "spectrum-release-ms")]
-    public float SpectrumReleaseMs { get; set; } = 150f; // 频谱下降时间（毫秒），值越大弹动越慢
+    public float SpectrumReleaseMs { get; set; } = 150f; // 频谱下降时间（毫秒）
 
     [CliParameter("FFT size for spectrum analysis (power of 2)", "fft-size")]
-    public int FftSize { get; set; } = 4096; // FFT 大小，必须是 2 的幂次方，范围 512~8192
+    public int FftSize { get; set; } = 4096; // FFT 大小，范围 512~8192
 
     [CliParameter("Intro fade duration in seconds", "intro-fade-duration")]
     public float IntroFadeDuration { get; set; } = 1.0f; // 开头免责声明的淡入淡出时长（秒）
@@ -646,7 +651,7 @@ public class Generator
 
         UpdateValues();
 
-        // 使用 CSCore 初始化真实音频解码器，并让输出采样率/声道数跟随解码器参数
+        // 初始化真实音频解码器
         InitializeAudioDecoder();
 
         // 配置画笔的抗锯齿设置
@@ -654,13 +659,13 @@ public class Generator
         _strokePaint.IsAntialias = _fontAntialiasing;
         _textPaint.IsAntialias = _fontAntialiasing;
 
-        // JIT 预热：预先编译热点代码路径，避免渲染开始时的性能抖动
+        // JIT 预热
         WarmupRenderingPipeline();
 
         LogGeneratorStatus();
     }
 
-    // JIT 预热：执行关键渲染路径以触发 JIT 编译
+    // JIT 预热
     private void WarmupRenderingPipeline()
     {
         Logger.Info("Warming up rendering pipeline...");
@@ -805,13 +810,12 @@ public class Generator
                 _audioSampleSource = SafeToSampleSource(_audioWaveSource, InputFilePath);
             }
             
-            // 恢复用户期望的输出设置
-            // FFmpeg 导出器会将音频从 AudioDecoderSampleRate/AudioDecoderChannelCount 重采样到 AudioOutputSampleRate/AudioOutputChannelCount
+            // FFmpeg 导出器会将音频重采样
             AudioOutputSampleRate = targetOutputSampleRate;
             AudioOutputChannelCount = targetOutputChannelCount;
             Logger.Info($"Audio: decoder={AudioDecoderSampleRate}Hz {AudioDecoderChannelCount}ch -> output={AudioOutputSampleRate}Hz {AudioOutputChannelCount}ch");
 
-            // 准备音频缓冲区（基于解码器参数，因为这是实际读取的数据）
+            // 准备音频缓冲区
             int decoderSamplesPerChannel = AudioDecoderSampleRate / OutputFps;
             _outputAudioBuffer = new(decoderSamplesPerChannel, AudioDecoderChannelCount);
             _audioSampleBuffer = new float[decoderSamplesPerChannel * AudioDecoderChannelCount];
@@ -877,7 +881,7 @@ public class Generator
         Logger.Info("Loading fonts (SkiaSharp)…");
         Logger.Debug($"Requested font: '{FontName}'.");
 
-        // 尝试按用户指定的字体名加载
+        // 尝试按指定的字体名加载
         if (!string.IsNullOrEmpty(FontName))
         {
             _typeface = TryLoadFont(FontName);
@@ -887,7 +891,7 @@ public class Generator
             }
         }
 
-        // 如果用户指定的字体不可用，尝试备选字体
+        // 如果指定的字体不可用，尝试备选字体
         if (_typeface == null)
         {
             // 按优先级尝试字体（包含大小写变体）
@@ -933,7 +937,7 @@ public class Generator
         _textPaint.Typeface = _typeface;
     }
     
-    // 尝试加载指定名称的字体（使用 SKFontManager 进行精确匹配）
+    // 尝试加载指定名称的字体
     private SKTypeface TryLoadFont(string fontName)
     {
         if (string.IsNullOrEmpty(fontName)) return null;
@@ -1207,10 +1211,8 @@ public class Generator
         PopulateSubfileMetadata();
     }
 
-    /// 
     /// 使用 TagLib 为每个子文件填充基础音频元数据：专辑、碟号、曲号、曲名、艺术家和风格。
     /// 解析失败时记录 Debug 日志，不影响整体流程。
-    
     private void PopulateSubfileMetadata()
     {
         foreach (var sf in _subfiles)
@@ -1289,6 +1291,12 @@ public class Generator
                     sf.Genre = string.Join(", ", tag.Genres);
                 }
                 
+                // 音频比特率（从 Properties 读取，单位 kbps）
+                if (sf.AudioBitrate == 0 && tagFile.Properties != null)
+                {
+                    sf.AudioBitrate = tagFile.Properties.AudioBitrate * 1000; // 转换为 bps
+                }
+                
                 // 专辑封面：从 tag.Pictures 读取嵌入的封面图片
                 if (sf.Icon == null && tag.Pictures != null && tag.Pictures.Length > 0)
                 {
@@ -1332,7 +1340,6 @@ public class Generator
     }
 
     // 预计算所有子文件的波形 RMS 值（用于底部进度条显示）
-    // 使用流式读取 + 完整采样计算，生成准确的波形数据
     private void PrecomputeSubfileWaveforms()
     {
         Logger.Info("Precomputing waveform RMS for subfiles…");
@@ -1373,6 +1380,9 @@ public class Generator
                 long currentPosition = 0;
                 int totalRead;
                 
+                // 同时记录文件峰值振幅
+                float fileMaxPeak = 0f;
+                
                 while ((totalRead = sampleSource.Read(buffer, 0, readBufferSize)) > 0)
                 {
                     // 处理每个采样，累加到对应的 RMS 段
@@ -1382,13 +1392,18 @@ public class Generator
                         int segmentIndex = (int)((currentPosition + i) / samplesPerSegment);
                         if (segmentIndex >= rmsCount) segmentIndex = rmsCount - 1;
                         
-                        // 累加平方值
-                        double sample = buffer[i];
+                        // 累加平方值并记录峰值
+                        float sample = buffer[i];
+                        float absVal = Math.Abs(sample);
                         sumSquares[segmentIndex] += sample * sample;
                         sampleCounts[segmentIndex]++;
+                        if (absVal > fileMaxPeak) fileMaxPeak = absVal;
                     }
                     currentPosition += totalRead;
                 }
+                
+                // 保存该歌曲的峰值（用于波形和频谱归一化）
+                sf.AudioPeak = fileMaxPeak > 0.001f ? fileMaxPeak : 1.0f;
                 
                 // 计算每个段的 RMS 值
                 float[] rmsValues = new float[rmsCount];
@@ -1414,7 +1429,7 @@ public class Generator
                 }
                 
                 sf.WaveformPeaks = rmsValues;
-                Logger.Debug($"Waveform computed for '{sf.FileName}': {currentPosition} samples, max RMS = {globalMaxRms:F4}");
+                Logger.Debug($"Waveform computed for '{sf.FileName}': {currentPosition} samples, peak = {sf.AudioPeak:F4}, max RMS = {globalMaxRms:F4}");
             }
             catch (Exception ex)
             {
@@ -1512,7 +1527,7 @@ public class Generator
     // 配置模式：调整线程池、GC 和运行时设置
     private static void ConfigureHighPerformanceMode()
     {
-        // 大幅增加线程池线程数（完全利用多核 CPU）
+        // 线程池线程数（完全利用多核 CPU）
         int processorCount = Environment.ProcessorCount;
         int minWorkerThreads = processorCount * 8;
         int minIOThreads = processorCount * 4;
@@ -1878,6 +1893,9 @@ public class Generator
                 // 当播放第3个及之后时，窗口索引=currentSubfileKey-2（当前项固定在第3行）
                 float targetWindowIndex = currentSubfileKey < 3 ? 0 : currentSubfileKey - 2;
                 subfileWindowIndex = 0.2f * subfileWindowIndex + 0.8f * targetWindowIndex;
+                
+                // 更新当前歌曲的峰值（用于波形和频谱归一化）
+                _currentAudioPeak = currentSubfileValue?.AudioPeak ?? 1.0f;
             }
 
             // 5. 实际绘制一帧：左侧瀑布 + 右侧上部列表 + 右下音频可视化 + 顶/底渐变 + 文字信息
@@ -2044,9 +2062,14 @@ public class Generator
                 $"{displayOffset / 1048576f:N2} MiB\n0x{displayOffset:X8}", SKColors.White,
                 VerticalAlign.Top, HorizontalAlign.Right);
             
-            // BITRATE 值（BITRATE 标签下方）
+            // BITRATE 值：显示当前歌曲的源文件比特率
+            string currentBitrateString = readSpeedString;
+            if (currentSubfileValue != null && currentSubfileValue.AudioBitrate > 0)
+            {
+                currentBitrateString = $"{currentSubfileValue.AudioBitrate / 1000} kbps";
+            }
             DrawText(OutputVideoWidth - 280, valueY, _fontSize24,
-                readSpeedString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+                currentBitrateString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
 
             // Author（居中显示）
             if (!string.IsNullOrEmpty(Author))
@@ -2864,15 +2887,45 @@ public class Generator
         // 显示窗口
         int windowSize = (int)(AudioOutputSampleRate * WaveformLengthMs / 1000f);
         windowSize = Math.Clamp(windowSize, 64, samples.Length);
+        
+        // 计算起始索引（默认从末尾开始）
         int startIdx = samples.Length - windowSize;
-
-        // 归一化
-        float maxAbs = 0.001f;
-        for (int i = 0; i < windowSize; i++)
+        
+        // Zero-crossing Trigger：找到正向过零点作为波形起始位置
+        if (WaveformTriggerEnabled && windowSize < samples.Length - 100)
         {
-            float abs = Math.Abs(samples[startIdx + i]);
-            if (abs > maxAbs) maxAbs = abs;
+            // 搜索范围：从默认起始位置向前搜索半个窗口大小
+            int searchStart = Math.Max(0, startIdx - windowSize / 2);
+            int searchEnd = startIdx;
+            int triggerOffset = -1;
+            
+            // 寻找正向过零点（从负到正的穿越）
+            for (int i = searchStart + 1; i < searchEnd; i++)
+            {
+                if (samples[i - 1] < 0 && samples[i] >= 0)
+                {
+                    triggerOffset = i;
+                    break;
+                }
+            }
+            
+            // 如果找到触发点，使用它作为起始位置
+            if (triggerOffset >= 0)
+            {
+                // 如果新触发点与上一帧差异太大，进行平滑
+                int maxJump = windowSize / 4;
+                if (_lastTriggerOffset > 0 && Math.Abs(triggerOffset - _lastTriggerOffset) > maxJump)
+                {
+                    // 限制跳变幅度
+                    triggerOffset = _lastTriggerOffset + Math.Sign(triggerOffset - _lastTriggerOffset) * maxJump;
+                }
+                startIdx = Math.Clamp(triggerOffset, 0, samples.Length - windowSize);
+                _lastTriggerOffset = triggerOffset;
+            }
         }
+
+        // 使用当前歌曲峰值进行归一化（而不是窗口内最大值）
+        float normalizeFactor = _currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f;
 
         float centerY = region.MidY;
         float amplitude = region.Height * 0.45f;
@@ -2890,7 +2943,8 @@ public class Generator
         {
             // 每个点对应的样本索引
             int sampleIdx = startIdx + (i * windowSize / pointCount);
-            float v = samples[sampleIdx] / maxAbs;
+            // 使用全局峰值归一化
+            float v = samples[sampleIdx] / normalizeFactor;
             float x = region.Left + (i / (float)(pointCount - 1)) * region.Width;
             float y = centerY - v * amplitude;
             points[i] = new SKPoint(x, y);
@@ -2979,8 +3033,11 @@ public class Generator
                 if (_fftMagnitudes[k] > maxMag) maxMag = _fftMagnitudes[k];
             }
 
-            float db = 20f * (float)Math.Log10(maxMag + 1e-10f);
-            bars[i] = Math.Clamp((db + 60f) / 60f, 0f, 1f);
+            // 使用当前歌曲峰值进行缩放
+            float normalizedMag = maxMag / (_currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f);
+            float db = 20f * (float)Math.Log10(normalizedMag + 1e-10f);
+            // 使用 -40dB 到 0dB 的范围
+            bars[i] = Math.Clamp((db + 40f) / 40f, 0f, 1f);
         }
 
         if (_smoothedSpectrum == null || _smoothedSpectrum.Length != barCount)
@@ -2990,25 +3047,27 @@ public class Generator
         }
 
         // 基于时间的指数衰减平滑（与帧率无关）
-        // 公式：coef = exp(-dt / tau)，其中 dt = 帧时间，tau = 时间常数
         float dt = 1000f / OutputFps; // 每帧时间（毫秒）
-        float attackMs = Math.Max(1f, SpectrumAttackMs);   // 上升时间（毫秒）
-        float releaseMs = Math.Max(1f, SpectrumReleaseMs); // 下降时间（毫秒）
         
-        // 计算平滑系数（指数衰减）
-        float attackCoef = (float)Math.Exp(-dt / attackMs);
-        float releaseCoef = (float)Math.Exp(-dt / releaseMs);
+        // 将用户参数解释为半衰期（衰减到50%的时间）
+        float attackHalfLife = Math.Max(0.1f, SpectrumAttackMs);   // 上升半衰期（毫秒）
+        float releaseHalfLife = Math.Max(0.1f, SpectrumReleaseMs); // 下降半衰期（毫秒）
+        
+        // 计算平滑系数
+        float ln05 = -0.693147f; // ln(0.5)
+        float attackCoef = (float)Math.Exp(ln05 * dt / attackHalfLife);
+        float releaseCoef = (float)Math.Exp(ln05 * dt / releaseHalfLife);
         
         for (int i = 0; i < barCount; i++)
         {
             if (bars[i] > _smoothedSpectrum[i])
             {
-                // 上升：使用 attack 时间常数
+                // 上升：使用 attack 半衰期
                 _smoothedSpectrum[i] = _smoothedSpectrum[i] * attackCoef + bars[i] * (1f - attackCoef);
             }
             else
             {
-                // 下降：使用 release 时间常数
+                // 下降：使用 release 半衰期
                 _smoothedSpectrum[i] = _smoothedSpectrum[i] * releaseCoef + bars[i] * (1f - releaseCoef);
             }
         }
@@ -3017,7 +3076,7 @@ public class Generator
         float gap = barWidth * 0.15f;
         float actualWidth = barWidth - gap;
 
-        // 使用路径批量绘制所有频谱柱（减少 DrawRect 调用次数）
+        // 使用路径批量绘制所有频谱柱
         using var path = new SKPath();
         for (int i = 0; i < barCount; i++)
         {

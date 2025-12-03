@@ -294,7 +294,9 @@ public class Generator
     private void DrawMultilineCentered(string text, float centerX, float centerY, float fontSize, SKColor color, float lineSpacingMultiplier = 1.25f)
     {
         if (string.IsNullOrEmpty(text) || _frameCanvas == null) return;
-        string[] lines = text.Split('\n');
+        // 统一换行符：Windows 的 \r\n 和 Mac 旧版的 \r 都转换为 \n
+        string normalizedText = text.Replace("\r\n", "\n").Replace("\r", "\n");
+        string[] lines = normalizedText.Split('\n');
         float lineSpacing = fontSize * lineSpacingMultiplier;
         float totalHeight = lineSpacing * (lines.Length - 1);
         for (int i = 0; i < lines.Length; i++)
@@ -580,7 +582,7 @@ public class Generator
     public float SpectrumSlope { get; set; } = 4.5f; // 频谱斜率（dB/octave），默认 4.5
 
     [CliParameter("Spectrum release time in milliseconds", "spectrum-release-ms")]
-    public float SpectrumReleaseMs { get; set; } = 150f; // 频谱下降时间（毫秒）
+    public float SpectrumReleaseMs { get; set; } = 10f; // 频谱下降时间（毫秒）
 
     [CliParameter("FFT size for spectrum analysis (power of 2)", "fft-size")]
     public int FftSize { get; set; } = 4096; // FFT 大小，范围 512~8192
@@ -592,7 +594,7 @@ public class Generator
     public float OutroFadeDuration { get; set; } = 2.0f; // 内容结束后的淡出时长（秒）
 
     [CliParameter("Intro text content", "intro-text")]
-    public string IntroText { get; set; } = "声明\n\n本视频由\nextended-binary-waterfall\n项目改造进行生成\n\n"; // 入场显示的文字内容
+    public string IntroText { get; set; } = "声明\n\n本视频使用\nextended-binary-waterfall\n项目进行生成\n\n"; // 入场显示的文字内容
 
     [CliParameter("Intro duration in seconds", "intro-duration")]
     public float IntroDuration { get; set; } = 5.0f; // 开场持续时间（秒）
@@ -2847,6 +2849,19 @@ public class Generator
     // 音频历史缓冲（用于更大的 FFT 窗口以提高低频分辨率）
     private float[] _audioHistoryBuffer = null;
     private int _audioHistoryWritePos = 0;
+    // 频谱频率映射缓存（避免每帧重复计算 Math.Pow/Log）
+    private int[] _spectrumBin0Cache = null;
+    private int[] _spectrumBin1Cache = null;
+    private float[] _spectrumCenterFreqCache = null;
+    private float[] _spectrumBarsCache = null; // 复用 bars 数组
+    private int _spectrumCacheBarCount = 0;
+    private int _spectrumCacheFftSize = 0;
+    // 平滑系数缓存（避免每帧计算 Math.Exp）
+    private float _cachedAttackAlpha = 0f;
+    private float _cachedReleaseAlpha = 0f;
+    private float _cachedAttackMs = 0f;
+    private float _cachedReleaseMs = 0f;
+    private int _cachedOutputFps = 0;
     // FFT 旋转因子缓存
     private double[] _fftCosTable = null;
     private double[] _fftSinTable = null;
@@ -3043,25 +3058,20 @@ public class Generator
             _audioMonoBuffer = new float[sampleCount];
         }
         
-        // 峰值归一化系数：将音频归一化到 [-1, 1] 范围
-        float peakNorm = _currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f;
-        
-        // SIMD 优化的声道混合 + 峰值归一化
+        // SIMD 优化的声道混合（解交错 + 混音）
         if (channelCount == 2 && Vector.IsHardwareAccelerated)
         {
-            // 立体声特化：SIMD 向量化 + 峰值归一化
+            // 立体声：SIMD 向量化解交错 + 混音
             int vectorSize = Vector<float>.Count;
-            float scale = 0.5f / peakNorm;
             int i = 0;
             
-            // 每次处理 vectorSize 个采样
             for (; i <= sampleCount - vectorSize; i += vectorSize)
             {
-                // 解交错：左右声道分别相加并平均，同时归一化
+                // 解交错：从交错数据中提取左右声道并求平均
                 for (int k = 0; k < vectorSize && i + k < sampleCount; k++)
                 {
                     int idx = (i + k) * 2;
-                    _audioMonoBuffer[i + k] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
+                    _audioMonoBuffer[i + k] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * 0.5f;
                 }
             }
             
@@ -3069,18 +3079,22 @@ public class Generator
             for (; i < sampleCount; i++)
             {
                 int idx = i * 2;
-                _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
+                _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * 0.5f;
             }
         }
         else if (channelCount == 2)
         {
             // 立体声回退：无 SIMD
-            float scale = 0.5f / peakNorm;
             for (int i = 0; i < sampleCount; i++)
             {
                 int idx = i * 2;
-                _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * scale;
+                _audioMonoBuffer[i] = (_audioInterleavedBuffer[idx] + _audioInterleavedBuffer[idx + 1]) * 0.5f;
             }
+        }
+        else if (channelCount == 1)
+        {
+            // 单声道：直接复制
+            Array.Copy(_audioInterleavedBuffer, _audioMonoBuffer, sampleCount);
         }
         else
         {
@@ -3089,7 +3103,7 @@ public class Generator
             // - 非相关信号的能量累加是 sqrt(N) 倍
             // - 环绕声通常只有部分声道活跃，直接除以 N 会导致振幅过小
             float sqrtChannels = (float)Math.Sqrt(channelCount);
-            float scale = 1f / (sqrtChannels * peakNorm);
+            float invScale = 1f / sqrtChannels;
             for (int i = 0; i < sampleCount; i++)
             {
                 float sum = 0f;
@@ -3098,7 +3112,38 @@ public class Generator
                 {
                     sum += _audioInterleavedBuffer[baseIdx + ch];
                 }
-                _audioMonoBuffer[i] = sum * scale;
+                _audioMonoBuffer[i] = sum * invScale;
+            }
+        }
+        
+        // 使用歌曲整体峰值进行归一化
+        float songPeak = _currentAudioPeak > 0.001f ? _currentAudioPeak : 1.0f;
+        float normScale = 1f / songPeak;
+        
+        // SIMD 优化的归一化
+        if (Vector.IsHardwareAccelerated)
+        {
+            int vectorSize = Vector<float>.Count;
+            var scaleVec = new Vector<float>(normScale);
+            int i = 0;
+            
+            for (; i <= sampleCount - vectorSize; i += vectorSize)
+            {
+                var vec = new Vector<float>(_audioMonoBuffer, i);
+                (vec * scaleVec).CopyTo(_audioMonoBuffer, i);
+            }
+            
+            // 处理剩余采样
+            for (; i < sampleCount; i++)
+            {
+                _audioMonoBuffer[i] *= normScale;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < sampleCount; i++)
+            {
+                _audioMonoBuffer[i] *= normScale;
             }
         }
 
@@ -3166,7 +3211,7 @@ public class Generator
         float lineWidth = Math.Max(1.5f, WaveformLineWidth * ResolutionScale);
 
         // 下采样点数（折线顶点数）
-        int pointCount = Math.Min(512, windowSize);
+        int pointCount = Math.Min(512, windowSize); 
         if (_waveformPointCache == null || _waveformPointCache.Length < pointCount)
         {
             _waveformPointCache = new SKPoint[pointCount];
@@ -3239,56 +3284,78 @@ public class Generator
         ComputeMagnitudesSimd(_fftReal, _fftImag, _fftMagnitudes, halfN, n);
 
         // 频率范围
-        float freqPerBin = (float)AudioOutputSampleRate / n;
-        float minFreq = 20f;
-        float nyquistFreq = AudioOutputSampleRate / 2f;
-        float maxFreq = nyquistFreq * 0.98f; // 保留 2% 余量避免混叠边缘
-
         int barCount = Math.Clamp(SpectrumBarCount, 16, 128);
-        float[] bars = new float[barCount];
+        
+        // 复用 bars 数组
+        if (_spectrumBarsCache == null || _spectrumBarsCache.Length != barCount)
+        {
+            _spectrumBarsCache = new float[barCount];
+        }
+        float[] bars = _spectrumBarsCache;
 
-        // 对数频率映射（符合人耳感知）
-        float logMin = (float)Math.Log10(minFreq);
-        float logMax = (float)Math.Log10(maxFreq);
-        float logRange = logMax - logMin;
+        // 预计算频率映射缓存（仅在参数变化时重新计算）
+        if (_spectrumBin0Cache == null || _spectrumCacheBarCount != barCount || _spectrumCacheFftSize != n)
+        {
+            float freqPerBin = (float)AudioOutputSampleRate / n;
+            float minFreq = 20f;
+            float nyquistFreq = AudioOutputSampleRate / 2f;
+            float maxFreq = nyquistFreq * 0.98f;
+            float logMin = (float)Math.Log10(minFreq);
+            float logMax = (float)Math.Log10(maxFreq);
+            float logRange = logMax - logMin;
+            
+            _spectrumBin0Cache = new int[barCount];
+            _spectrumBin1Cache = new int[barCount];
+            _spectrumCenterFreqCache = new float[barCount];
+            
+            for (int i = 0; i < barCount; i++)
+            {
+                float t0 = i / (float)barCount;
+                float t1 = (i + 1) / (float)barCount;
+                float freqLo = (float)Math.Pow(10, logMin + t0 * logRange);
+                float freqHi = (float)Math.Pow(10, logMin + t1 * logRange);
+                _spectrumCenterFreqCache[i] = (float)Math.Sqrt(freqLo * freqHi);
+                
+                float binLo = freqLo / freqPerBin;
+                float binHi = freqHi / freqPerBin;
+                _spectrumBin0Cache[i] = Math.Max(1, (int)binLo);
+                _spectrumBin1Cache[i] = Math.Min(halfN - 1, (int)Math.Ceiling(binHi));
+                if (_spectrumBin1Cache[i] < _spectrumBin0Cache[i]) 
+                    _spectrumBin1Cache[i] = _spectrumBin0Cache[i];
+            }
+            _spectrumCacheBarCount = barCount;
+            _spectrumCacheFftSize = n;
+        }
 
+        // 使用缓存的频率映射计算频谱（避免每帧重复 Math.Pow/Log）
+        bool hasSlope = SpectrumSlope > 0.01f || SpectrumSlope < -0.01f;
+        float log2Base = (float)Math.Log(2);
+        
         for (int i = 0; i < barCount; i++)
         {
-            float t0 = i / (float)barCount;
-            float t1 = (i + 1) / (float)barCount;
-            float freqLo = (float)Math.Pow(10, logMin + t0 * logRange);
-            float freqHi = (float)Math.Pow(10, logMin + t1 * logRange);
-            float centerFreq = (float)Math.Sqrt(freqLo * freqHi); // 几何中心频率
-
-            float binLo = freqLo / freqPerBin;
-            float binHi = freqHi / freqPerBin;
-            int bin0 = Math.Max(1, (int)binLo);
-            int bin1 = Math.Min(halfN - 1, (int)Math.Ceiling(binHi));
-            if (bin1 < bin0) bin1 = bin0;
-
-            // 使用 RMS（均方根）计算频带能量
+            int bin0 = _spectrumBin0Cache[i];
+            int bin1 = _spectrumBin1Cache[i];
+            
+            // 使用 RMS 计算频带能量
             float sumSq = 0f;
-            int binCount = 0;
+            int binCount = bin1 - bin0 + 1;
             for (int k = bin0; k <= bin1; k++)
             {
                 sumSq += _fftMagnitudes[k] * _fftMagnitudes[k];
-                binCount++;
             }
             float rmsMag = binCount > 0 ? (float)Math.Sqrt(sumSq / binCount) : 0f;
 
-            // 转换为 dB（FFT 输入已在写入历史缓冲区时归一化）
+            // 转换为 dB（输入已归一化到 [-1, 1]）
             float db = 20f * (float)Math.Log10(rmsMag + 1e-10f);
             
-            // 斜率补偿（在 dB 域应用）
-            // 4.5 dB/oct = SPAN 默认值
-            if (SpectrumSlope > 0.01f || SpectrumSlope < -0.01f)
+            // 斜率补偿
+            if (hasSlope)
             {
-                float octaveFromRef = (float)(Math.Log(centerFreq / 1000f) / Math.Log(2));
+                float octaveFromRef = (float)Math.Log(_spectrumCenterFreqCache[i] / 1000f) / log2Base;
                 db += octaveFromRef * SpectrumSlope;
             }
             
             // 映射到 0~1（-60dB ~ 0dB 动态范围）
-            // 60dB 范围更适合音乐可视化
             bars[i] = Math.Clamp((db + 60f) / 60f, 0f, 1f);
         }
 
@@ -3299,21 +3366,20 @@ public class Generator
             Array.Copy(bars, _smoothedSpectrum, barCount);
         }
 
-        // 指数平滑（基于时间常数 τ）
-        // 公式: output = previous + α * (current - previous)
-        // 其中 α = 1 - exp(-dt / τ)
-        // τ 时间后达到目标值的 63.2%（1 - 1/e）
-        float dt = 1000f / OutputFps; // 帧间隔（毫秒）
-        
-        // 时间常数（毫秒），最小 1ms 避免除零
-        float attackTau = Math.Max(1f, SpectrumAttackMs);
-        float releaseTau = Math.Max(1f, SpectrumReleaseMs);
-        
-        // 计算平滑系数（α）
-        // attack: 信号上升时使用，较小的 τ = 更快响应
-        // release: 信号下降时使用，较大的 τ = 更慢衰减
-        float attackAlpha = 1f - (float)Math.Exp(-dt / attackTau);
-        float releaseAlpha = 1f - (float)Math.Exp(-dt / releaseTau);
+        // 指数平滑（基于时间常数 τ）- 仅在参数变化时重新计算
+        if (_cachedAttackMs != SpectrumAttackMs || _cachedReleaseMs != SpectrumReleaseMs || _cachedOutputFps != OutputFps)
+        {
+            float dt = 1000f / OutputFps;
+            float attackTau = Math.Max(1f, SpectrumAttackMs);
+            float releaseTau = Math.Max(1f, SpectrumReleaseMs);
+            _cachedAttackAlpha = 1f - (float)Math.Exp(-dt / attackTau);
+            _cachedReleaseAlpha = 1f - (float)Math.Exp(-dt / releaseTau);
+            _cachedAttackMs = SpectrumAttackMs;
+            _cachedReleaseMs = SpectrumReleaseMs;
+            _cachedOutputFps = OutputFps;
+        }
+        float attackAlpha = _cachedAttackAlpha;
+        float releaseAlpha = _cachedReleaseAlpha;
         
         for (int i = 0; i < barCount; i++)
         {

@@ -1,0 +1,21 @@
+未来添加功能：
+
+Stream View: 已完成
+View: Binary Waterfall
+wav，flac等流式传输格式
+
+MIDI View: 基本完成
+View: Piano Roll
+MIDI格式
+
+Track View:
+View: Tracker
+.mod .it .s3m .xm 等Tracker格式
+
+VGM View:
+View: Note and Register
+.VGM .VGZ 等VGM格式
+
+MML View:
+View: Real Time MML + Register
+.MML .M .MDX 等MML格式

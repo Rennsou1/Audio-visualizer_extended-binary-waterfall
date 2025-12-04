@@ -138,6 +138,31 @@ public class Generator
     // 波形触发状态（用于零交叉触发稳定）
     private int _lastTriggerOffset = 0;              // 上一帧的触发偏移位置
     
+    // MIDI 钢琴卷帘可视化相关
+    private VisualizerTransition _visualizerTransition = new();  // 可视化模式切换控制器
+    private MidiVisualizer _currentMidiVisualizer = null;        // 当前 MIDI 可视化器
+    private List<NoteVisualData> _visibleNotesBuffer = new();    // 可见音符缓冲（复用避免 GC）
+    
+    // 打击乐器显示相关
+    private List<(int noteNumber, int velocity, double triggerTimeMs)> _activeDrumNotes = new();
+    private Dictionary<int, double> _drumTriggerTimes = new();       // 每个音符的最后触发时间
+    private Dictionary<int, int> _drumVelocities = new();            // 每个音符的最后力度
+    private const double DrumTriggerWindowMs = 200;                  // 触发检测窗口
+    private const double DrumAnimDurationMs = 280;                   // 打击动画时长（放慢）
+    private const double DrumVelocityDecayMs = 400;                  // 力度条衰减时长（更缓和）
+    private int[] _currentDrumNotes = null;                          // 当前 MIDI 使用的打击乐音符
+    
+    // MIDI 模式 UI 切换状态
+    private bool _isMidiMode = false;                            // 当前是否为 MIDI 模式
+    private bool _prevIsMidiMode = false;                        // 上一帧是否为 MIDI 模式
+    private double _midiUITransitionStart = -1;                  // MIDI UI 切换动画开始时间
+    private const double MidiUITransitionDuration = 0.4;         // UI 切换动画时长（秒）
+    private int _currentPolyphony = 0;                           // 当前复音数（实时）
+    private int _currentPlayingNotes = 0;                        // 当前已播放音符数
+    
+    // MIDI 钢琴窗口流速（可通过 GUI 配置）
+    public int PianoRollWindowMs { get; set; } = 4000;
+    
     // 可复用的 Paint 对象（避免每帧创建）
     private readonly SKPaint _fillPaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
     private readonly SKPaint _strokePaint = new() { IsAntialias = true, Style = SKPaintStyle.Stroke };
@@ -147,6 +172,9 @@ public class Generator
     private readonly SKPaint _gradientPaint = new() { IsAntialias = false };
     // 封面画笔（复用，避免每帧创建）
     private readonly SKPaint _coverPaint = new() { IsAntialias = false, FilterQuality = SKFilterQuality.Low };
+    // 钢琴卷帘画笔（复用，避免每帧创建）
+    private readonly SKPaint _pianoRollGridPaint = new() { IsAntialias = false, Style = SKPaintStyle.Stroke };
+    private readonly SKPaint _pianoRollNotePaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
     
     // SIMD alpha 向量缓存（避免每帧创建）
     private static readonly Vector<byte> _simdAlphaMask;
@@ -353,7 +381,7 @@ public class Generator
     // 公共方法：请求停止生成
     public void RequestStop() => _exitRequested = true;
 
-    // 预渲染静态 UI 图层（仅包含灰色标签，数值在动态层绘制）
+    // 预渲染静态 UI 图层（仅包含底部播放器标签，顶部标签动态绘制以支持 MIDI 模式切换）
     private void EnsureStaticUILayerCached(string avSettingsString, string readSpeedString)
     {
         if (_staticUILayerValid && _staticUILayer != null) return;
@@ -369,16 +397,7 @@ public class Generator
         // 颜色定义
         var dimGray = new SKColor(105, 105, 105);
         
-        // A/V SETTINGS 标签
-        canvas.DrawTextAndCache(_typeface, _fontSize16, "A/V SETTINGS", 32, 32, dimGray, HorizontalAlign.Left, VerticalAlign.Top);
-        
-        // ABS. OFFSET 标签
-        canvas.DrawTextAndCache(_typeface, _fontSize16, "ABS. OFFSET", OutputVideoWidth - 32, 32, dimGray, HorizontalAlign.Right, VerticalAlign.Top);
-        
-        // BITRATE 标签
-        canvas.DrawTextAndCache(_typeface, _fontSize16, "BITRATE", OutputVideoWidth - 280, 32, dimGray, HorizontalAlign.Right, VerticalAlign.Top);
-        
-        // 底部播放器固定标签
+        // 底部播放器固定标签（这些标签不随 MIDI 模式变化）
         float s = ResolutionScale;
         float bottomPanelHeight = 100f * s;
         float bottomY = OutputVideoHeight - bottomPanelHeight - 16f * s;
@@ -393,6 +412,111 @@ public class Generator
         
         _staticUILayerValid = true;
         Logger.Info("静态 UI 图层已预渲染");
+    }
+    
+    // 绘制顶部 UI 标签（根据 MIDI/Audio 模式显示不同内容）
+    private void DrawTopUILabels(SubFile currentSubfile, double currentTimeMs)
+    {
+        if (_frameCanvas == null) return;
+        
+        var dimGray = new SKColor(105, 105, 105);
+        float labelY = 32;
+        
+        // 检测是否为 MIDI 模式
+        bool isMidi = currentSubfile?.IsMidi == true && currentSubfile.MidiMetadata != null;
+        _isMidiMode = isMidi;
+        
+        // 左上角：A/V SETTINGS 或 MIDI SETTINGS
+        string leftLabel = isMidi ? "MIDI SETTINGS" : "A/V SETTINGS";
+        DrawText(32, labelY, _fontSize16, leftLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Left);
+        
+        // 中间偏右：BITRATE 或 POLYPHONY
+        float midRightX = OutputVideoWidth - 280;
+        string midLabel = isMidi ? "POLYPHONY" : "BITRATE";
+        DrawText(midRightX, labelY, _fontSize16, midLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Right);
+        
+        // 右上角：ABS. OFFSET 或 NOTE
+        float rightX = OutputVideoWidth - 32;
+        string rightLabel = isMidi ? "NOTE" : "ABS. OFFSET";
+        DrawText(rightX, labelY, _fontSize16, rightLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Right);
+    }
+    
+    // 绘制顶部 UI 数值（根据 MIDI/Audio 模式显示不同内容）
+    private void DrawTopUIValues(SubFile currentSubfile, long currentOffset, string avSettingsString, 
+        string readSpeedString, double currentTimeMs)
+    {
+        if (_frameCanvas == null) return;
+        
+        float valueY = 32 + _fontSize16 + 8;
+        bool isMidi = currentSubfile?.IsMidi == true && currentSubfile.MidiMetadata != null;
+        var meta = currentSubfile?.MidiMetadata;
+        
+        // 左上角数值
+        if (isMidi && meta != null)
+        {
+            // MIDI 模式：显示 TEMPO, TIME SIG, CHANNELS, TYPE + SoundFont
+            double bpm = meta.GetBpmAtTime(currentTimeMs);
+            var (num, den) = meta.GetTimeSignatureAtTime(currentTimeMs);
+            string midiInfo = $"{bpm:F0} BPM, {num}/{den}, {meta.ChannelCount} CH, {meta.MidiType}\n" +
+                              $"SoundFont: {currentSubfile.SoundFontName ?? "Default"}";
+            DrawText(32, valueY, _fontSize24, midiInfo, SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
+        }
+        else
+        {
+            // Audio 模式
+            string currentAvSettings = avSettingsString;
+            if (currentSubfile != null && currentSubfile.AudioSampleRate > 0)
+            {
+                currentAvSettings = BuildAudioFormatString(
+                    currentSubfile.AudioSampleRate,
+                    currentSubfile.AudioChannels,
+                    currentSubfile.AudioBitDepth);
+            }
+            DrawText(32, valueY, _fontSize24, currentAvSettings, SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
+        }
+        
+        // 中间偏右数值
+        float midRightX = OutputVideoWidth - 280;
+        if (isMidi && meta != null && _currentMidiVisualizer != null)
+        {
+            // MIDI 模式：显示当前复音数/最大复音数
+            _currentPolyphony = _currentMidiVisualizer.GetActiveNoteCount(currentTimeMs, _visibleNotesBuffer);
+            string polyString = $"{_currentPolyphony} / {meta.MaxPolyphony}";
+            DrawText(midRightX, valueY, _fontSize24, polyString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+        }
+        else
+        {
+            // Audio 模式：显示比特率
+            string currentBitrateString = readSpeedString;
+            if (currentSubfile != null && currentSubfile.AudioBitrate > 0)
+            {
+                currentBitrateString = $"{currentSubfile.AudioBitrate / 1000} kbps";
+            }
+            DrawText(midRightX, valueY, _fontSize24, currentBitrateString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+        }
+        
+        // 右上角数值
+        float rightX = OutputVideoWidth - 32;
+        if (isMidi && meta != null && _currentMidiVisualizer != null)
+        {
+            // MIDI 模式：显示已播放音符数/总音符数
+            _currentPlayingNotes = _currentMidiVisualizer.GetPlayedNoteCount(currentTimeMs);
+            string noteString = $"{_currentPlayingNotes} / {meta.TotalNoteCount}";
+            DrawText(rightX, valueY, _fontSize24, noteString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+        }
+        else
+        {
+            // Audio 模式：显示偏移
+            long displayOffset = currentOffset;
+            if (currentSubfile != null)
+            {
+                displayOffset = currentOffset - currentSubfile.StartOffset;
+                if (displayOffset < 0) displayOffset = 0;
+            }
+            DrawText(rightX, valueY, _fontSize24,
+                $"{displayOffset / 1048576f:N2} MiB\n0x{displayOffset:X8}", SKColors.White,
+                VerticalAlign.Top, HorizontalAlign.Right);
+        }
     }
     
     // 获取当前帧的 BGRA 字节数组（用于 WPF 显示）
@@ -792,28 +916,48 @@ public class Generator
             else
             {
                 // 单文件模式
-                _audioWaveSource = CodecFactory.Instance.GetCodec(InputFilePath);
-                var wf = _audioWaveSource.WaveFormat;
-
-                // 保存解码器原始参数（用于 FFmpeg 重采样）
-                AudioDecoderSampleRate = wf.SampleRate;
-                AudioDecoderChannelCount = wf.Channels;
-
-                // 根据音频时长计算 WaterfallWindowMs（瀑布视窗时间）
-                long decodedBytes = _audioWaveSource.Length;
-                int bytesPerSecond = wf.BytesPerSecond;
-                if (decodedBytes > 0 && bytesPerSecond > 0 && InputFileStream != null && InputFileStream.Length > 0)
+                bool isMidi = MidiAudioSourceFactory.IsMidiFile(InputFilePath);
+                
+                if (isMidi)
                 {
-                    double durationSeconds = decodedBytes / (double)bytesPerSecond;
-                    if (durationSeconds > 0.1)
-                    {
-                        int calculatedBytesPerSecond = (int)(InputFileStream.Length / durationSeconds);
-                        WaterfallWindowMs = WaterfallFrameLength * 1000 / Math.Max(1, calculatedBytesPerSecond);
-                        Logger.Info($"Single-file WaterfallWindowMs: {WaterfallWindowMs}ms (InputBytesPerSecond={InputBytesPerSecond})");
-                    }
+                    // MIDI 文件使用 FluidSynth 渲染
+                    Logger.Info($"[MIDI] 使用 FluidSynth 渲染: {Path.GetFileName(InputFilePath)}");
+                    _audioSampleSource = MidiAudioSourceFactory.Create(InputFilePath, targetOutputSampleRate, targetOutputChannelCount);
+                    var wf = _audioSampleSource.WaveFormat;
+                    AudioDecoderSampleRate = wf.SampleRate;
+                    AudioDecoderChannelCount = wf.Channels;
+                    
+                    // MIDI 文件：使用渲染后的音频长度计算时长
+                    long audioLength = _audioSampleSource.Length;
+                    double durationSeconds = audioLength / (double)(wf.SampleRate * wf.Channels);
+                    Logger.Info($"[MIDI] 渲染完成: {durationSeconds:F2}s, {audioLength} samples");
                 }
+                else
+                {
+                    // 流式音频文件
+                    _audioWaveSource = CodecFactory.Instance.GetCodec(InputFilePath);
+                    var wf = _audioWaveSource.WaveFormat;
 
-                _audioSampleSource = SafeToSampleSource(_audioWaveSource, InputFilePath);
+                    // 保存解码器原始参数（用于 FFmpeg 重采样）
+                    AudioDecoderSampleRate = wf.SampleRate;
+                    AudioDecoderChannelCount = wf.Channels;
+
+                    // 根据音频时长计算 WaterfallWindowMs（瀑布视窗时间）
+                    long decodedBytes = _audioWaveSource.Length;
+                    int bytesPerSecond = wf.BytesPerSecond;
+                    if (decodedBytes > 0 && bytesPerSecond > 0 && InputFileStream != null && InputFileStream.Length > 0)
+                    {
+                        double durationSeconds = decodedBytes / (double)bytesPerSecond;
+                        if (durationSeconds > 0.1)
+                        {
+                            int calculatedBytesPerSecond = (int)(InputFileStream.Length / durationSeconds);
+                            WaterfallWindowMs = WaterfallFrameLength * 1000 / Math.Max(1, calculatedBytesPerSecond);
+                            Logger.Info($"Single-file WaterfallWindowMs: {WaterfallWindowMs}ms (InputBytesPerSecond={InputBytesPerSecond})");
+                        }
+                    }
+
+                    _audioSampleSource = SafeToSampleSource(_audioWaveSource, InputFilePath);
+                }
             }
             
             // FFmpeg 导出器会将音频重采样
@@ -1106,8 +1250,9 @@ public class Generator
     // 优化：同时计算波形 RMS，避免多次打开文件
     private void ParseSubfiles()
     {
-        // 如果有多文件队列（超过1个文件），为每个文件创建子文件条目
-        if (InputFilePaths != null && InputFilePaths.Count > 1)
+        // 音频文件队列使用基于音频时长的虚拟偏移
+        // 这对 MIDI 文件尤其重要，因为 MIDI 文件很小但音频时长可能很长
+        if (InputFilePaths != null && InputFilePaths.Count >= 1)
         {
             Logger.Info($"Building subfiles from audio queue ({InputFilePaths.Count} files)…");
             
@@ -1139,11 +1284,26 @@ public class Generator
                 try
                 {
                     actualFileSize = new System.IO.FileInfo(filePath).Length;
-                    
-                    // 使用 FfmpegAudioDecoder 获取准确的音频时长和格式信息
-                    // 同时计算波形 RMS（一次打开完成两项工作）
-                    using var decoder = new FfmpegAudioDecoder(filePath);
-                    var wf = decoder.WaveFormat;
+                    // MIDI 文件用 MidiMetadata 获取准确时长
+                    bool isMidiFile = MidiAudioSourceFactory.IsMidiFile(filePath);
+                    if (isMidiFile)
+                    {
+                        var tempMeta = MidiMetadata.FromMidiFile(filePath);
+                        durationSeconds = tempMeta.TotalDurationMs / 1000.0;
+                        if (durationSeconds < 0.1) durationSeconds = 60.0;
+                        fileLength = (long)(durationSeconds * InputBytesPerSecond);
+                        audioSampleRate = AudioOutputSampleRate;
+                        audioChannels = AudioOutputChannelCount;
+                        audioBitDepth = 32;
+                        Logger.Debug($"[ParseSubfiles] MIDI {System.IO.Path.GetFileName(filePath)}: duration={durationSeconds:F2}s");
+                    }
+                    else
+                    {
+                        //非 MIDI操作
+                        // 使用 FfmpegAudioDecoder 获取准确的音频时长和格式信息
+                        // 同时计算波形 RMS
+                        using var decoder = new FfmpegAudioDecoder(filePath);
+                        var wf = decoder.WaveFormat;
                     
                     // 获取格式信息
                     long totalSamplesInFile = decoder.Length;
@@ -1154,7 +1314,7 @@ public class Generator
                     durationSeconds = (totalSamplesInFile / channelCount) / (double)audioSampleRate;
                     fileLength = (long)(durationSeconds * InputBytesPerSecond);
                     
-                    // 计算波形 RMS（在同一次解码中完成）
+                    // 计算波形 RMS
                     if (totalSamplesInFile > 0)
                     {
                         long samplesPerSegment = totalSamplesInFile / rmsCount;
@@ -1207,6 +1367,7 @@ public class Generator
                     }
                     
                     Logger.Debug($"[ParseSubfiles] {System.IO.Path.GetFileName(filePath)}: duration={durationSeconds:F2}s, {audioSampleRate}Hz {audioChannels}ch, peak={audioPeak:F4}");
+                } // 结束非 MIDI 音频处理块
                 }
                 catch (Exception ex)
                 {
@@ -1233,6 +1394,24 @@ public class Generator
                 // 设置波形数据（已在上面计算）
                 sf.WaveformPeaks = waveformPeaks;
                 sf.AudioPeak = audioPeak;
+                
+                // 解析 MIDI 元数据
+                if (MidiAudioSourceFactory.IsMidiFile(filePath))
+                {
+                    sf.IsMidi = true;
+                    sf.MidiMetadata = MidiMetadata.FromMidiFile(filePath);
+                    // 获取 SoundFont 名称
+                    string sfPath = MidiAudioSourceFactory.FindSoundFont();
+                    sf.SoundFontName = !string.IsNullOrEmpty(sfPath) 
+                        ? System.IO.Path.GetFileNameWithoutExtension(sfPath) 
+                        : "Default";
+                    Logger.Debug($"[MIDI] {System.IO.Path.GetFileName(filePath)}: " +
+                        $"BPM={sf.MidiMetadata.InitialBpm:F0}, " +
+                        $"TimeSign={sf.MidiMetadata.TimeSignatureString}, " +
+                        $"Channels={sf.MidiMetadata.ChannelCount}, " +
+                        $"Type={sf.MidiMetadata.MidiType}");
+                }
+                
                 _subfiles.Add(sf);
                 
                 currentOffset += fileLength;
@@ -1556,8 +1735,22 @@ public class Generator
             
             try
             {
-                // 使用 FfmpegAudioDecoder 解码音频文件获取 PCM 采样
-                using var sampleSource = new FfmpegAudioDecoder(sf.Path);
+                // 根据文件类型选择解码器：MIDI 使用 FluidSynth，其他使用 FFmpeg
+                ISampleSource sampleSource;
+                bool isMidi = MidiAudioSourceFactory.IsMidiFile(sf.Path);
+                
+                if (isMidi)
+                {
+                    // MIDI 文件使用 FluidSynth 渲染
+                    sampleSource = MidiAudioSourceFactory.Create(sf.Path, 48000, 2);
+                }
+                else
+                {
+                    // 流式音频使用 FfmpegAudioDecoder
+                    sampleSource = new FfmpegAudioDecoder(sf.Path);
+                }
+                
+                using var _ = sampleSource;
                 
                 // 获取音频总采样数
                 long totalSamples = sampleSource.Length;
@@ -1806,11 +1999,17 @@ public class Generator
     private void GenerateMainVideo()
     {
         Logger.Info("Generating binary waterfall…");
+        
+        // 根据第一个文件类型设置初始可视化模式（避免开始时的模式切换动画）
+        string firstFilePath = _subfiles.FirstOrDefault()?.Path ?? InputFilePath;
+        var initialMode = VisualizerTransition.GetModeForFile(firstFilePath);
+        _visualizerTransition.SetInitialMode(initialMode);
+        Logger.Info($"Initial visualizer mode: {initialMode} (based on first file: {Path.GetFileName(firstFilePath)})");
 
         // A/V SETTINGS 默认值（使用解码器格式，如果有多文件则会在循环内根据当前子文件动态更新）
         string avSettingsString = BuildAudioFormatString(AudioDecoderSampleRate, AudioDecoderChannelCount, 32);
         string readSpeedString = $"{InputBytesPerSecond / 1024} KiB/s";
-
+        
         float subfileWindowIndex = 0f;
         long currentOffset = 0;
         int playHeadRelPos = 0;
@@ -2094,9 +2293,36 @@ public class Generator
                 
                 // 更新当前歌曲的峰值（用于波形和频谱归一化）
                 _currentAudioPeak = currentSubfileValue?.AudioPeak ?? 1.0f;
+                
+                // MIDI 可视化模式检测
+                string currentFilePath = currentSubfileValue?.Path;
+                VisualizerMode requiredMode = VisualizerTransition.GetModeForFile(currentFilePath);
+                _visualizerTransition.SwitchTo(requiredMode);
+                
+                // 如果是 MIDI 文件，确保可视化器已加载（切换到新 MIDI 文件时重新加载）
+                if (requiredMode == VisualizerMode.PianoRoll && !string.IsNullOrEmpty(currentFilePath))
+                {
+                    // 检查是否需要加载新的 MIDI 可视化器（文件路径不同时重新加载）
+                    if (_currentMidiVisualizer == null || _currentMidiVisualizer.FilePath != currentFilePath)
+                    {
+                        _currentMidiVisualizer = MidiVisualizerCache.GetOrCreate(currentFilePath);
+                        // 从 MidiMetadata 获取打击乐通道列表
+                        if (currentSubfileValue?.MidiMetadata?.DrumChannels != null)
+                        {
+                            _currentMidiVisualizer.SetDrumChannels(currentSubfileValue.MidiMetadata.DrumChannels);
+                        }
+                        // 清除打击乐缓存（新文件需要重新收集）
+                        _currentDrumNotes = null;
+                        _drumTriggerTimes.Clear();
+                        _drumVelocities.Clear();
+                    }
+                }
             }
+            
+            // 更新可视化切换动画
+            _visualizerTransition.Update(1f / OutputFps);
 
-            // 5. 实际绘制一帧：左侧瀑布 + 右侧上部列表 + 右下音频可视化 + 顶/底渐变 + 文字信息
+            // 5. 实际绘制一帧：左侧瀑布/钢琴卷帘 + 右侧上部列表 + 右下音频可视化 + 顶/底渐变 + 文字信息
             EnsureFrameCanvas();
             _frameCanvas.Clear(new SKColor(16, 16, 16));
 
@@ -2170,11 +2396,58 @@ public class Generator
                 subfileY += subfileRowH;
             }
 
-            if (_viewportFramebuf != null)
+            // 根据可视化模式绘制瀑布或钢琴卷帘（带过渡动画）
+            var (waterfallSlideOffset, pianoRollSlideOffset) = _visualizerTransition.GetOffsets(WaterfallScaledWidth);
+            var visualizerRegion = new SKRect(_videoFrameX1, _videoFrameY1, 
+                _videoFrameX1 + WaterfallScaledWidth, _videoFrameY1 + WaterfallScaledHeight);
+            
+            // 绘制瀑布（如果可见）
+            if (waterfallSlideOffset > -WaterfallScaledWidth && _viewportFramebuf != null)
             {
-                _frameCanvas.DrawBitmap(_viewportFramebuf, _videoFrameX1, _videoFrameY1, _imagePaint);
+                _frameCanvas.Save();
+                _frameCanvas.ClipRect(visualizerRegion);
+                _frameCanvas.DrawBitmap(_viewportFramebuf, _videoFrameX1 + waterfallSlideOffset, _videoFrameY1, _imagePaint);
+                _frameCanvas.Restore();
             }
-            DrawText(32, (OutputVideoHeight / 2f) + (playHeadRelPos * (WaterfallScaledHeight / (float)WaterfallHeight)),
+            
+            // 绘制钢琴卷帘（如果可见）
+            if (pianoRollSlideOffset < WaterfallScaledWidth && _currentMidiVisualizer != null)
+            {
+                _frameCanvas.Save();
+                _frameCanvas.ClipRect(visualizerRegion);
+                _frameCanvas.Translate(pianoRollSlideOffset, 0);
+                
+                // 计算当前播放时间（毫秒）
+                double currentTimeMs = (double)frameNumber / OutputFps * 1000.0;
+                if (currentSubfileValue != null && currentSubfileValue.AudioStartTime > 0)
+                {
+                    currentTimeMs = ((double)frameNumber / OutputFps - currentSubfileValue.AudioStartTime) * 1000.0;
+                }
+                
+                DrawPianoRoll(visualizerRegion, currentTimeMs, currentSubfileValue);
+                _frameCanvas.Restore();
+            }
+            
+            // 绘制模式切换标签
+            var (modeLabel, labelAlpha) = _visualizerTransition.GetLabelState();
+            if (labelAlpha > 0.01f && !string.IsNullOrEmpty(modeLabel))
+            {
+                byte alpha = (byte)(labelAlpha * 255);
+                DrawText(_videoFrameX1 + WaterfallScaledWidth / 2f, _videoFrameY1 + 60, 
+                    _fontSize32, modeLabel, new SKColor(255, 255, 255, alpha), 
+                    VerticalAlign.Center, HorizontalAlign.Center);
+            }
+            
+            // 统一播放头指示器 ▶
+            // 计算瀑布模式下的播放头 Y 位置
+            float waterfallPlayheadY = (OutputVideoHeight / 2f) + (playHeadRelPos * (WaterfallScaledHeight / (float)WaterfallHeight));
+            // 钢琴窗模式下的播放头 Y 位置（固定居中）
+            float pianoRollPlayheadY = _videoFrameY1 + WaterfallScaledHeight / 2f;
+            // 更新播放头位置到动画控制器
+            _visualizerTransition.SetWaterfallPlayheadY(waterfallPlayheadY);
+            _visualizerTransition.SetPianoRollPlayheadY(pianoRollPlayheadY);
+            // 绘制播放头（位置由动画控制器管理）
+            DrawText(32, _visualizerTransition.GetPlayheadY(),
                 _fontSize32, "▶", SKColors.White, VerticalAlign.Center);
 
             // 音频可视化区域（在歌曲列表下方，限制在遮罩区域内）
@@ -2233,43 +2506,19 @@ public class Generator
                 _frameCanvas.DrawBitmap(_staticUILayer, 0, 0, _imagePaint);
             }
 
-            // 动态绘制：数值位置在标签下方（标签高度 _fontSize16 + 间距 8）
-            float valueY = 32 + _fontSize16 + 8;
-            
-            // A/V SETTINGS 值（左上角）：使用当前子文件的源格式（如果有）
-            string currentAvSettings = avSettingsString;
-            if (currentSubfileValue != null && currentSubfileValue.AudioSampleRate > 0)
+            // 计算当前播放时间（用于 MIDI 模式 UI）
+            double topUITimeMs = (double)frameNumber / OutputFps * 1000.0;
+            if (currentSubfileValue != null && currentSubfileValue.AudioStartTime > 0)
             {
-                currentAvSettings = BuildAudioFormatString(
-                    currentSubfileValue.AudioSampleRate,
-                    currentSubfileValue.AudioChannels,
-                    currentSubfileValue.AudioBitDepth);
+                topUITimeMs = ((double)frameNumber / OutputFps - currentSubfileValue.AudioStartTime) * 1000.0;
             }
-            DrawText(32, valueY, _fontSize24,
-                currentAvSettings, SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
             
-            // ABS. OFFSET 值（右上角）：显示相对于当前文件的偏移
-            long displayOffset = currentOffset;
-            if (currentSubfileValue != null)
-            {
-                // 多文件模式：显示相对于当前文件的偏移
-                displayOffset = currentOffset - currentSubfileValue.StartOffset;
-                if (displayOffset < 0) displayOffset = 0;
-            }
-            DrawText(OutputVideoWidth - 32, valueY, _fontSize24,
-                $"{displayOffset / 1048576f:N2} MiB\n0x{displayOffset:X8}", SKColors.White,
-                VerticalAlign.Top, HorizontalAlign.Right);
-            
-            // BITRATE 值：显示当前歌曲的源文件比特率
-            string currentBitrateString = readSpeedString;
-            if (currentSubfileValue != null && currentSubfileValue.AudioBitrate > 0)
-            {
-                currentBitrateString = $"{currentSubfileValue.AudioBitrate / 1000} kbps";
-            }
-            DrawText(OutputVideoWidth - 280, valueY, _fontSize24,
-                currentBitrateString, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+            // 绘制顶部 UI（根据 MIDI/Audio 模式自动切换，带滑动动画）
+            DrawTopUILabels(currentSubfileValue, topUITimeMs);
+            DrawTopUIValues(currentSubfileValue, currentOffset, avSettingsString, readSpeedString, topUITimeMs);
 
             // Author（居中显示）
+            float valueY = 32 + _fontSize16 + 8;
             if (!string.IsNullOrEmpty(Author))
             {
                 DrawText(OutputVideoWidth / 2f, valueY + _fontSize24 / 2, _fontSize24,
@@ -2369,7 +2618,15 @@ public class Generator
         
         if (subfile != null)
         {
-            trackName = !string.IsNullOrWhiteSpace(subfile.TrackTitle) ? subfile.TrackTitle : subfile.FileName;
+            // MIDI 文件优先使用元数据中的标题，否则使用 TrackTitle 或文件名
+            if (subfile.IsMidi && subfile.MidiMetadata?.Title != null)
+            {
+                trackName = subfile.MidiMetadata.Title;
+            }
+            else
+            {
+                trackName = !string.IsNullOrWhiteSpace(subfile.TrackTitle) ? subfile.TrackTitle : subfile.FileName;
+            }
             composerName = subfile.ComposerName ?? subfile.ArtistName ?? "";
             genreText = subfile.Genre ?? "";
             coverImage = subfile.Icon;
@@ -3495,10 +3752,10 @@ public class Generator
             line += prefix + "- ";
         }
 
-        // 曲名：优先 TrackTitle，没有则退回文件名
+        // 曲名：优先 TrackTitle，没有则使用不带扩展名的文件名
         string title = !string.IsNullOrWhiteSpace(subfile.TrackTitle)
             ? subfile.TrackTitle
-            : subfile.FileName;
+            : System.IO.Path.GetFileNameWithoutExtension(subfile.FileName);
         line += title;
 
         // 作曲家：优先使用 Composer，其次 Artist
@@ -3513,8 +3770,299 @@ public class Generator
         {
             line += " [" + subfile.Genre + "]";
         }
+        
+        // 始终在最后添加文件后缀名标识
+        if (!string.IsNullOrEmpty(subfile.FileName))
+        {
+            string ext = System.IO.Path.GetExtension(subfile.FileName);
+            if (!string.IsNullOrEmpty(ext))
+            {
+                line += $" ({ext.TrimStart('.').ToUpperInvariant()})";
+            }
+        }
 
         return line;
+    }
+    
+    // 绘制钢琴卷帘可视化
+    private void DrawPianoRoll(SKRect region, double currentTimeMs, SubFile currentSubfile = null)
+    {
+        if (_currentMidiVisualizer == null) return;
+        
+        // 时间窗口
+        double windowMs = PianoRollWindowMs;
+        
+        // 获取音符范围
+        int minNote = _currentMidiVisualizer.MinNoteNumber;
+        int maxNote = _currentMidiVisualizer.MaxNoteNumber;
+        int noteRange = maxNote - minNote + 1;
+        if (noteRange <= 0) return;
+        
+        // 垂直布局：X 轴是音高，Y 轴是时间
+        float noteWidth = region.Width / noteRange;
+        float msPerPixel = (float)(windowMs / region.Height);
+        
+        // 播放头始终固定在中间
+        float playheadY = region.MidY;
+        
+        // 根据 MIDI 元数据计算小节时长
+        double msPerBar = 2000.0;  // 默认值：120 BPM, 4/4 拍
+        if (currentSubfile?.MidiMetadata != null)
+        {
+            // 使用 MIDI 文件的实际 Tempo 和拍号
+            msPerBar = currentSubfile.MidiMetadata.GetBarDurationMs(currentTimeMs);
+        }
+        _pianoRollGridPaint.Color = new SKColor(60, 60, 60);
+        _pianoRollGridPaint.StrokeWidth = 1;
+        
+        double halfWindowMs = windowMs / 2.0;
+        double visibleStartMs = currentTimeMs - halfWindowMs;
+        double visibleEndMs = currentTimeMs + halfWindowMs;
+        
+        double firstBarMs = Math.Floor(visibleStartMs / msPerBar) * msPerBar;
+        for (double barMs = firstBarMs; barMs <= visibleEndMs; barMs += msPerBar)
+        {
+            float y = playheadY - (float)(barMs - currentTimeMs) / msPerPixel;
+            if (y >= region.Top && y <= region.Bottom)
+            {
+                _frameCanvas.DrawLine(region.Left, y, region.Right, y, _pianoRollGridPaint);
+            }
+        }
+        
+        // 获取可见音符
+        _currentMidiVisualizer.GetVisibleNotes(currentTimeMs, windowMs, _visibleNotesBuffer);
+        
+        // 按通道分组批量绘制音符
+        using var notePath = new SKPath();
+        using var activePath = new SKPath();
+        
+        // 预计算所有音符的矩形
+        int lastChannel = -1;
+        SKColor lastColor = SKColors.Transparent;
+        float halfWidth = noteWidth * 0.4f;
+        
+        foreach (var note in _visibleNotesBuffer)
+        {
+            // 跳过打击乐通道（在底部单独显示）
+            if (_currentMidiVisualizer.IsDrumChannel(note.Channel)) continue;
+            
+            float noteX = region.Left + (note.NoteNumber - minNote + 0.5f) * noteWidth;
+            
+            // Y 坐标
+            float noteStartY = playheadY - (float)(note.StartMs - currentTimeMs) / msPerPixel;
+            float noteEndY = playheadY - (float)(note.EndMs - currentTimeMs) / msPerPixel;
+            if (noteStartY > noteEndY) (noteStartY, noteEndY) = (noteEndY, noteStartY);
+            
+            float noteHeight = Math.Max(3, noteEndY - noteStartY);
+            var noteRect = new SKRect(noteX - halfWidth, noteStartY, noteX + halfWidth, noteStartY + noteHeight);
+            
+            // 颜色变化时，先绘制之前的批次
+            var (r, g, b) = MidiVisualizer.GetChannelColor(note.Channel);
+            float velocityScale = 0.5f + (note.Velocity / 127f) * 0.5f;
+            byte alpha = (byte)(220 * velocityScale);
+            var noteColor = new SKColor((byte)(r * velocityScale), (byte)(g * velocityScale), (byte)(b * velocityScale), alpha);
+            
+            if (note.Channel != lastChannel && notePath.PointCount > 0)
+            {
+                _pianoRollNotePaint.Color = lastColor;
+                _frameCanvas.DrawPath(notePath, _pianoRollNotePaint);
+                notePath.Reset();
+            }
+            
+            notePath.AddRect(noteRect);
+            lastChannel = note.Channel;
+            lastColor = noteColor;
+            
+            // 正在播放的音符
+            if (note.StartMs <= currentTimeMs && note.EndMs >= currentTimeMs)
+            {
+                activePath.AddRect(noteRect);
+            }
+        }
+        
+        // 绘制最后一批音符
+        if (notePath.PointCount > 0)
+        {
+            _pianoRollNotePaint.Color = lastColor;
+            _frameCanvas.DrawPath(notePath, _pianoRollNotePaint);
+        }
+        
+        // 绘制活动音符高亮
+        if (activePath.PointCount > 0)
+        {
+            _strokePaint.Color = SKColors.White;
+            _strokePaint.StrokeWidth = 1.5f;
+            _frameCanvas.DrawPath(activePath, _strokePaint);
+        }
+        
+        // 播放指示器 "▶" 已移至主绘制循环，统一由 _visualizerTransition 管理位置
+        
+        // 绘制底部打击乐器显示区域（在遮罩之前）
+        DrawDrumIndicators(region, currentTimeMs);
+        
+        // 渐变遮罩
+        float fadeHeight = region.Height * 0.15f;
+        
+        using (var topShader = SKShader.CreateLinearGradient(
+            new SKPoint(region.Left, region.Top),
+            new SKPoint(region.Left, region.Top + fadeHeight),
+            new[] { new SKColor(16, 16, 16, 255), new SKColor(16, 16, 16, 0) },
+            SKShaderTileMode.Clamp))
+        {
+            _gradientPaint.Shader = topShader;
+            _frameCanvas.DrawRect(new SKRect(region.Left, region.Top, region.Right, region.Top + fadeHeight), _gradientPaint);
+        }
+        
+        using (var bottomShader = SKShader.CreateLinearGradient(
+            new SKPoint(region.Left, region.Bottom - fadeHeight),
+            new SKPoint(region.Left, region.Bottom),
+            new[] { new SKColor(16, 16, 16, 0), new SKColor(16, 16, 16, 255) },
+            SKShaderTileMode.Clamp))
+        {
+            _gradientPaint.Shader = bottomShader;
+            _frameCanvas.DrawRect(new SKRect(region.Left, region.Bottom - fadeHeight, region.Right, region.Bottom), _gradientPaint);
+        }
+        
+        _gradientPaint.Shader = null;
+    }
+    
+    // 绘制打击乐器指示器（底部居中，支持多行）
+    private void DrawDrumIndicators(SKRect region, double currentTimeMs)
+    {
+        if (_currentMidiVisualizer == null) return;
+        
+        // 获取当前 MIDI 使用的打击乐音符（缓存）
+        var usedDrums = _currentMidiVisualizer.GetUsedDrumNotes();
+        if (usedDrums.Count == 0) return;
+        
+        // 更新打击乐音符列表（按音符编号排序）
+        if (_currentDrumNotes == null || _currentDrumNotes.Length != usedDrums.Count)
+        {
+            _currentDrumNotes = usedDrums.OrderBy(n => n).ToArray();
+        }
+        
+        // 更新打击乐触发状态
+        _currentMidiVisualizer.GetActiveDrumNotes(currentTimeMs, DrumTriggerWindowMs, _activeDrumNotes);
+        foreach (var (noteNumber, velocity, triggerTime) in _activeDrumNotes)
+        {
+            if (!_drumTriggerTimes.TryGetValue(noteNumber, out double lastTime) || triggerTime > lastTime)
+            {
+                _drumTriggerTimes[noteNumber] = triggerTime;
+                _drumVelocities[noteNumber] = velocity;
+            }
+        }
+        
+        // 打击乐器显示区域参数
+        float scale = OutputVideoWidth / 1920f;
+        float drumSize = 28 * scale;
+        float drumSpacing = 4 * scale;
+        float velocityBarWidth = 3 * scale;
+        float rowSpacing = 6 * scale;
+        
+        // 计算每行最多能放多少个
+        float itemWidth = drumSize + drumSpacing + velocityBarWidth;
+        float maxRowWidth = region.Width * 0.9f;
+        int maxPerRow = Math.Max(1, (int)((maxRowWidth + drumSpacing) / itemWidth));
+        
+        // 计算行数
+        int drumCount = _currentDrumNotes.Length;
+        int rowCount = (drumCount + maxPerRow - 1) / maxPerRow;
+        rowCount = Math.Min(rowCount, 2);  // 最多两行
+        
+        // 计算底部位置（在淡出遮罩上方）
+        float totalHeight = rowCount * drumSize + (rowCount - 1) * rowSpacing;
+        float bottomMargin = region.Height * 0.17f;
+        float baseY = region.Bottom - bottomMargin - totalHeight / 2f;
+        
+        int drumIndex = 0;
+        for (int row = 0; row < rowCount && drumIndex < drumCount; row++)
+        {
+            // 计算这一行有多少个
+            int itemsInRow = Math.Min(maxPerRow, drumCount - drumIndex);
+            float rowWidth = itemsInRow * itemWidth - drumSpacing;
+            float startX = region.MidX - rowWidth / 2f;
+            float drumY = baseY + row * (drumSize + rowSpacing);
+            
+            for (int i = 0; i < itemsInRow && drumIndex < drumCount; i++, drumIndex++)
+            {
+                int noteNumber = _currentDrumNotes[drumIndex];
+                float currentX = startX + i * itemWidth;
+                
+                // 计算动画进度（打击效果）
+                float hitProgress = 0f;
+                float velocityProgress = 0f;
+                int velocity = 64;
+                
+                if (_drumTriggerTimes.TryGetValue(noteNumber, out double triggerTime))
+                {
+                    double elapsed = currentTimeMs - triggerTime;
+                    
+                    // 打击动画（较快衰减）
+                    if (elapsed >= 0 && elapsed < DrumAnimDurationMs)
+                    {
+                        hitProgress = 1f - (float)(elapsed / DrumAnimDurationMs);
+                        hitProgress = hitProgress * hitProgress;  // 缓动
+                    }
+                    
+                    // 力度条动画（更缓慢衰减）
+                    if (elapsed >= 0 && elapsed < DrumVelocityDecayMs)
+                    {
+                        velocityProgress = 1f - (float)(elapsed / DrumVelocityDecayMs);
+                        velocityProgress = MathF.Sqrt(velocityProgress);  // 缓慢衰减
+                    }
+                    
+                    if (_drumVelocities.TryGetValue(noteNumber, out int v)) velocity = v;
+                }
+                
+                // 打击感缩放效果
+                float hitScale = 1f + hitProgress * 0.2f;
+                float scaledSize = drumSize * hitScale;
+                float offsetX = (scaledSize - drumSize) / 2f;
+                
+                // 方框位置
+                var boxRect = new SKRect(
+                    currentX - offsetX,
+                    drumY - offsetX,
+                    currentX + scaledSize - offsetX,
+                    drumY + scaledSize - offsetX
+                );
+                
+                // 默认白色空心框，触发时变成白色实心
+                if (hitProgress > 0.1f)
+                {
+                    // 触发时：实心白色方块
+                    byte fillAlpha = (byte)(255 * hitProgress);
+                    _fillPaint.Color = new SKColor(255, 255, 255, fillAlpha);
+                    _frameCanvas.DrawRect(boxRect, _fillPaint);
+                }
+                
+                // 白色边框（始终显示）
+                _strokePaint.Color = SKColors.White;
+                _strokePaint.StrokeWidth = 1.2f * scale;
+                _frameCanvas.DrawRect(boxRect, _strokePaint);
+                
+                // 打击乐器简称（在方框内）
+                string label = MidiVisualizer.GetDrumShortName(noteNumber);
+                float fontSize = drumSize * 0.38f;
+                // 触发时文字变黑，否则白色
+                var textColor = hitProgress > 0.3f ? SKColors.Black : SKColors.White;
+                DrawText(currentX + drumSize / 2f, drumY + drumSize / 2f, fontSize, label,
+                    textColor, VerticalAlign.Center, HorizontalAlign.Center);
+                
+                // 力度指示条（右侧，更缓和的衰减）
+                float barX = currentX + drumSize + 1.5f * scale;
+                float velocityRatio = velocity / 127f;
+                float barHeight = drumSize * velocityRatio * velocityProgress;
+                float barY = drumY + drumSize - barHeight;
+                
+                if (barHeight > 0.5f)
+                {
+                    byte barAlpha = (byte)(200 * velocityProgress);
+                    _fillPaint.Color = new SKColor(255, 255, 255, barAlpha);
+                    _frameCanvas.DrawRect(new SKRect(barX, barY, barX + velocityBarWidth, drumY + drumSize), _fillPaint);
+                }
+            }
+        }
     }
     #endregion
 }

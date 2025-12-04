@@ -37,6 +37,8 @@
 		<PackageReference Include="CSCore.Ogg" Version="1.0.0.1" />
 		<!-- Used for reading audio metadata (album/artist/genre 等) -->
 		<PackageReference Include="TagLibSharp" Version="2.3.0" />
+		<!-- Used for MIDI file parsing and playback -->
+		<PackageReference Include="Melanchall.DryWetMidi" Version="7.2.0" />
 		<!-- Used for GPU detection on Windows -->
 		<PackageReference Include="System.Management" Version="10.0.0-rc.1.25451.107" />
 		<!-- libyuv 色彩空间转换 -->

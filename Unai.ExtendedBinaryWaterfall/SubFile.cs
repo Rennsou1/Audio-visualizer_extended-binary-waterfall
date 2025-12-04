@@ -37,6 +37,11 @@ public class SubFile(string path, long startOffset, long length)
 	public int AudioChannels { get; set; } = 0;               // 音频声道数
 	public int AudioBitDepth { get; set; } = 0;               // 音频位深 (bits)
 	public int AudioBitrate { get; set; } = 0;                // 音频比特率 (bps)
+	
+	// MIDI 相关属性
+	public bool IsMidi { get; set; } = false;                 // 是否为 MIDI 文件
+	public MidiMetadata MidiMetadata { get; set; } = null;    // MIDI 元数据
+	public string SoundFontName { get; set; } = null;         // 使用的 SoundFont 名称
 
 	public string FileName => System.IO.Path.GetFileName(Path);
 	public string FileDirectory => System.IO.Path.GetDirectoryName(Path);

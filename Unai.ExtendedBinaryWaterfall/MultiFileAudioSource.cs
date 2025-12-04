@@ -2,19 +2,21 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using CSCore;
+using Melanchall.DryWetMidi.Interaction;
 
 namespace Unai.ExtendedBinaryWaterfall;
 
 // 多文件音频源：支持顺序读取多个音频文件，自动切换到下一个文件
-// 使用 FFmpeg 解码器，支持任何 FFmpeg 支持的音频格式
+// 支持 FFmpeg 解码器和 MIDI (FluidSynth) 渲染
 // 所有文件会被重采样到统一的目标采样率和声道数
 public class MultiFileAudioSource : ISampleSource
 {
     private readonly List<string> _filePaths;
     private readonly List<long> _fileLengths;      // 每个文件的采样数长度（基于目标采样率）
     private readonly List<long> _fileOffsets;      // 每个文件的起始偏移量
+    private readonly List<bool> _isMidiFile;       // 每个文件是否为 MIDI 格式
     private int _currentFileIndex = 0;
-    private FfmpegAudioDecoder _currentDecoder;    // 使用 FFmpeg 解码器
+    private ISampleSource _currentSource;          // 当前音频源（FFmpeg 或 MIDI）
     private WaveFormat _waveFormat;
     private long _totalLength;
     private long _position;
@@ -38,31 +40,46 @@ public class MultiFileAudioSource : ISampleSource
         _filePaths = filePaths ?? throw new ArgumentNullException(nameof(filePaths));
         _fileLengths = new List<long>();
         _fileOffsets = new List<long>();
+        _isMidiFile = new List<bool>();
         
         if (_filePaths.Count == 0)
             throw new ArgumentException("至少需要一个音频文件", nameof(filePaths));
 
-        // 先打开第一个文件获取默认格式（不指定目标参数）
-        using (var firstDecoder = new FfmpegAudioDecoder(_filePaths[0]))
+        // 确定目标格式：如果未指定，使用第一个非 MIDI 文件的格式，或默认值
+        if (targetSampleRate <= 0 || targetChannels <= 0)
         {
-            // 如果未指定目标采样率/声道数，使用第一个文件的格式
-            _targetSampleRate = targetSampleRate > 0 ? targetSampleRate : firstDecoder.WaveFormat.SampleRate;
-            _targetChannels = targetChannels > 0 ? targetChannels : firstDecoder.WaveFormat.Channels;
+            // 查找第一个非 MIDI 文件来获取格式
+            foreach (var path in _filePaths)
+            {
+                if (!MidiAudioSourceFactory.IsMidiFile(path))
+                {
+                    using var firstDecoder = new FfmpegAudioDecoder(path);
+                    targetSampleRate = targetSampleRate > 0 ? targetSampleRate : firstDecoder.WaveFormat.SampleRate;
+                    targetChannels = targetChannels > 0 ? targetChannels : firstDecoder.WaveFormat.Channels;
+                    break;
+                }
+            }
+            // 如果全是 MIDI 文件，使用默认值
+            if (targetSampleRate <= 0) targetSampleRate = 48000;
+            if (targetChannels <= 0) targetChannels = 2;
         }
         
-        // 创建统一的 WaveFormat（所有文件都会重采样到这个格式）
+        _targetSampleRate = targetSampleRate;
+        _targetChannels = targetChannels;
+        
+        // 创建统一的 WaveFormat（所有文件都会重采样/渲染到这个格式）
         _waveFormat = new WaveFormat(_targetSampleRate, 32, _targetChannels, AudioEncoding.IeeeFloat);
         
-        Logger.Info($"[MultiFileAudioSource] 目标格式: {_targetSampleRate}Hz {_targetChannels}ch (用户导出设置)");
+        Logger.Info($"[MultiFileAudioSource] 目标格式: {_targetSampleRate}Hz {_targetChannels}ch");
 
         // 计算所有文件的总长度（基于目标采样率）
         CalculateTotalLength();
         
-        // 打开第一个文件（使用目标参数）
+        // 打开第一个文件
         OpenFile(0);
-        if (_currentDecoder.CanSeek)
+        if (_currentSource != null && _currentSource.CanSeek)
         {
-            _currentDecoder.Position = 0;
+            _currentSource.Position = 0;
         }
     }
 
@@ -72,16 +89,34 @@ public class MultiFileAudioSource : ISampleSource
         _totalLength = 0;
         _fileLengths.Clear();
         _fileOffsets.Clear();
+        _isMidiFile.Clear();
 
         foreach (var filePath in _filePaths)
         {
             if (!File.Exists(filePath)) continue;
 
+            bool isMidi = MidiAudioSourceFactory.IsMidiFile(filePath);
+            _isMidiFile.Add(isMidi);
+
             try
             {
-                // 使用 FFmpeg 解码器获取文件信息（传入目标参数以获得正确的重采样后长度）
-                using var decoder = new FfmpegAudioDecoder(filePath, _targetSampleRate, _targetChannels);
-                long fileLength = decoder.Length;
+                long fileLength;
+                if (isMidi)
+                {
+                    // MIDI 文件：直接使用 DryWetMidi 计算时长
+                    var midiFile = Melanchall.DryWetMidi.Core.MidiFile.Read(filePath);
+                    var duration = midiFile.GetDuration<Melanchall.DryWetMidi.Interaction.MetricTimeSpan>();
+                    double durationSeconds = duration.TotalMicroseconds / 1_000_000.0;
+                    // 计算采样数：时长 * 采样率 * 声道数
+                    fileLength = (long)(durationSeconds * _targetSampleRate * _targetChannels);
+                    Logger.Debug($"[MultiFileAudioSource] MIDI 文件 {Path.GetFileName(filePath)}: {durationSeconds:F2}s, {fileLength} 采样");
+                }
+                else
+                {
+                    // 其他格式：使用 FFmpeg 解码器获取长度
+                    using var decoder = new FfmpegAudioDecoder(filePath, _targetSampleRate, _targetChannels);
+                    fileLength = decoder.Length;
+                }
                 _fileOffsets.Add(_totalLength);
                 _fileLengths.Add(fileLength);
                 _totalLength += fileLength;
@@ -102,15 +137,25 @@ public class MultiFileAudioSource : ISampleSource
         if (index < 0 || index >= _filePaths.Count)
             return;
 
-        // 关闭当前解码器
-        _currentDecoder?.Dispose();
+        // 关闭当前音频源
+        _currentSource?.Dispose();
 
         string filePath = _filePaths[index];
+        bool isMidi = index < _isMidiFile.Count && _isMidiFile[index];
         
         try
         {
-            // 传入目标参数，确保所有文件输出统一的采样率和声道数
-            _currentDecoder = new FfmpegAudioDecoder(filePath, _targetSampleRate, _targetChannels);
+            if (isMidi)
+            {
+                // MIDI 文件：使用 FluidSynth 渲染
+                Logger.Info($"[MultiFileAudioSource] 打开 MIDI: {Path.GetFileName(filePath)}");
+                _currentSource = MidiAudioSourceFactory.Create(filePath, _targetSampleRate, _targetChannels);
+            }
+            else
+            {
+                // 其他格式：使用 FFmpeg 解码器
+                _currentSource = new FfmpegAudioDecoder(filePath, _targetSampleRate, _targetChannels);
+            }
             _currentFileIndex = index;
         }
         catch (Exception ex)
@@ -158,12 +203,12 @@ public class MultiFileAudioSource : ISampleSource
             }
 
             // 设置文件内的位置
-            if (_currentDecoder != null && targetIndex < _fileOffsets.Count)
+            if (_currentSource != null && targetIndex < _fileOffsets.Count)
             {
                 long localPosition = value - _fileOffsets[targetIndex];
-                if (localPosition >= 0 && localPosition <= _currentDecoder.Length)
+                if (localPosition >= 0 && localPosition <= _currentSource.Length)
                 {
-                    _currentDecoder.Position = localPosition;
+                    _currentSource.Position = localPosition;
                 }
             }
         }
@@ -173,14 +218,14 @@ public class MultiFileAudioSource : ISampleSource
 
     public int Read(float[] buffer, int offset, int count)
     {
-        if (_isDisposed || _currentDecoder == null)
+        if (_isDisposed || _currentSource == null)
             return 0;
 
         int totalRead = 0;
 
         while (totalRead < count && _position < _totalLength)
         {
-            int read = _currentDecoder.Read(buffer, offset + totalRead, count - totalRead);
+            int read = _currentSource.Read(buffer, offset + totalRead, count - totalRead);
 
             if (read > 0)
             {
@@ -189,12 +234,27 @@ public class MultiFileAudioSource : ISampleSource
             }
             else
             {
-                // Read 返回 0，使用 IsEof 属性检查是否真的到达文件末尾
-                // 这比比较 Position 和 Length 更可靠（避免重采样导致的长度误差）
-                if (!_currentDecoder.IsEof)
+                // Read 返回 0，检查是否真的到达文件末尾
+                // 对于 FfmpegAudioDecoder 使用 IsEof 属性，对于 MIDI 使用 Position >= Length
+                bool isEof = false;
+                if (_currentSource is FfmpegAudioDecoder decoder)
                 {
-                    // 还没到文件末尾，只是无法读取完整声道数据（剩余请求数 < 声道数）
-                    Logger.Debug($"[MultiFileAudioSource] Read=0 但 IsEof=false, pos={_currentDecoder.Position}, len={_currentDecoder.Length}");
+                    isEof = decoder.IsEof;
+                }
+                else if (_currentSource is MidiAudioSource midiSource)
+                {
+                    isEof = midiSource.IsEof;
+                }
+                else
+                {
+                    // 其他类型：使用位置判断
+                    isEof = _currentSource.Position >= _currentSource.Length;
+                }
+                
+                if (!isEof)
+                {
+                    // 还没到文件末尾，只是无法读取完整声道数据
+                    Logger.Debug($"[MultiFileAudioSource] Read=0 但 IsEof=false, pos={_currentSource.Position}, len={_currentSource.Length}");
                     break;
                 }
                 
@@ -229,7 +289,7 @@ public class MultiFileAudioSource : ISampleSource
     {
         if (!_isDisposed)
         {
-            _currentDecoder?.Dispose();
+            _currentSource?.Dispose();
             _isDisposed = true;
         }
     }

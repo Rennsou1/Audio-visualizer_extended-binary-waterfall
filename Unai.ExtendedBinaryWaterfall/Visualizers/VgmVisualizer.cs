@@ -10,11 +10,15 @@ public class VgmVisualizer : IDisposable
     // 芯片通道状态
     public class ChannelState
     {
-        public int Note;          // 当前音符 (0-127, -1 表示无声)
-        public int Volume;        // 当前音量 (0-127)
-        public int Panning;       // 声像 (-64 ~ 63)
-        public bool KeyOn;        // 是否按下
-        public string Label;      // 通道标签
+        public int Note;              // 当前音符 (0-127, -1 表示无声)
+        public int Volume;            // 当前音量 (0-127)
+        public int Panning;           // 声像 (-64 ~ 63，0=居中)
+        public int PanLeft;           // 左声道音量 (0-127)
+        public int PanRight;          // 右声道音量 (0-127)
+        public float DisplayPanLeft;  // 显示用左声道 (带衰减)
+        public float DisplayPanRight; // 显示用右声道 (带衰减)
+        public bool KeyOn;            // 是否按下
+        public string Label;          // 通道标签
     }
 
     // 芯片状态
@@ -22,7 +26,7 @@ public class VgmVisualizer : IDisposable
     {
         public VgmChipInfo Info;
         public ChannelState[] Channels;
-        public byte[] Registers;  // 原始寄存器值
+        public byte[] Registers;
     }
 
     private readonly List<ChipState> _chipStates = new();
@@ -32,25 +36,39 @@ public class VgmVisualizer : IDisposable
     private byte[] _vgmData;
     private int _lastEventIndex = -1;
     private bool _disposed;
-
-    // 颜色配置
-    private static readonly SKColor[] ChipColors = new[]
-    {
-        new SKColor(0xFF, 0x66, 0x66), // 红
-        new SKColor(0x66, 0xFF, 0x66), // 绿
-        new SKColor(0x66, 0x66, 0xFF), // 蓝
-        new SKColor(0xFF, 0xFF, 0x66), // 黄
-        new SKColor(0xFF, 0x66, 0xFF), // 紫
-        new SKColor(0x66, 0xFF, 0xFF), // 青
-        new SKColor(0xFF, 0xAA, 0x66), // 橙
-        new SKColor(0xAA, 0x66, 0xFF), // 紫蓝
-    };
+    private double _lastUpdateTime;
+    
+    // 声像衰减设置（毫秒）
+    private const float PAN_RELEASE_MS = 300f;
 
     public IReadOnlyList<ChipState> ChipStates => _chipStates;
     public VgmHeader Header => _audioSource?.Header ?? default;
     public Gd3Tag Gd3 => _audioSource?.Gd3;
+    public VgmAudioSource AudioSource => _audioSource;
     public string SystemName { get; private set; } = "";
     public Gd3Language Gd3Language { get; set; } = Gd3Language.English;
+    
+    // 获取 VGM 版本字符串（BCD格式解析）
+    public string GetVersionString()
+    {
+        uint ver = Header.Version;
+        // VGM版本号是BCD格式：0x161 = 1.61
+        int major = (int)(ver >> 8);
+        int minor = (int)(ver & 0xFF);
+        return $"{major}.{minor:X2}";
+    }
+    
+    // 获取芯片列表字符串
+    public string GetChipsString()
+    {
+        if (_chipStates.Count == 0) return "";
+        var names = new List<string>();
+        foreach (var chip in _chipStates)
+        {
+            names.Add(chip.Info.Name);
+        }
+        return string.Join(", ", names);
+    }
 
     // 初始化可视化器
     public void Initialize(VgmAudioSource audioSource)
@@ -151,10 +169,31 @@ public class VgmVisualizer : IDisposable
     {
         if (_parser == null || _parser.Events.Count == 0) return;
         
-        uint targetTick = VgmCommandParser.MsToTick(timeMs);
+        // 循环支持：如果有循环点且时间超过循环点，使用模运算计算循环内时间
+        double effectiveTimeMs = timeMs;
+        if (_audioSource != null && _audioSource.HasLoop)
+        {
+            // 循环点时间（毫秒）
+            double loopPointMs = (_audioSource.Header.TotalSamples - _audioSource.Header.LoopSamples) / 44100.0 * 1000.0;
+            // 循环段时间（毫秒）
+            double loopLengthMs = _audioSource.Header.LoopSamples / 44100.0 * 1000.0;
+            
+            if (loopLengthMs > 0 && timeMs > loopPointMs)
+            {
+                // 计算循环内偏移
+                double loopOffset = (timeMs - loopPointMs) % loopLengthMs;
+                effectiveTimeMs = loopPointMs + loopOffset;
+            }
+        }
+        
+        uint targetTick = VgmCommandParser.MsToTick(effectiveTimeMs);
         int targetIndex = _parser.GetEventIndexAtTick(targetTick);
         
-        // 如果时间倒退，需要重置并从头开始
+        // 计算时间差（用于声像衰减，使用原始时间保持动画连续）
+        float deltaMs = (float)(timeMs - _lastUpdateTime);
+        _lastUpdateTime = timeMs;
+        
+        // 如果时间倒退（包括循环跳回），需要重置并从头开始
         if (targetIndex < _lastEventIndex)
         {
             foreach (var tracker in _trackers.Values)
@@ -162,6 +201,7 @@ public class VgmVisualizer : IDisposable
                 tracker.Reset();
             }
             _lastEventIndex = -1;
+            deltaMs = 0;
         }
         
         // 处理从上次位置到当前位置的所有事件
@@ -184,6 +224,51 @@ public class VgmVisualizer : IDisposable
             {
                 tracker.UpdateVisualizerState(state);
             }
+            
+            // 更新声像显示（带衰减）
+            UpdatePanDisplay(state, deltaMs);
+        }
+    }
+    
+    // 更新声像显示（带衰减效果）
+    private void UpdatePanDisplay(ChipState state, float deltaMs)
+    {
+        float decayFactor = deltaMs > 0 ? deltaMs / PAN_RELEASE_MS : 0;
+        
+        foreach (var ch in state.Channels)
+        {
+            // 计算目标声像值（从音量和Panning计算左右声道）
+            float targetLeft = 0, targetRight = 0;
+            
+            if (ch.KeyOn && ch.Volume > 0)
+            {
+                float vol = ch.Volume / 127f;
+                
+                // 如果有独立的左右声道值
+                if (ch.PanLeft > 0 || ch.PanRight > 0)
+                {
+                    targetLeft = ch.PanLeft / 127f * vol;
+                    targetRight = ch.PanRight / 127f * vol;
+                }
+                else
+                {
+                    // 从Panning值计算（-64~63）
+                    float pan = ch.Panning / 64f; // -1 ~ 1
+                    targetLeft = vol * (1f - Math.Max(0, pan));
+                    targetRight = vol * (1f + Math.Min(0, pan));
+                }
+            }
+            
+            // 应用衰减（只往下衰减，不往上）
+            if (targetLeft > ch.DisplayPanLeft)
+                ch.DisplayPanLeft = targetLeft;
+            else
+                ch.DisplayPanLeft = Math.Max(0, ch.DisplayPanLeft - decayFactor);
+                
+            if (targetRight > ch.DisplayPanRight)
+                ch.DisplayPanRight = targetRight;
+            else
+                ch.DisplayPanRight = Math.Max(0, ch.DisplayPanRight - decayFactor);
         }
     }
     
@@ -277,10 +362,12 @@ public class VgmVisualizer : IDisposable
         chip.Registers[address] = value;
     }
 
-    // 获取芯片颜色
+    // 获取芯片颜色（纯白灰黑色方案）
     public static SKColor GetChipColor(int chipIndex)
     {
-        return ChipColors[chipIndex % ChipColors.Length];
+        // 不同芯片使用不同灰度
+        byte gray = (byte)(200 - (chipIndex % 4) * 20);
+        return new SKColor(gray, gray, gray);
     }
 
     // 计算组件高度

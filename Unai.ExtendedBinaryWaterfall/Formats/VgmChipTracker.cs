@@ -1067,7 +1067,7 @@ public class SAA1099Tracker : VgmChipTracker
 public class RF5CTracker : VgmChipTracker
 {
     private readonly int[] _env = new int[8];       // 音量包络
-    private readonly int[] _pan = new int[8];       // 声像
+    private readonly int[] _pan = new int[8];       // 声像 (L4:R4)
     private readonly int[] _fdLow = new int[8];     // 频率增量低位
     private readonly int[] _fdHigh = new int[8];    // 频率增量高位
     private readonly bool[] _keyOn = new bool[8];
@@ -1083,17 +1083,17 @@ public class RF5CTracker : VgmChipTracker
         if (reg == 0x07)
         {
             _chipEnable = (val & 0x80) != 0;
-            // 当 MOD=1 (bit6=1) 时，低3位是通道选择
+            // 当 CB=1 (bit6=1) 时，低3位是通道选择
             if ((val & 0x40) != 0)
             {
                 _currentChannel = val & 0x07;
             }
         }
-        // 通道开/关控制 0x08（bit=1 表示通道激活）
+        // 通道开/关控制 0x08（bit=0 表示通道激活，bit=1 表示静音）
         else if (reg == 0x08)
         {
             for (int i = 0; i < 8; i++)
-                _keyOn[i] = (val & (1 << i)) != 0;
+                _keyOn[i] = (val & (1 << i)) == 0;  // 0=播放, 1=静音
         }
         // 通道寄存器（需要先选择通道）
         else if (reg <= 0x06)
@@ -1101,10 +1101,10 @@ public class RF5CTracker : VgmChipTracker
             int ch = _currentChannel;
             switch (reg)
             {
-                case 0x00: _env[ch] = val; break;                    // 音量包络
-                case 0x01: _pan[ch] = val; break;                    // 声像
-                case 0x02: _fdLow[ch] = val; break;                  // 频率增量低位
-                case 0x03: _fdHigh[ch] = val; break;                 // 频率增量高位
+                case 0x00: _env[ch] = val; break;        // 音量包络
+                case 0x01: _pan[ch] = val; break;        // 声像 L[7:4] R[3:0]
+                case 0x02: _fdLow[ch] = val; break;      // FD低8位
+                case 0x03: _fdHigh[ch] = val & 0x07; break;  // FD高3位
             }
         }
     }
@@ -1129,15 +1129,23 @@ public class RF5CTracker : VgmChipTracker
             state.Channels[ch].KeyOn = active;
             state.Channels[ch].Volume = _env[ch] / 2;
             
+            // 声像: 高4位=L, 低4位=R
+            int panL = (_pan[ch] >> 4) & 0x0F;
+            int panR = _pan[ch] & 0x0F;
+            state.Channels[ch].PanLeft = panL * 8;   // 0-15 -> 0-120
+            state.Channels[ch].PanRight = panR * 8;
+            
             // 从频率增量计算音高
             if (active)
             {
                 int fd = _fdLow[ch] | (_fdHigh[ch] << 8);
                 if (fd > 0)
                 {
-                    // RF5C164: freq = fd * clock / (256 * 384)
-                    // clock 通常是 12.5 MHz
-                    double freq = fd * 12500000.0 / (256.0 * 384.0);
+                    // RF5C164: 采样率 = FD * clock / (384 * 65536)
+                    // clock = 12.5MHz, 基准采样率约32552Hz时对应FD=0x800
+                    // 假设基准音为C4(261.63Hz)对应FD=0x800
+                    double ratio = fd / 2048.0;
+                    double freq = 261.63 * ratio;
                     state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
                 }
                 else
@@ -1156,7 +1164,10 @@ public class RF5CTracker : VgmChipTracker
 // C140 状态追踪器（Namco PCM）
 public class C140Tracker : VgmChipTracker
 {
-    private readonly int[] _volume = new int[24];
+    private readonly int[] _volumeR = new int[24];
+    private readonly int[] _volumeL = new int[24];
+    private readonly int[] _freqH = new int[24];
+    private readonly int[] _freqL = new int[24];
     private readonly bool[] _keyOn = new bool[24];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1168,14 +1179,23 @@ public class C140Tracker : VgmChipTracker
         
         if (ch < 24)
         {
-            if (type == 0) _volume[ch] = val;
-            else if (type == 5) _keyOn[ch] = (val & 0x80) != 0;
+            switch (type)
+            {
+                case 0x00: _volumeR[ch] = val; break;   // 右声道音量
+                case 0x01: _volumeL[ch] = val; break;   // 左声道音量
+                case 0x02: _freqH[ch] = val; break;     // 频率高位
+                case 0x03: _freqL[ch] = val; break;     // 频率低位
+                case 0x05: _keyOn[ch] = (val & 0x80) != 0; break;  // Key On
+            }
         }
     }
     
     public override void Reset()
     {
-        Array.Clear(_volume);
+        Array.Clear(_volumeR);
+        Array.Clear(_volumeL);
+        Array.Clear(_freqH);
+        Array.Clear(_freqL);
         Array.Clear(_keyOn);
     }
     
@@ -1184,8 +1204,30 @@ public class C140Tracker : VgmChipTracker
         for (int ch = 0; ch < 24 && ch < state.Channels.Length; ch++)
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
-            state.Channels[ch].Volume = _volume[ch] / 2;
-            state.Channels[ch].Note = -1;
+            state.Channels[ch].Volume = Math.Max(_volumeL[ch], _volumeR[ch]) / 2;
+            state.Channels[ch].PanLeft = _volumeL[ch];
+            state.Channels[ch].PanRight = _volumeR[ch];
+            
+            // C140: 频率 = (freqH << 8 | freqL) * clock / 65536
+            if (_keyOn[ch])
+            {
+                int freq16 = (_freqH[ch] << 8) | _freqL[ch];
+                if (freq16 > 0)
+                {
+                    // 假设基准C4对应freq16=0x1000
+                    double ratio = freq16 / 4096.0;
+                    double freq = 261.63 * ratio;
+                    state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                }
+                else
+                {
+                    state.Channels[ch].Note = -1;
+                }
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1193,7 +1235,8 @@ public class C140Tracker : VgmChipTracker
 // C352 状态追踪器（Namco 32-voice PCM）
 public class C352Tracker : VgmChipTracker
 {
-    private readonly int[] _volume = new int[32];
+    private readonly int[] _volumeL = new int[32];
+    private readonly int[] _volumeR = new int[32];
     private readonly int[] _pitch = new int[32];
     private readonly bool[] _keyOn = new bool[32];
     
@@ -1206,16 +1249,19 @@ public class C352Tracker : VgmChipTracker
         
         if (ch < 32)
         {
-            if (type == 0) _volume[ch] = val;
-            else if (type == 2) _pitch[ch] = (_pitch[ch] & 0xFF00) | val;
-            else if (type == 3) _pitch[ch] = (_pitch[ch] & 0x00FF) | (val << 8);
-            else if (type == 6) _keyOn[ch] = (val & 0x40) != 0;
+            // 音量：前后左右四声道
+            if (type == 0) _volumeR[ch] = val;       // Vol Front R
+            else if (type == 1) _volumeL[ch] = val;  // Vol Front L
+            else if (type == 2) _pitch[ch] = (_pitch[ch] & 0xFF00) | val;  // Pitch Low
+            else if (type == 3) _pitch[ch] = (_pitch[ch] & 0x00FF) | (val << 8);  // Pitch High
+            else if (type == 6) _keyOn[ch] = (val & 0x40) != 0;  // Flags (bit6 = key on)
         }
     }
     
     public override void Reset()
     {
-        Array.Clear(_volume);
+        Array.Clear(_volumeL);
+        Array.Clear(_volumeR);
         Array.Clear(_pitch);
         Array.Clear(_keyOn);
     }
@@ -1225,8 +1271,23 @@ public class C352Tracker : VgmChipTracker
         for (int ch = 0; ch < 32 && ch < state.Channels.Length; ch++)
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
-            state.Channels[ch].Volume = _volume[ch] / 2;
-            state.Channels[ch].Note = -1;
+            state.Channels[ch].Volume = Math.Max(_volumeL[ch], _volumeR[ch]) / 2;
+            state.Channels[ch].PanLeft = _volumeL[ch];
+            state.Channels[ch].PanRight = _volumeR[ch];
+            
+            // Pitch -> Note: C352 pitch 0x10000 = 原始采样率
+            // freq = baseSampleRate * pitch / 65536
+            // 假设基准C4(261.63Hz)对应pitch=0x10000
+            if (_keyOn[ch] && _pitch[ch] > 0)
+            {
+                double ratio = _pitch[ch] / 65536.0;
+                double freq = 261.63 * ratio;  // 假设基准为C4
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1235,6 +1296,8 @@ public class C352Tracker : VgmChipTracker
 public class K053260Tracker : VgmChipTracker
 {
     private readonly int[] _volume = new int[4];
+    private readonly int[] _pitch = new int[4];
+    private readonly int[] _pan = new int[4];
     private readonly bool[] _keyOn = new bool[4];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1242,21 +1305,43 @@ public class K053260Tracker : VgmChipTracker
         byte reg = evt.Register;
         byte val = evt.Value;
         
-        if (reg >= 0x00 && reg <= 0x07)
+        // 每通道8个寄存器 (0x08-0x27)
+        if (reg >= 0x08 && reg <= 0x27)
         {
-            int ch = reg / 2;
-            if ((reg & 1) == 1) _volume[ch] = val & 0x7F;
+            int ch = (reg - 0x08) / 8;
+            int type = (reg - 0x08) % 8;
+            if (ch < 4)
+            {
+                switch (type)
+                {
+                    case 0: _pitch[ch] = (_pitch[ch] & 0x0F00) | val; break;  // pitch低8位
+                    case 1: _pitch[ch] = (_pitch[ch] & 0x00FF) | ((val & 0x0F) << 8); break;  // pitch高4位
+                    case 7: _volume[ch] = val & 0x7F; break;  // 音量
+                }
+            }
         }
-        else if (reg == 0x28)
+        else if (reg == 0x28)  // Key On/Off
         {
             for (int i = 0; i < 4; i++)
                 _keyOn[i] = (val & (1 << i)) != 0;
+        }
+        else if (reg == 0x2C)  // Pan声道0,1
+        {
+            _pan[0] = val & 0x07;
+            _pan[1] = (val >> 3) & 0x07;
+        }
+        else if (reg == 0x2D)  // Pan声道2,3
+        {
+            _pan[2] = val & 0x07;
+            _pan[3] = (val >> 3) & 0x07;
         }
     }
     
     public override void Reset()
     {
         Array.Clear(_volume);
+        Array.Clear(_pitch);
+        Array.Clear(_pan);
         Array.Clear(_keyOn);
     }
     
@@ -1266,7 +1351,23 @@ public class K053260Tracker : VgmChipTracker
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
             state.Channels[ch].Volume = _volume[ch];
-            state.Channels[ch].Note = -1;
+            
+            // Pan: 0=静音, 1=L, 4=Center, 7=R
+            int pan = _pan[ch];
+            state.Channels[ch].PanLeft = pan >= 1 && pan <= 4 ? 127 : 0;
+            state.Channels[ch].PanRight = pan >= 4 && pan <= 7 ? 127 : 0;
+            
+            // Pitch -> Note (12位pitch)
+            if (_keyOn[ch] && _pitch[ch] > 0)
+            {
+                double ratio = _pitch[ch] / 2048.0;
+                double freq = 261.63 * ratio;
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1275,6 +1376,9 @@ public class K053260Tracker : VgmChipTracker
 public class K054539Tracker : VgmChipTracker
 {
     private readonly int[] _volume = new int[8];
+    private readonly int[] _pitch = new int[8];  // 24位pitch
+    private readonly int[] _panL = new int[8];
+    private readonly int[] _panR = new int[8];
     private readonly bool[] _keyOn = new bool[8];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1282,11 +1386,25 @@ public class K054539Tracker : VgmChipTracker
         int reg = (evt.Port << 8) | evt.Register;
         byte val = evt.Value;
         
-        int ch = (reg >> 5) & 0x07;
-        int type = reg & 0x1F;
-        
-        if (type == 0x03) _volume[ch] = val;
-        else if (reg == 0x214)
+        // 通道寄存器 0x00-0xFF (每通道32字节)
+        if (reg < 0x100)
+        {
+            int ch = reg >> 5;
+            int type = reg & 0x1F;
+            if (ch < 8)
+            {
+                switch (type)
+                {
+                    case 0x00: _pitch[ch] = (_pitch[ch] & 0xFFFF00) | val; break;  // pitch低8位
+                    case 0x01: _pitch[ch] = (_pitch[ch] & 0xFF00FF) | (val << 8); break;  // pitch中8位
+                    case 0x02: _pitch[ch] = (_pitch[ch] & 0x00FFFF) | (val << 16); break;  // pitch高8位
+                    case 0x03: _volume[ch] = val; break;  // 音量
+                    case 0x04: _panL[ch] = val; break;  // 左声道
+                    case 0x05: _panR[ch] = val; break;  // 右声道
+                }
+            }
+        }
+        else if (reg == 0x214)  // Key On/Off
         {
             for (int i = 0; i < 8; i++)
                 _keyOn[i] = (val & (1 << i)) != 0;
@@ -1296,6 +1414,9 @@ public class K054539Tracker : VgmChipTracker
     public override void Reset()
     {
         Array.Clear(_volume);
+        Array.Clear(_pitch);
+        Array.Clear(_panL);
+        Array.Clear(_panR);
         Array.Clear(_keyOn);
     }
     
@@ -1305,7 +1426,20 @@ public class K054539Tracker : VgmChipTracker
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
             state.Channels[ch].Volume = _volume[ch] / 2;
-            state.Channels[ch].Note = -1;
+            state.Channels[ch].PanLeft = _panL[ch];
+            state.Channels[ch].PanRight = _panR[ch];
+            
+            // K054539: 24位pitch，高位是整数部分，低位是小数部分
+            if (_keyOn[ch] && _pitch[ch] > 0)
+            {
+                double ratio = _pitch[ch] / 65536.0;
+                double freq = 261.63 * ratio / 256.0;
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1314,6 +1448,9 @@ public class K054539Tracker : VgmChipTracker
 public class MultiPCMTracker : VgmChipTracker
 {
     private readonly int[] _volume = new int[28];
+    private readonly int[] _panpot = new int[28];
+    private readonly int[] _oct = new int[28];
+    private readonly int[] _pitch = new int[28];
     private readonly bool[] _keyOn = new bool[28];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1327,13 +1464,20 @@ public class MultiPCMTracker : VgmChipTracker
         if (ch < 28)
         {
             if (type == 0) _keyOn[ch] = (val & 0x80) != 0;
+            else if (type == 1) _panpot[ch] = val & 0x0F;
+            else if (type == 2) _pitch[ch] = (_pitch[ch] & 0xFF00) | val;  // Pitch Low
+            else if (type == 3) _pitch[ch] = (_pitch[ch] & 0x00FF) | (val << 8);  // Pitch High
             else if (type == 4) _volume[ch] = val & 0x7F;
+            else if (type == 5) _oct[ch] = (val >> 4) & 0x0F;  // Octave
         }
     }
     
     public override void Reset()
     {
         Array.Clear(_volume);
+        Array.Clear(_panpot);
+        Array.Clear(_oct);
+        Array.Clear(_pitch);
         Array.Clear(_keyOn);
     }
     
@@ -1343,7 +1487,24 @@ public class MultiPCMTracker : VgmChipTracker
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
             state.Channels[ch].Volume = _volume[ch];
-            state.Channels[ch].Note = -1;
+            
+            // Pan: 0=L, 7=Center, 15=R
+            float pan = (_panpot[ch] - 7) / 8f;
+            state.Channels[ch].PanLeft = (int)(127 * (1f - Math.Max(0, pan)));
+            state.Channels[ch].PanRight = (int)(127 * (1f + Math.Min(0, pan)));
+            
+            // MultiPCM: Octave + Pitch -> Note
+            if (_keyOn[ch] && _pitch[ch] > 0)
+            {
+                int octave = (_oct[ch] & 0x07) - 4;
+                double baseFreq = 261.63 * Math.Pow(2, octave);
+                double freq = baseFreq * _pitch[ch] / 1024.0;
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1352,6 +1513,10 @@ public class MultiPCMTracker : VgmChipTracker
 public class ScspTracker : VgmChipTracker
 {
     private readonly int[] _volume = new int[32];
+    private readonly int[] _oct = new int[32];
+    private readonly int[] _fns = new int[32];
+    private readonly int[] _panL = new int[32];
+    private readonly int[] _panR = new int[32];
     private readonly bool[] _keyOn = new bool[32];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1359,16 +1524,27 @@ public class ScspTracker : VgmChipTracker
         int addr = (evt.Register << 8) | evt.Port;
         byte val = evt.Value;
         
+        // SCSP每通違32字节
         int ch = (addr >> 5) & 0x1F;
         int reg = addr & 0x1F;
         
-        if (reg == 0x00) _keyOn[ch] = (val & 0x10) != 0;
-        else if (reg == 0x0A) _volume[ch] = val & 0x0F;
+        switch (reg)
+        {
+            case 0x00: _keyOn[ch] = (val & 0x10) != 0; break;
+            case 0x08: _oct[ch] = (val >> 3) & 0x0F; _fns[ch] = (_fns[ch] & 0x00FF) | ((val & 0x03) << 8); break;
+            case 0x09: _fns[ch] = (_fns[ch] & 0x0300) | val; break;
+            case 0x0A: _volume[ch] = val & 0x0F; break;
+            case 0x12: _panL[ch] = (val >> 4) & 0x0F; _panR[ch] = val & 0x0F; break;
+        }
     }
     
     public override void Reset()
     {
         Array.Clear(_volume);
+        Array.Clear(_oct);
+        Array.Clear(_fns);
+        Array.Clear(_panL);
+        Array.Clear(_panR);
         Array.Clear(_keyOn);
     }
     
@@ -1378,7 +1554,21 @@ public class ScspTracker : VgmChipTracker
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
             state.Channels[ch].Volume = (15 - _volume[ch]) * 127 / 15;
-            state.Channels[ch].Note = -1;
+            state.Channels[ch].PanLeft = _panL[ch] * 8;
+            state.Channels[ch].PanRight = _panR[ch] * 8;
+            
+            // SCSP: OCT + FNS -> Note
+            if (_keyOn[ch])
+            {
+                int oct = _oct[ch];
+                if (oct > 7) oct -= 16;  // 符号扩展
+                double freq = 261.63 * Math.Pow(2, oct) * (1.0 + _fns[ch] / 1024.0);
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1531,7 +1721,9 @@ public class OKIM6295Tracker : VgmChipTracker
 // SegaPCM 状态追踪器
 public class SegaPCMTracker : VgmChipTracker
 {
-    private readonly int[] _volume = new int[16];
+    private readonly int[] _volumeL = new int[16];
+    private readonly int[] _volumeR = new int[16];
+    private readonly int[] _delta = new int[16];  // 采样增量（音高）
     private readonly bool[] _keyOn = new bool[16];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1542,13 +1734,18 @@ public class SegaPCMTracker : VgmChipTracker
         int ch = (addr >> 3) & 0x0F;
         int reg = addr & 0x07;
         
-        if (reg == 0x02) _volume[ch] = val;
-        else if (reg == 0x06) _keyOn[ch] = (val & 0x01) == 0;
+        // SegaPCM寄存器: 每通道8字节
+        if (reg == 0x02) _volumeL[ch] = val;       // 左声道音量
+        else if (reg == 0x03) _volumeR[ch] = val;  // 右声道音量
+        else if (reg == 0x07) _delta[ch] = val;    // 采样增量（音高）
+        else if (reg == 0x06) _keyOn[ch] = (val & 0x01) == 0;  // bit0=0表示播放
     }
     
     public override void Reset()
     {
-        Array.Clear(_volume);
+        Array.Clear(_volumeL);
+        Array.Clear(_volumeR);
+        Array.Clear(_delta);
         Array.Clear(_keyOn);
     }
     
@@ -1557,8 +1754,22 @@ public class SegaPCMTracker : VgmChipTracker
         for (int ch = 0; ch < 16 && ch < state.Channels.Length; ch++)
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
-            state.Channels[ch].Volume = _volume[ch] / 2;
-            state.Channels[ch].Note = -1;
+            state.Channels[ch].Volume = Math.Max(_volumeL[ch], _volumeR[ch]) / 2;
+            state.Channels[ch].PanLeft = _volumeL[ch];
+            state.Channels[ch].PanRight = _volumeR[ch];
+            
+            // Delta -> Note: delta=0x80对应原始采样率
+            // 采样率 = 31250 * delta / 128
+            if (_keyOn[ch] && _delta[ch] > 0)
+            {
+                double ratio = _delta[ch] / 128.0;
+                double freq = 261.63 * ratio;  // 假设基准为C4
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -1567,6 +1778,9 @@ public class SegaPCMTracker : VgmChipTracker
 public class YMZ280BTracker : VgmChipTracker
 {
     private readonly int[] _volume = new int[8];
+    private readonly int[] _pitch = new int[8];
+    private readonly int[] _panL = new int[8];
+    private readonly int[] _panR = new int[8];
     private readonly bool[] _keyOn = new bool[8];
     
     public override void ProcessEvent(VgmEvent evt)
@@ -1574,16 +1788,25 @@ public class YMZ280BTracker : VgmChipTracker
         byte reg = evt.Register;
         byte val = evt.Value;
         
+        // 每通道4个寄存器
         int ch = (reg >> 2) & 0x07;
         int type = reg & 0x03;
         
-        if (type == 0) _keyOn[ch] = (val & 0x80) != 0;
-        else if (type == 2) _volume[ch] = val;
+        switch (type)
+        {
+            case 0: _keyOn[ch] = (val & 0x80) != 0; _pitch[ch] = (_pitch[ch] & 0x00FF) | ((val & 0x01) << 8); break;
+            case 1: _pitch[ch] = (_pitch[ch] & 0x0100) | val; break;  // pitch低8位
+            case 2: _volume[ch] = val; break;
+            case 3: _panL[ch] = val >> 4; _panR[ch] = val & 0x0F; break;
+        }
     }
     
     public override void Reset()
     {
         Array.Clear(_volume);
+        Array.Clear(_pitch);
+        Array.Clear(_panL);
+        Array.Clear(_panR);
         Array.Clear(_keyOn);
     }
     
@@ -1593,7 +1816,20 @@ public class YMZ280BTracker : VgmChipTracker
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
             state.Channels[ch].Volume = _volume[ch] / 2;
-            state.Channels[ch].Note = -1;
+            state.Channels[ch].PanLeft = _panL[ch] * 8;
+            state.Channels[ch].PanRight = _panR[ch] * 8;
+            
+            // YMZ280B: 9位pitch
+            if (_keyOn[ch] && _pitch[ch] > 0)
+            {
+                double ratio = _pitch[ch] / 256.0;
+                double freq = 261.63 * ratio;
+                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }

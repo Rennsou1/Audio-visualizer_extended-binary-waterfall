@@ -68,16 +68,16 @@ public sealed unsafe class VgmAudioSource : ISampleSource
         double baseDuration = Header.TotalSamples / 44100.0;
         double loopDuration = Header.LoopSamples / 44100.0;
         
-        // 总时长 = 基础时长 + (循环次数-1) * 循环长度 + 淡出时长
+        // 循环逻辑：LoopCount=1 表示只播放一次，LoopCount=2 表示循环一次（共播放两次）
+        // 总时长 = 引入段 + (循环次数) * 循环段 + 淡出时长
+        // 引入段 = baseDuration - loopDuration（从开始到循环点的部分）
         double totalSeconds = baseDuration;
         
         // 只有有循环点的 VGM 才添加额外循环和淡出
-        if (HasLoop)
+        if (HasLoop && LoopCount > 1)
         {
-            if (LoopCount > 1)
-            {
-                totalSeconds += loopDuration * (LoopCount - 1);
-            }
+            // LoopCount=2 表示播放2次，需要加1次循环段
+            totalSeconds += loopDuration * (LoopCount - 1);
             if (FadeOutEnabled)
             {
                 totalSeconds += FadeOutDuration;
@@ -156,7 +156,10 @@ public sealed unsafe class VgmAudioSource : ISampleSource
             CalculateTotalLength();
             if (HasLoop)
             {
-                Logger.Info($"[VGM] 有循环点, 循环: {LoopCount}次, 淡出: {(FadeOutEnabled ? $"{FadeOutDuration}s" : "禁用")}, 总时长: {Duration:F2}s");
+                string loopInfo = LoopCount == 1 
+                    ? "1次（不循环）" 
+                    : $"{LoopCount}次（循环{LoopCount - 1}次）";
+                Logger.Info($"[VGM] 有循环点, 播放: {loopInfo}, 淡出: {(FadeOutEnabled && LoopCount > 1 ? $"{FadeOutDuration}s" : "禁用")}, 总时长: {Duration:F2}s");
             }
             else
             {
@@ -222,15 +225,32 @@ public sealed unsafe class VgmAudioSource : ISampleSource
         int samplesPerChannel = count / _channels;
         int samplesRendered;
 
-        // 检查循环次数（只有有循环点的 VGM 才会触发淡出）
-        if (HasLoop && !_fadeStarted)
+        // 检查循环/结束条件
+        if (!_fadeStarted)
         {
             uint currentLoop = LibVgm.VgmPlayer_GetCurLoop(_player);
-            if (currentLoop >= LoopCount)
+            
+            // libvgm 的 CurLoop: 0=第一次播放，1=已循环一次，以此类推
+            if (HasLoop)
             {
-                _fadeStarted = true;
-                _fadeStartPosition = _position;
-                Logger.Debug($"[VGM] 开始淡出 (循环 {currentLoop}/{LoopCount})");
+                // 有循环点：当 currentLoop >= LoopCount 时触发淡出
+                // 例如 LoopCount=2 时，当 currentLoop>=2（即完成两次播放）开始淡出
+                if (currentLoop >= (uint)LoopCount)
+                {
+                    _fadeStarted = true;
+                    _fadeStartPosition = _position;
+                    if (FadeOutEnabled && LoopCount > 1)
+                    {
+                        Logger.Debug($"[VGM] 开始淡出 (循环 {currentLoop}/{LoopCount})");
+                    }
+                    else
+                    {
+                        // LoopCount=1 或禁用淡出时直接结束
+                        _playbackEnded = true;
+                        Logger.Debug($"[VGM] 播放结束 (循环 {currentLoop}/{LoopCount})");
+                        return 0;
+                    }
+                }
             }
         }
 
@@ -320,11 +340,30 @@ public sealed unsafe class VgmAudioSource : ISampleSource
         return tick / 44100.0;
     }
 
-    // 获取当前循环次数
+    // 获取当前循环次数（从1开始计数，1=第一次播放）
     public int GetCurrentLoop()
     {
+        if (_player == IntPtr.Zero) return 1;
+        return (int)LibVgm.VgmPlayer_GetCurLoop(_player) + 1;
+    }
+    
+    // 获取当前采样偏移（tick）
+    public uint GetCurrentSampleOffset()
+    {
         if (_player == IntPtr.Zero) return 0;
-        return (int)LibVgm.VgmPlayer_GetCurLoop(_player);
+        return LibVgm.VgmPlayer_GetCurPos(_player, LibVgm.UNIT_SAMPLE);
+    }
+    
+    // 获取循环点采样偏移
+    public uint GetLoopSampleOffset()
+    {
+        return Header.LoopSamples > 0 ? Header.TotalSamples - Header.LoopSamples : 0;
+    }
+    
+    // 获取最大采样偏移（始终返回总采样数）
+    public uint GetMaxSampleOffset()
+    {
+        return Header.TotalSamples;
     }
 
     // 获取播放状态

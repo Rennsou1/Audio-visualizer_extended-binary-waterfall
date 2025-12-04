@@ -170,6 +170,7 @@ public class Generator
     private VgmVisualizer _currentVgmVisualizer = null;   // 当前 VGM 可视化器
     private VgmAudioSource _currentVgmAudioSource = null; // 当前 VGM 音频源
     private bool _isVgmMode = false;                      // 当前是否为 VGM 模式
+    private float _gradientMaskAlpha = 1f;                // 渐变遮罩透明度（VGM模式时淡出）
     
     // 可复用的 Paint 对象（避免每帧创建）
     private readonly SKPaint _fillPaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
@@ -422,7 +423,7 @@ public class Generator
         Logger.Info("静态 UI 图层已预渲染");
     }
     
-    // 绘制顶部 UI 标签（根据 MIDI/Audio 模式显示不同内容）
+    // 绘制顶部 UI 标签（根据 MIDI/VGM/Audio 模式显示不同内容）
     private void DrawTopUILabels(SubFile currentSubfile, double currentTimeMs)
     {
         if (_frameCanvas == null) return;
@@ -430,26 +431,36 @@ public class Generator
         var dimGray = new SKColor(105, 105, 105);
         float labelY = 32;
         
-        // 检测是否为 MIDI 模式
+        // 检测模式
         bool isMidi = currentSubfile?.IsMidi == true && currentSubfile.MidiMetadata != null;
+        bool isVgm = _currentVgmVisualizer != null && _currentVgmAudioSource != null;
         _isMidiMode = isMidi;
         
-        // 左上角：A/V SETTINGS 或 MIDI SETTINGS
-        string leftLabel = isMidi ? "MIDI SETTINGS" : "A/V SETTINGS";
+        // 左上角标签
+        string leftLabel;
+        if (isVgm) leftLabel = "CHIPS";
+        else if (isMidi) leftLabel = "MIDI SETTINGS";
+        else leftLabel = "A/V SETTINGS";
         DrawText(32, labelY, _fontSize16, leftLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Left);
         
-        // 中间偏右：BITRATE 或 POLYPHONY
+        // 中间偏右标签
         float midRightX = OutputVideoWidth - 280;
-        string midLabel = isMidi ? "POLYPHONY" : "BITRATE";
+        string midLabel;
+        if (isVgm) midLabel = "VGM VERSION";
+        else if (isMidi) midLabel = "POLYPHONY";
+        else midLabel = "BITRATE";
         DrawText(midRightX, labelY, _fontSize16, midLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Right);
         
-        // 右上角：ABS. OFFSET 或 NOTE
+        // 右上角标签
         float rightX = OutputVideoWidth - 32;
-        string rightLabel = isMidi ? "NOTE" : "ABS. OFFSET";
+        string rightLabel;
+        if (isVgm) rightLabel = "SAMPLE OFFSET";
+        else if (isMidi) rightLabel = "NOTE";
+        else rightLabel = "ABS. OFFSET";
         DrawText(rightX, labelY, _fontSize16, rightLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Right);
     }
     
-    // 绘制顶部 UI 数值（根据 MIDI/Audio 模式显示不同内容）
+    // 绘制顶部 UI 数值（根据 MIDI/VGM/Audio 模式显示不同内容）
     private void DrawTopUIValues(SubFile currentSubfile, long currentOffset, string avSettingsString, 
         string readSpeedString, double currentTimeMs)
     {
@@ -457,10 +468,23 @@ public class Generator
         
         float valueY = 32 + _fontSize16 + 8;
         bool isMidi = currentSubfile?.IsMidi == true && currentSubfile.MidiMetadata != null;
+        bool isVgm = _currentVgmVisualizer != null && _currentVgmAudioSource != null;
         var meta = currentSubfile?.MidiMetadata;
         
         // 左上角数值
-        if (isMidi && meta != null)
+        if (isVgm)
+        {
+            // VGM 模式：显示芯片信息
+            var chipStates = _currentVgmVisualizer.ChipStates;
+            var parts = new List<string>();
+            foreach (var chip in chipStates)
+            {
+                double mhz = chip.Info.Clock / 1000000.0;
+                parts.Add($"{chip.Info.Name} @{mhz:F2}MHz, {chip.Info.ChannelCount}ch");
+            }
+            DrawText(32, valueY, _fontSize24, string.Join("\n", parts), SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
+        }
+        else if (isMidi && meta != null)
         {
             // MIDI 模式：显示 TEMPO, TIME SIG, CHANNELS, TYPE + SoundFont
             double bpm = meta.GetBpmAtTime(currentTimeMs);
@@ -485,7 +509,13 @@ public class Generator
         
         // 中间偏右数值
         float midRightX = OutputVideoWidth - 280;
-        if (isMidi && meta != null && _currentMidiVisualizer != null)
+        if (isVgm)
+        {
+            // VGM 模式：显示版本
+            string vgmVersion = _currentVgmVisualizer.GetVersionString();
+            DrawText(midRightX, valueY, _fontSize24, vgmVersion, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+        }
+        else if (isMidi && meta != null && _currentMidiVisualizer != null)
         {
             // MIDI 模式：显示当前复音数/最大复音数
             _currentPolyphony = _currentMidiVisualizer.GetActiveNoteCount(currentTimeMs, _visibleNotesBuffer);
@@ -505,7 +535,17 @@ public class Generator
         
         // 右上角数值
         float rightX = OutputVideoWidth - 32;
-        if (isMidi && meta != null && _currentMidiVisualizer != null)
+        if (isVgm)
+        {
+            // VGM 模式：显示采样偏移和循环次数
+            uint currentSample = _currentVgmAudioSource.GetCurrentSampleOffset();
+            uint maxSample = _currentVgmAudioSource.GetMaxSampleOffset();
+            int currentLoop = _currentVgmAudioSource.GetCurrentLoop();
+            int maxLoop = _currentVgmAudioSource.LoopCount;
+            string sampleInfo = $"{currentSample:N0} / {maxSample:N0}\nLoop: {currentLoop} / {maxLoop}";
+            DrawText(rightX, valueY, _fontSize24, sampleInfo, SKColors.White, VerticalAlign.Top, HorizontalAlign.Right);
+        }
+        else if (isMidi && meta != null && _currentMidiVisualizer != null)
         {
             // MIDI 模式：显示已播放音符数/总音符数
             _currentPlayingNotes = _currentMidiVisualizer.GetPlayedNoteCount(currentTimeMs);
@@ -2482,7 +2522,10 @@ public class Generator
             float subfileY = listTop + subfileRowH / 2f - (subfileWindowIndex - firstSubfileIndex) * subfileRowH;
             float minSubfileY = rightPanelTop;
 
-            // 直接绘制子文件列表（预渲染缓存反而更慢）
+            // VGM 模式标记（用于遮罩淡入淡出）
+            bool isVgmModeForList = _currentVgmVisualizer != null && _currentVgmAudioSource != null;
+
+            // 绘制子文件列表（VGM文件也在列表中正常显示）
             for (int sfi = firstSubfileIndex; sfi <= lastSubfileIndex; sfi++)
             {
                 if (sfi < 0 || sfi >= _subfiles.Count) { subfileY += subfileRowH; continue; }
@@ -2497,13 +2540,39 @@ public class Generator
                 string sizeText = Utils.ToByteSizeString(subfile.Length);
                 float sizeWidth = MeasureTextWidth(sizeText, _fontSize24);
                 float textStartX = subfileX1 + 24 * s;
-                float availableWidth = subfileX2 - textStartX - sizeWidth - 16 * s;  // 留出间距
+                float availableWidth = subfileX2 - textStartX - sizeWidth - 16 * s;
                 
-                // 根据可用宽度动态截断文本
-                string displayLine = $"{Utils.GetFileTypeEmoji(subfile)} {BuildSubfileDisplayLine(subfile)}";
-                string truncatedLine = ClampTextToWidth(displayLine, _fontSize24, availableWidth);
+                // 检查是否为VGM文件
+                bool isVgmFile = subfile.Path != null && 
+                    (subfile.Path.EndsWith(".vgm", StringComparison.OrdinalIgnoreCase) ||
+                     subfile.Path.EndsWith(".vgz", StringComparison.OrdinalIgnoreCase));
                 
-                DrawText(textStartX, subfileY, _fontSize24, truncatedLine, SKColors.White, VerticalAlign.Center);
+                if (isVgmFile && isMainSubfile && _currentVgmVisualizer != null)
+                {
+                    // VGM文件特殊显示：Title // Artist (Chips)（白色）
+                    var gd3 = _currentVgmVisualizer.Gd3;
+                    var lang = _currentVgmVisualizer.Gd3Language;
+                    string chips = _currentVgmVisualizer.GetChipsString();
+                    
+                    string trackName = gd3?.GetTrackName(lang) ?? System.IO.Path.GetFileNameWithoutExtension(subfile.FileName);
+                    string author = gd3?.GetAuthor(lang) ?? "";
+                    
+                    // 白色行：Title // Artist (Chips)
+                    string whiteLine = trackName;
+                    if (!string.IsNullOrEmpty(author)) whiteLine += $" // {author}";
+                    if (!string.IsNullOrEmpty(chips)) whiteLine += $" ({chips})";
+                    whiteLine = ClampTextToWidth(whiteLine, _fontSize24, availableWidth);
+                    
+                    DrawText(textStartX, subfileY, _fontSize24, whiteLine, SKColors.White, VerticalAlign.Center);
+                }
+                else
+                {
+                    // 普通文件显示方式
+                    string displayLine = $"{Utils.GetFileTypeEmoji(subfile)} {BuildSubfileDisplayLine(subfile)}";
+                    string truncatedLine = ClampTextToWidth(displayLine, _fontSize24, availableWidth);
+                    DrawText(textStartX, subfileY, _fontSize24, truncatedLine, SKColors.White, VerticalAlign.Center);
+                }
+                
                 DrawText(subfileX2, subfileY, _fontSize24, sizeText, SKColors.DimGray, VerticalAlign.Center, HorizontalAlign.Right);
 
                 if (isMainSubfile)
@@ -2620,7 +2689,13 @@ public class Generator
             string albumHeaderText;
             {
                 var sfValue = currentSubfileValue;
-                if (sfValue != null && !string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
+                // VGM模式：显示游戏名
+                if (isVgmModeForList && _currentVgmVisualizer?.Gd3 != null)
+                {
+                    string gameName = _currentVgmVisualizer.Gd3.GetGameName(_currentVgmVisualizer.Gd3Language);
+                    albumHeaderText = !string.IsNullOrEmpty(gameName) ? gameName : (sfValue?.FileDirectory ?? string.Empty);
+                }
+                else if (sfValue != null && !string.IsNullOrWhiteSpace(sfValue.AlbumTitle))
                 {
                     albumHeaderText = sfValue.AlbumTitle;
                     if (!string.IsNullOrWhiteSpace(sfValue.AlbumArtistName))
@@ -2634,22 +2709,35 @@ public class Generator
                 }
             }
 
-            // 淡出遮罩
+            // 淡出遮罩（VGM模式时淡出）
             float bottomPanelTop = OutputVideoHeight - 120f * s;
             float correctedShadowY2 = Math.Min(shadowY2, bottomPanelTop);
             
+            // 更新遮罩透明度（VGM模式时淡出，其他模式淡入）
+            float targetMaskAlpha = isVgmModeForList ? 0f : 1f;
+            float maskSpeed = 0.15f;  // 快→慢的缓动速度
+            _gradientMaskAlpha += (targetMaskAlpha - _gradientMaskAlpha) * maskSpeed;
+            
             float gradientHeight = subfileH * 2f;
             EnsureGradientShadersCached(shadowY1, correctedShadowY2, gradientHeight);
-            // 使用复用画笔绘制渐变遮罩
-            if (_cachedTopGradientShader != null)
+            
+            // 使用复用画笔绘制渐变遮罩（仅当透明度>0时绘制）
+            if (_gradientMaskAlpha > 0.01f)
             {
-                _gradientPaint.Shader = _cachedTopGradientShader;
-                _frameCanvas.DrawRect(new SKRect(0, shadowY1, OutputVideoWidth, shadowY1 + gradientHeight), _gradientPaint);
-            }
-            if (_cachedBottomGradientShader != null)
-            {
-                _gradientPaint.Shader = _cachedBottomGradientShader;
-                _frameCanvas.DrawRect(new SKRect(0, shadowY2 - gradientHeight, OutputVideoWidth, shadowY2), _gradientPaint);
+                byte maskAlpha = (byte)(255 * _gradientMaskAlpha);
+                if (_cachedTopGradientShader != null)
+                {
+                    _gradientPaint.Shader = _cachedTopGradientShader;
+                    _gradientPaint.Color = new SKColor(255, 255, 255, maskAlpha);
+                    _frameCanvas.DrawRect(new SKRect(0, shadowY1, OutputVideoWidth, shadowY1 + gradientHeight), _gradientPaint);
+                }
+                if (_cachedBottomGradientShader != null)
+                {
+                    _gradientPaint.Shader = _cachedBottomGradientShader;
+                    _gradientPaint.Color = new SKColor(255, 255, 255, maskAlpha);
+                    _frameCanvas.DrawRect(new SKRect(0, shadowY2 - gradientHeight, OutputVideoWidth, shadowY2), _gradientPaint);
+                }
+                _gradientPaint.Color = SKColors.White;
             }
 
             // 专辑标题直接绘制
@@ -2773,7 +2861,34 @@ public class Generator
         SKBitmap coverImage = null;
         float[] waveformPeaks = null;
         
-        if (subfile != null)
+        // VGM 模式特殊处理
+        bool isVgm = _currentVgmVisualizer != null && _currentVgmAudioSource != null;
+        if (isVgm)
+        {
+            var gd3 = _currentVgmVisualizer.Gd3;
+            var lang = _currentVgmVisualizer.Gd3Language;
+            string chips = _currentVgmVisualizer.GetChipsString();
+            
+            if (gd3 != null)
+            {
+                trackName = gd3.GetTrackName(lang);
+                composerName = gd3.GetAuthor(lang);
+                genreText = chips;
+            }
+            else
+            {
+                trackName = System.IO.Path.GetFileNameWithoutExtension(InputFilePath);
+                genreText = chips;
+            }
+            
+            totalTime = TimeSpan.FromSeconds(_currentVgmAudioSource.Duration);
+            currentTime = TimeSpan.FromSeconds(_currentVgmAudioSource.GetPosition());
+            trackProgress = (float)(currentTime.TotalSeconds / Math.Max(0.1, totalTime.TotalSeconds));
+            
+            // 使用subfile的预计算波形数据
+            waveformPeaks = subfile?.WaveformPeaks;
+        }
+        else if (subfile != null)
         {
             // MIDI 文件优先使用元数据中的标题，否则使用 TrackTitle 或文件名
             if (subfile.IsMidi && subfile.MidiMetadata?.Title != null)
@@ -3036,7 +3151,8 @@ public class Generator
                     animGenreX = _prevGenreLabelX;
                     genreAlpha = (byte)(255 * (1f - animT));
                 }
-                DrawText(animGenreX, labelY, _fontSize16, "Genre:", new SKColor(105, 105, 105, genreAlpha));
+                string genreLabelAnim = isVgm ? "Chips:" : "Genre:";
+                DrawText(animGenreX, labelY, _fontSize16, genreLabelAnim, new SKColor(105, 105, 105, genreAlpha));
             }
         }
         else
@@ -3048,7 +3164,8 @@ public class Generator
             }
             if (hasGenre)
             {
-                DrawText(genreStartX, labelY, _fontSize16, "Genre:", labelColor);
+                string genreLabel = isVgm ? "Chips:" : "Genre:";
+                DrawText(genreStartX, labelY, _fontSize16, genreLabel, labelColor);
             }
             
             // 更新前一首标签位置
@@ -4242,7 +4359,7 @@ public class Generator
         }
     }
     
-    // 绘制 VGM 芯片可视化
+    // 绘制 VGM 芯片可视化（纯白灰黑色方案，仅显示芯片通道）
     private void DrawChipView(SKRect region, double currentTimeMs, SubFile currentSubfile = null)
     {
         if (_currentVgmVisualizer == null) return;
@@ -4250,130 +4367,179 @@ public class Generator
         // 更新芯片状态到当前时间
         _currentVgmVisualizer.UpdateToTime(currentTimeMs);
         
-        float scale = ResolutionScale;
-        float chipPanelHeight = 120 * scale;
-        float padding = 16 * scale;
+        float s = ResolutionScale;
+        float padding = 12 * s;
         
-        // 获取芯片列表
+        // 颜色定义
+        var colorLabel = new SKColor(200, 200, 200);
+        var colorLabelOff = new SKColor(80, 80, 80);
+        var colorOctaveLabel = new SKColor(120, 120, 120);
+        
         var chipStates = _currentVgmVisualizer.ChipStates;
         if (chipStates.Count == 0) return;
         
-        // 计算布局
-        float totalHeight = chipStates.Count * chipPanelHeight;
-        float startY = region.Top + (region.Height - totalHeight) / 2f;
+        // 布局参数
+        float areaLeft = region.Left + padding;
+        float areaTop = region.Top + padding;
+        float areaWidth = region.Width - padding * 2;
+        float areaHeight = region.Height - padding * 2;
         
-        // 绘制每个芯片面板
-        for (int chipIdx = 0; chipIdx < chipStates.Count; chipIdx++)
+        // 统计总通道数
+        int totalChannels = 0;
+        foreach (var chip in chipStates)
+            totalChannels += chip.Channels?.Length ?? 0;
+        
+        // 八度标记行高度
+        float octaveLabelHeight = 14 * s;
+        // 通道行高度
+        float rowHeight = Math.Min(16 * s, (areaHeight - octaveLabelHeight) / Math.Max(totalChannels, 1));
+        rowHeight = Math.Max(rowHeight, 10 * s);
+        
+        // 列宽定义
+        float labelWidth = 50 * s;
+        float noteNameWidth = 32 * s;
+        float volumeBarWidth = 50 * s;
+        float gapWidth = 4 * s;
+        
+        // 钢琴区域宽度（剩余空间）
+        float pianoWidth = areaWidth - labelWidth - noteNameWidth - volumeBarWidth - gapWidth * 3;
+        pianoWidth = Math.Max(pianoWidth, 100 * s);
+        
+        // 钢琴参数（8个八度，96个半音）
+        int totalOctaves = 8;
+        int totalKeys = totalOctaves * 12;
+        float keyWidth = pianoWidth / totalKeys;
+        
+        // 绘制八度标记（顶部）
+        float pianoX = areaLeft + labelWidth + gapWidth;
+        for (int oct = 0; oct < totalOctaves; oct++)
         {
-            var chip = chipStates[chipIdx];
-            float panelY = startY + chipIdx * chipPanelHeight;
-            var panelRect = new SKRect(region.Left + padding, panelY, 
-                                       region.Right - padding, panelY + chipPanelHeight - 8 * scale);
+            float octX = pianoX + oct * 12 * keyWidth;
+            string octLabel = $"o{oct}";
+            DrawText(octX + 6 * keyWidth, areaTop + octaveLabelHeight / 2, _fontSize16 * 0.5f,
+                     octLabel, colorOctaveLabel, VerticalAlign.Center, HorizontalAlign.Center);
+        }
+        
+        float rowY = areaTop + octaveLabelHeight;
+        
+        foreach (var chip in chipStates)
+        {
+            if (chip.Channels == null) continue;
             
-            // 面板背景
-            var chipColor = VgmVisualizer.GetChipColor(chipIdx);
-            _fillPaint.Color = new SKColor(chipColor.Red, chipColor.Green, chipColor.Blue, 40);
-            _frameCanvas.DrawRoundRect(panelRect, 8 * scale, 8 * scale, _fillPaint);
-            
-            // 芯片名称和时钟
-            string chipTitle = chip.Info.Name;
-            if (chip.Info.Clock > 0)
+            foreach (var channel in chip.Channels)
             {
-                double mhz = chip.Info.Clock / 1000000.0;
-                chipTitle += $" @ {mhz:F2} MHz";
-            }
-            DrawText(panelRect.Left + 12 * scale, panelY + 16 * scale, 
-                     _fontSize24, chipTitle, chipColor, VerticalAlign.Top);
-            
-            // 绘制通道键盘
-            if (chip.Channels != null && chip.Channels.Length > 0)
-            {
-                float channelStartX = panelRect.Left + 12 * scale;
-                float channelY = panelY + 48 * scale;
-                float channelWidth = (panelRect.Width - 24 * scale) / Math.Max(chip.Channels.Length, 1);
-                float channelHeight = 48 * scale;
+                if (rowY + rowHeight > region.Bottom - padding) break;
                 
-                for (int chIdx = 0; chIdx < chip.Channels.Length; chIdx++)
-                {
-                    var channel = chip.Channels[chIdx];
-                    float chX = channelStartX + chIdx * channelWidth;
-                    var chRect = new SKRect(chX + 2 * scale, channelY, 
-                                            chX + channelWidth - 2 * scale, channelY + channelHeight);
-                    
-                    // 通道背景（根据 KeyOn 状态）
-                    byte bgAlpha = channel.KeyOn ? (byte)160 : (byte)60;
-                    _fillPaint.Color = new SKColor(chipColor.Red, chipColor.Green, chipColor.Blue, bgAlpha);
-                    _frameCanvas.DrawRoundRect(chRect, 4 * scale, 4 * scale, _fillPaint);
-                    
-                    // 通道标签
-                    string chLabel = channel.Label ?? $"CH{chIdx + 1}";
-                    DrawText(chRect.MidX, channelY + 8 * scale, _fontSize16 * 0.75f, chLabel, 
-                             SKColors.White, VerticalAlign.Top, HorizontalAlign.Center);
-                    
-                    // 音符显示
-                    if (channel.Note >= 0)
-                    {
-                        string noteName = VgmVisualizer.GetNoteName(channel.Note);
-                        DrawText(chRect.MidX, channelY + 26 * scale, _fontSize16, noteName,
-                                 SKColors.White, VerticalAlign.Top, HorizontalAlign.Center);
-                    }
-                    
-                    // 音量条
-                    if (channel.Volume > 0)
-                    {
-                        float volRatio = channel.Volume / 127f;
-                        float volBarWidth = (chRect.Width - 8 * scale) * volRatio;
-                        float volBarY = channelY + channelHeight - 8 * scale;
-                        _fillPaint.Color = new SKColor(255, 255, 255, 180);
-                        _frameCanvas.DrawRect(chRect.Left + 4 * scale, volBarY, 
-                                              chRect.Left + 4 * scale + volBarWidth, volBarY + 4 * scale, _fillPaint);
-                    }
-                }
+                float colX = areaLeft;
+                bool isOn = channel.KeyOn && channel.Volume > 0;
+                
+                // 通道标签
+                string chLabel = channel.Label ?? "CH";
+                DrawText(colX, rowY + rowHeight / 2, _fontSize16 * 0.55f,
+                         chLabel, isOn ? colorLabel : colorLabelOff, VerticalAlign.Center);
+                colX = pianoX;
+                
+                // 钢琴方块键盘
+                DrawPianoBlocks(colX, rowY + 1 * s, pianoWidth, rowHeight - 2 * s, 
+                               channel.Note, isOn, totalOctaves);
+                colX += pianoWidth + gapWidth;
+                
+                // 音符名称
+                string noteName = channel.Note >= 0 ? VgmVisualizer.GetNoteName(channel.Note) : "--";
+                DrawText(colX, rowY + rowHeight / 2, _fontSize16 * 0.55f,
+                         noteName, isOn ? colorLabel : colorLabelOff, VerticalAlign.Center);
+                colX += noteNameWidth + gapWidth;
+                
+                // L/R音量条（双柱显示）
+                float barH = rowHeight - 4 * s;
+                DrawStereoVolumeBar(colX, rowY + 2 * s, volumeBarWidth, barH,
+                                   channel.DisplayPanLeft, channel.DisplayPanRight);
+                
+                rowY += rowHeight;
             }
+        }
+    }
+    
+    // 绘制方块式钢琴键盘
+    private void DrawPianoBlocks(float x, float y, float width, float height, int note, bool isOn, int octaves)
+    {
+        float s = ResolutionScale;
+        int totalKeys = octaves * 12;
+        float keyWidth = width / totalKeys;
+        float keyGap = 1 * s;
+        
+        // 颜色定义
+        var keyOffColor = new SKColor(50, 50, 50);
+        var keyOnColor = new SKColor(220, 220, 220);
+        var blackKeyOffColor = new SKColor(35, 35, 35);
+        
+        // 绘制所有键
+        for (int i = 0; i < totalKeys; i++)
+        {
+            int semitone = i % 12;
+            bool isBlackKey = semitone == 1 || semitone == 3 || semitone == 6 || semitone == 8 || semitone == 10;
+            // 音符范围检查：note 必须在 0 到 totalKeys-1 范围内
+            bool isActive = isOn && note >= 0 && note < totalKeys && note == i;
+            
+            float keyX = x + i * keyWidth;
+            var keyRect = new SKRect(keyX, y, keyX + keyWidth - keyGap, y + height);
+            
+            if (isActive)
+            {
+                _fillPaint.Color = keyOnColor;
+                _frameCanvas.DrawRect(keyRect, _fillPaint);
+            }
+            else
+            {
+                _fillPaint.Color = isBlackKey ? blackKeyOffColor : keyOffColor;
+                _frameCanvas.DrawRect(keyRect, _fillPaint);
+            }
+        }
+    }
+    
+    // 绘制立体声音量条（L/R双柱横向显示）
+    private void DrawStereoVolumeBar(float x, float y, float width, float height, float leftLevel, float rightLevel)
+    {
+        float s = ResolutionScale;
+        float barHeight = (height - 2 * s) / 2;
+        
+        var bgColor = new SKColor(40, 40, 40);
+        var barColor = new SKColor(180, 180, 180);
+        
+        // L 声道（上）
+        var lBgRect = new SKRect(x, y, x + width, y + barHeight);
+        _fillPaint.Color = bgColor;
+        _frameCanvas.DrawRect(lBgRect, _fillPaint);
+        
+        float lWidth = width * Math.Clamp(leftLevel, 0, 1);
+        if (lWidth > 0)
+        {
+            var lBarRect = new SKRect(x, y, x + lWidth, y + barHeight);
+            _fillPaint.Color = barColor;
+            _frameCanvas.DrawRect(lBarRect, _fillPaint);
         }
         
-        // 显示系统名称和曲目信息
-        string systemName = _currentVgmVisualizer.SystemName;
-        if (!string.IsNullOrEmpty(systemName))
-        {
-            DrawText(region.Left + padding, region.Top + padding, _fontSize16, 
-                     systemName, new SKColor(180, 180, 180), VerticalAlign.Top);
-        }
+        // R 声道（下）
+        float rY = y + barHeight + 2 * s;
+        var rBgRect = new SKRect(x, rY, x + width, rY + barHeight);
+        _fillPaint.Color = bgColor;
+        _frameCanvas.DrawRect(rBgRect, _fillPaint);
         
-        // 显示 GD3 标签信息
-        var gd3 = _currentVgmVisualizer.Gd3;
-        if (gd3 != null)
+        float rWidth = width * Math.Clamp(rightLevel, 0, 1);
+        if (rWidth > 0)
         {
-            var lang = _currentVgmVisualizer.Gd3Language;
-            string trackName = gd3.GetTrackName(lang);
-            string gameName = gd3.GetGameName(lang);
-            string author = gd3.GetAuthor(lang);
-            
-            float infoY = region.Top + padding;
-            
-            // 曲目名
-            if (!string.IsNullOrEmpty(trackName))
-            {
-                DrawText(region.Right - padding, infoY, _fontSize16,
-                         trackName, new SKColor(220, 220, 220), VerticalAlign.Top, HorizontalAlign.Right);
-                infoY += _fontSize16 * 1.3f;
-            }
-            
-            // 游戏名
-            if (!string.IsNullOrEmpty(gameName))
-            {
-                DrawText(region.Right - padding, infoY, _fontSize16 * 0.85f,
-                         gameName, new SKColor(180, 180, 180), VerticalAlign.Top, HorizontalAlign.Right);
-                infoY += _fontSize16 * 1.1f;
-            }
-            
-            // 作者
-            if (!string.IsNullOrEmpty(author))
-            {
-                DrawText(region.Right - padding, infoY, _fontSize16 * 0.75f,
-                         "by " + author, new SKColor(150, 150, 150), VerticalAlign.Top, HorizontalAlign.Right);
-            }
+            var rBarRect = new SKRect(x, rY, x + rWidth, rY + barHeight);
+            _fillPaint.Color = barColor;
+            _frameCanvas.DrawRect(rBarRect, _fillPaint);
         }
+    }
+    
+    // 格式化时间
+    private static string FormatTime(double seconds)
+    {
+        int mins = (int)(seconds / 60);
+        int secs = (int)(seconds % 60);
+        return $"{mins}:{secs:D2}";
     }
     #endregion
 }

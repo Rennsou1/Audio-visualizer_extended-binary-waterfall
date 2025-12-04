@@ -14,3 +14,8 @@ publish.md
 publish
 doc.md
 README.MD
+libvgm-src
+libvgm-build
+libvgm-wrapper
+.windsurf
+.vscode

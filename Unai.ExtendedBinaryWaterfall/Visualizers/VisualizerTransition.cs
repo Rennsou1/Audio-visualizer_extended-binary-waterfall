@@ -6,7 +6,8 @@ namespace Unai.ExtendedBinaryWaterfall;
 public enum VisualizerMode
 {
     BinaryWaterfall,  // 二进制瀑布（默认）
-    PianoRoll         // 钢琴卷帘（MIDI）
+    PianoRoll,        // 钢琴卷帘（MIDI）
+    VgmView           // VGM 芯片可视化
 }
 
 // 可视化模式切换动画控制器
@@ -21,6 +22,7 @@ public class VisualizerTransition
     // 播放头 Y 位置动画相关
     private float _playheadCurrentY = 0f;    // 当前播放头 Y 位置
     private float _playheadTargetY = 0f;     // 目标播放头 Y 位置
+    private float _playheadStartY = 0f;      // 动画开始时的 Y 位置（固定值，避免飘动）
     private float _playheadAnimProgress = 1f; // 播放头动画进度（0=开始, 1=完成）
     private bool _playheadAnimating = false;  // 是否正在动画中
     private float _playheadWaterfallY = 0f;   // 瀑布模式下的实际 Y 位置（持续更新）
@@ -72,6 +74,12 @@ public class VisualizerTransition
             // 启动播放头动画
             _playheadAnimProgress = 0f;
             _playheadAnimating = true;
+            
+            // 保存动画起始位置（固定值，避免动画过程中飘动）
+            _playheadStartY = (newMode == VisualizerMode.PianoRoll) 
+                ? _playheadWaterfallY   // 从瀑布位置开始
+                : _playheadPianoRollY;  // 从钢琴窗位置开始
+            
             // 目标位置：钢琴窗模式用居中位置，瀑布模式用当前瀑布位置
             _playheadTargetY = (newMode == VisualizerMode.PianoRoll) 
                 ? _playheadPianoRollY 
@@ -112,12 +120,9 @@ public class VisualizerTransition
             }
             else
             {
-                // 使用 EaseOutCubic 缓动
+                // 使用 EaseOutCubic 缓动，从固定的起始位置滑动（避免飘动）
                 float eased = EaseOutCubic(_playheadAnimProgress);
-                float startY = (_targetMode == VisualizerMode.PianoRoll) 
-                    ? _playheadWaterfallY  // 从瀑布位置开始
-                    : _playheadPianoRollY; // 从钢琴窗位置开始
-                _playheadCurrentY = startY + (_playheadTargetY - startY) * eased;
+                _playheadCurrentY = _playheadStartY + (_playheadTargetY - _playheadStartY) * eased;
             }
         }
         else
@@ -168,6 +173,7 @@ public class VisualizerTransition
         {
             VisualizerMode.BinaryWaterfall => "Binary Waterfall",
             VisualizerMode.PianoRoll => "Piano Roll",
+            VisualizerMode.VgmView => "VGM View",
             _ => ""
         };
 
@@ -211,6 +217,8 @@ public class VisualizerTransition
         {
             ".mid" => VisualizerMode.PianoRoll,
             ".midi" => VisualizerMode.PianoRoll,
+            ".vgm" => VisualizerMode.VgmView,
+            ".vgz" => VisualizerMode.VgmView,
             _ => VisualizerMode.BinaryWaterfall
         };
     }

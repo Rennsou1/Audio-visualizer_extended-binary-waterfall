@@ -166,6 +166,11 @@ public class Generator
     // MIDI 钢琴窗口流速（可通过 GUI 配置）
     public int PianoRollWindowMs { get; set; } = 4000;
     
+    // VGM 芯片可视化相关
+    private VgmVisualizer _currentVgmVisualizer = null;   // 当前 VGM 可视化器
+    private VgmAudioSource _currentVgmAudioSource = null; // 当前 VGM 音频源
+    private bool _isVgmMode = false;                      // 当前是否为 VGM 模式
+    
     // 可复用的 Paint 对象（避免每帧创建）
     private readonly SKPaint _fillPaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
     private readonly SKPaint _strokePaint = new() { IsAntialias = true, Style = SKPaintStyle.Stroke };
@@ -920,6 +925,7 @@ public class Generator
             {
                 // 单文件模式
                 bool isMidi = MidiAudioSourceFactory.IsMidiFile(InputFilePath);
+                bool isVgm = IsVgmFile(InputFilePath);
                 
                 if (isMidi)
                 {
@@ -934,6 +940,51 @@ public class Generator
                     long audioLength = _audioSampleSource.Length;
                     double durationSeconds = audioLength / (double)(wf.SampleRate * wf.Channels);
                     Logger.Info($"[MIDI] 渲染完成: {durationSeconds:F2}s, {audioLength} samples");
+                }
+                else if (isVgm)
+                {
+                    // VGM 文件使用 libvgm 渲染
+                    Logger.Info($"[VGM] 使用 libvgm 渲染: {Path.GetFileName(InputFilePath)}");
+                    _currentVgmAudioSource = new VgmAudioSource();
+                    if (_currentVgmAudioSource.LoadFile(InputFilePath))
+                    {
+                        _audioSampleSource = _currentVgmAudioSource;
+                        var wf = _currentVgmAudioSource.WaveFormat;
+                        AudioDecoderSampleRate = wf.SampleRate;
+                        AudioDecoderChannelCount = wf.Channels;
+                        
+                        long audioLength = _currentVgmAudioSource.Length;
+                        double durationSeconds = audioLength / (double)(wf.SampleRate * wf.Channels);
+                        Logger.Info($"[VGM] 渲染准备完成: {durationSeconds:F2}s");
+                        
+                        // 初始化 VGM 可视化器
+                        _currentVgmVisualizer = new VgmVisualizer();
+                        _currentVgmVisualizer.Initialize(_currentVgmAudioSource);
+                        
+                        // 加载 VGM 数据用于命令解析
+                        try
+                        {
+                            byte[] vgmData = System.IO.File.ReadAllBytes(InputFilePath);
+                            if (InputFilePath.EndsWith(".vgz", StringComparison.OrdinalIgnoreCase))
+                            {
+                                using var ms = new System.IO.MemoryStream(vgmData);
+                                using var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Decompress);
+                                using var output = new System.IO.MemoryStream();
+                                gz.CopyTo(output);
+                                vgmData = output.ToArray();
+                            }
+                            _currentVgmVisualizer.LoadVgmData(vgmData, _currentVgmAudioSource.Header);
+                            Logger.Info($"[VGM] 可视化器初始化: {_currentVgmVisualizer.SystemName}");
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warning($"[VGM] 加载可视化数据失败: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        Logger.Error("[VGM] 无法加载 VGM 文件");
+                    }
                 }
                 else
                 {
@@ -1300,10 +1351,29 @@ public class Generator
                         audioBitDepth = 32;
                         Logger.Debug($"[ParseSubfiles] MIDI {System.IO.Path.GetFileName(filePath)}: duration={durationSeconds:F2}s");
                     }
+                    else if (IsVgmFile(filePath))
+                    {
+                        // VGM 文件使用 VgmFormat 获取时长
+                        var header = VgmFormat.LoadHeader(filePath);
+                        durationSeconds = VgmFormat.GetDurationSeconds(header);
+                        
+                        // 考虑循环
+                        if (header.LoopSamples > 0)
+                        {
+                            double loopSec = header.LoopSamples / 44100.0;
+                            durationSeconds += loopSec * 2;  // 默认循环 2 次
+                        }
+                        
+                        if (durationSeconds < 0.1) durationSeconds = 60.0;
+                        fileLength = (long)(durationSeconds * InputBytesPerSecond);
+                        audioSampleRate = 44100;
+                        audioChannels = 2;
+                        audioBitDepth = 16;
+                        Logger.Debug($"[ParseSubfiles] VGM {System.IO.Path.GetFileName(filePath)}: duration={durationSeconds:F2}s, chips={VgmFormat.GetChipList(header).Length}");
+                    }
                     else
                     {
-                        //非 MIDI操作
-                        // 使用 FfmpegAudioDecoder 获取准确的音频时长和格式信息
+                        //非 MIDI/VGM 文件使用 FfmpegAudioDecoder 获取准确的音频时长和格式信息
                         // 同时计算波形 RMS
                         using var decoder = new FfmpegAudioDecoder(filePath);
                         var wf = decoder.WaveFormat;
@@ -1469,6 +1539,13 @@ public class Generator
 
         // 尝试为每个子文件填充音频元数据
         PopulateSubfileMetadata();
+    }
+
+    // 检查文件是否为 VGM 格式
+    private static bool IsVgmFile(string filePath)
+    {
+        string ext = System.IO.Path.GetExtension(filePath).ToLowerInvariant();
+        return ext == ".vgm" || ext == ".vgz";
     }
 
     /// 使用 TagLib 为每个子文件填充基础音频元数据：专辑、碟号、曲号、曲名、艺术家和风格。
@@ -1738,14 +1815,24 @@ public class Generator
             
             try
             {
-                // 根据文件类型选择解码器：MIDI 使用 FluidSynth，其他使用 FFmpeg
+                // 根据文件类型选择解码器
                 ISampleSource sampleSource;
                 bool isMidi = MidiAudioSourceFactory.IsMidiFile(sf.Path);
+                bool isVgm = IsVgmFile(sf.Path);
                 
                 if (isMidi)
                 {
                     // MIDI 文件使用 FluidSynth 渲染
                     sampleSource = MidiAudioSourceFactory.Create(sf.Path, 48000, 2);
+                }
+                else if (isVgm)
+                {
+                    // VGM 文件跳过波形预计算（使用占位波形）
+                    sf.WaveformPeaks = new float[rmsCount];
+                    for (int i = 0; i < rmsCount; i++) sf.WaveformPeaks[i] = 0.5f;
+                    sf.AudioPeak = 1.0f;
+                    Logger.Debug($"[PrecomputeWaveforms] VGM {sf.FileName}: 使用占位波形");
+                    continue;
                 }
                 else
                 {
@@ -2320,6 +2407,47 @@ public class Generator
                         _drumVelocities.Clear();
                     }
                 }
+                
+                // 如果是 VGM 文件，确保可视化器已加载
+                if (requiredMode == VisualizerMode.VgmView && !string.IsNullOrEmpty(currentFilePath))
+                {
+                    if (_currentVgmVisualizer == null)
+                    {
+                        _currentVgmVisualizer = new VgmVisualizer();
+                    }
+                    
+                    // 加载 VGM 音频源（如果尚未加载或文件不同）
+                    if (_currentVgmAudioSource == null || _currentVgmAudioSource.Header.DataOffset == 0)
+                    {
+                        _currentVgmAudioSource = new VgmAudioSource();
+                        if (_currentVgmAudioSource.LoadFile(currentFilePath))
+                        {
+                            _currentVgmVisualizer.Initialize(_currentVgmAudioSource);
+                            
+                            // 加载原始 VGM 数据用于命令解析
+                            try
+                            {
+                                byte[] vgmData = System.IO.File.ReadAllBytes(currentFilePath);
+                                // 如果是 .vgz 文件需要解压
+                                if (currentFilePath.EndsWith(".vgz", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    using var ms = new System.IO.MemoryStream(vgmData);
+                                    using var gz = new System.IO.Compression.GZipStream(ms, System.IO.Compression.CompressionMode.Decompress);
+                                    using var output = new System.IO.MemoryStream();
+                                    gz.CopyTo(output);
+                                    vgmData = output.ToArray();
+                                }
+                                _currentVgmVisualizer.LoadVgmData(vgmData, _currentVgmAudioSource.Header);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Warning($"[Generator] 加载 VGM 数据失败: {ex.Message}");
+                            }
+                            
+                            Logger.Info($"[Generator] 已加载 VGM: {_currentVgmVisualizer.SystemName}");
+                        }
+                    }
+                }
             }
             
             // 更新可视化切换动画
@@ -2412,8 +2540,9 @@ public class Generator
             var visualizerRegion = new SKRect(_videoFrameX1, _videoFrameY1, 
                 _videoFrameX1 + WaterfallScaledWidth, _videoFrameY1 + WaterfallScaledHeight);
             
-            // 绘制瀑布（如果可见）
-            if (waterfallSlideOffset > -WaterfallScaledWidth && _viewportFramebuf != null)
+            // 绘制瀑布（如果可见，且不是 VGM 模式）
+            bool isVgmMode = _visualizerTransition.TargetMode == VisualizerMode.VgmView;
+            if (!isVgmMode && waterfallSlideOffset > -WaterfallScaledWidth && _viewportFramebuf != null)
             {
                 _frameCanvas.Save();
                 _frameCanvas.ClipRect(visualizerRegion);
@@ -2421,8 +2550,8 @@ public class Generator
                 _frameCanvas.Restore();
             }
             
-            // 绘制钢琴卷帘（如果可见）
-            if (pianoRollSlideOffset < WaterfallScaledWidth && _currentMidiVisualizer != null)
+            // 绘制钢琴卷帘（如果可见，且不是 VGM 模式）
+            if (!isVgmMode && pianoRollSlideOffset < WaterfallScaledWidth && _currentMidiVisualizer != null)
             {
                 _frameCanvas.Save();
                 _frameCanvas.ClipRect(visualizerRegion);
@@ -2436,6 +2565,23 @@ public class Generator
                 }
                 
                 DrawPianoRoll(visualizerRegion, currentTimeMs, currentSubfileValue);
+                _frameCanvas.Restore();
+            }
+            
+            // 绘制芯片视图（VGM 模式）
+            if (_visualizerTransition.TargetMode == VisualizerMode.VgmView && _currentVgmVisualizer != null)
+            {
+                _frameCanvas.Save();
+                _frameCanvas.ClipRect(visualizerRegion);
+                
+                // 计算当前播放时间（毫秒）
+                double currentTimeMs = (double)frameNumber / OutputFps * 1000.0;
+                if (currentSubfileValue != null && currentSubfileValue.AudioStartTime > 0)
+                {
+                    currentTimeMs = ((double)frameNumber / OutputFps - currentSubfileValue.AudioStartTime) * 1000.0;
+                }
+                
+                DrawChipView(visualizerRegion, currentTimeMs, currentSubfileValue);
                 _frameCanvas.Restore();
             }
             
@@ -4092,6 +4238,140 @@ public class Generator
                     _fillPaint.Color = new SKColor(255, 255, 255, barAlpha);
                     _frameCanvas.DrawRect(new SKRect(barX, barY, barX + velocityBarWidth, drumY + drumSize), _fillPaint);
                 }
+            }
+        }
+    }
+    
+    // 绘制 VGM 芯片可视化
+    private void DrawChipView(SKRect region, double currentTimeMs, SubFile currentSubfile = null)
+    {
+        if (_currentVgmVisualizer == null) return;
+        
+        // 更新芯片状态到当前时间
+        _currentVgmVisualizer.UpdateToTime(currentTimeMs);
+        
+        float scale = ResolutionScale;
+        float chipPanelHeight = 120 * scale;
+        float padding = 16 * scale;
+        
+        // 获取芯片列表
+        var chipStates = _currentVgmVisualizer.ChipStates;
+        if (chipStates.Count == 0) return;
+        
+        // 计算布局
+        float totalHeight = chipStates.Count * chipPanelHeight;
+        float startY = region.Top + (region.Height - totalHeight) / 2f;
+        
+        // 绘制每个芯片面板
+        for (int chipIdx = 0; chipIdx < chipStates.Count; chipIdx++)
+        {
+            var chip = chipStates[chipIdx];
+            float panelY = startY + chipIdx * chipPanelHeight;
+            var panelRect = new SKRect(region.Left + padding, panelY, 
+                                       region.Right - padding, panelY + chipPanelHeight - 8 * scale);
+            
+            // 面板背景
+            var chipColor = VgmVisualizer.GetChipColor(chipIdx);
+            _fillPaint.Color = new SKColor(chipColor.Red, chipColor.Green, chipColor.Blue, 40);
+            _frameCanvas.DrawRoundRect(panelRect, 8 * scale, 8 * scale, _fillPaint);
+            
+            // 芯片名称和时钟
+            string chipTitle = chip.Info.Name;
+            if (chip.Info.Clock > 0)
+            {
+                double mhz = chip.Info.Clock / 1000000.0;
+                chipTitle += $" @ {mhz:F2} MHz";
+            }
+            DrawText(panelRect.Left + 12 * scale, panelY + 16 * scale, 
+                     _fontSize24, chipTitle, chipColor, VerticalAlign.Top);
+            
+            // 绘制通道键盘
+            if (chip.Channels != null && chip.Channels.Length > 0)
+            {
+                float channelStartX = panelRect.Left + 12 * scale;
+                float channelY = panelY + 48 * scale;
+                float channelWidth = (panelRect.Width - 24 * scale) / Math.Max(chip.Channels.Length, 1);
+                float channelHeight = 48 * scale;
+                
+                for (int chIdx = 0; chIdx < chip.Channels.Length; chIdx++)
+                {
+                    var channel = chip.Channels[chIdx];
+                    float chX = channelStartX + chIdx * channelWidth;
+                    var chRect = new SKRect(chX + 2 * scale, channelY, 
+                                            chX + channelWidth - 2 * scale, channelY + channelHeight);
+                    
+                    // 通道背景（根据 KeyOn 状态）
+                    byte bgAlpha = channel.KeyOn ? (byte)160 : (byte)60;
+                    _fillPaint.Color = new SKColor(chipColor.Red, chipColor.Green, chipColor.Blue, bgAlpha);
+                    _frameCanvas.DrawRoundRect(chRect, 4 * scale, 4 * scale, _fillPaint);
+                    
+                    // 通道标签
+                    string chLabel = channel.Label ?? $"CH{chIdx + 1}";
+                    DrawText(chRect.MidX, channelY + 8 * scale, _fontSize16 * 0.75f, chLabel, 
+                             SKColors.White, VerticalAlign.Top, HorizontalAlign.Center);
+                    
+                    // 音符显示
+                    if (channel.Note >= 0)
+                    {
+                        string noteName = VgmVisualizer.GetNoteName(channel.Note);
+                        DrawText(chRect.MidX, channelY + 26 * scale, _fontSize16, noteName,
+                                 SKColors.White, VerticalAlign.Top, HorizontalAlign.Center);
+                    }
+                    
+                    // 音量条
+                    if (channel.Volume > 0)
+                    {
+                        float volRatio = channel.Volume / 127f;
+                        float volBarWidth = (chRect.Width - 8 * scale) * volRatio;
+                        float volBarY = channelY + channelHeight - 8 * scale;
+                        _fillPaint.Color = new SKColor(255, 255, 255, 180);
+                        _frameCanvas.DrawRect(chRect.Left + 4 * scale, volBarY, 
+                                              chRect.Left + 4 * scale + volBarWidth, volBarY + 4 * scale, _fillPaint);
+                    }
+                }
+            }
+        }
+        
+        // 显示系统名称和曲目信息
+        string systemName = _currentVgmVisualizer.SystemName;
+        if (!string.IsNullOrEmpty(systemName))
+        {
+            DrawText(region.Left + padding, region.Top + padding, _fontSize16, 
+                     systemName, new SKColor(180, 180, 180), VerticalAlign.Top);
+        }
+        
+        // 显示 GD3 标签信息
+        var gd3 = _currentVgmVisualizer.Gd3;
+        if (gd3 != null)
+        {
+            var lang = _currentVgmVisualizer.Gd3Language;
+            string trackName = gd3.GetTrackName(lang);
+            string gameName = gd3.GetGameName(lang);
+            string author = gd3.GetAuthor(lang);
+            
+            float infoY = region.Top + padding;
+            
+            // 曲目名
+            if (!string.IsNullOrEmpty(trackName))
+            {
+                DrawText(region.Right - padding, infoY, _fontSize16,
+                         trackName, new SKColor(220, 220, 220), VerticalAlign.Top, HorizontalAlign.Right);
+                infoY += _fontSize16 * 1.3f;
+            }
+            
+            // 游戏名
+            if (!string.IsNullOrEmpty(gameName))
+            {
+                DrawText(region.Right - padding, infoY, _fontSize16 * 0.85f,
+                         gameName, new SKColor(180, 180, 180), VerticalAlign.Top, HorizontalAlign.Right);
+                infoY += _fontSize16 * 1.1f;
+            }
+            
+            // 作者
+            if (!string.IsNullOrEmpty(author))
+            {
+                DrawText(region.Right - padding, infoY, _fontSize16 * 0.75f,
+                         "by " + author, new SKColor(150, 150, 150), VerticalAlign.Top, HorizontalAlign.Right);
             }
         }
     }

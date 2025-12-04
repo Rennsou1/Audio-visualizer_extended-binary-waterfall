@@ -248,30 +248,31 @@ public class MidiVisualizer : IDisposable
         return noteIndex == 1 || noteIndex == 3 || noteIndex == 6 || noteIndex == 8 || noteIndex == 10;
     }
 
-    // 根据 MIDI 通道返回颜色（用于多轨可视化）
+    // 预缓存的通道颜色（避免每帧计算）
+    private static readonly (byte r, byte g, byte b)[] _channelColors =
+    {
+        ((byte)255, (byte)100, (byte)100),  // 0: 红
+        ((byte)100, (byte)255, (byte)100),  // 1: 绿
+        ((byte)100, (byte)100, (byte)255),  // 2: 蓝
+        ((byte)255, (byte)255, (byte)100),  // 3: 黄
+        ((byte)255, (byte)100, (byte)255),  // 4: 品红
+        ((byte)100, (byte)255, (byte)255),  // 5: 青
+        ((byte)255, (byte)180, (byte)100),  // 6: 橙
+        ((byte)180, (byte)100, (byte)255),  // 7: 紫
+        ((byte)100, (byte)255, (byte)180),  // 8: 薄荷绿
+        ((byte)200, (byte)200, (byte)200),  // 9: 鼓（灰色）
+        ((byte)150, (byte)200, (byte)255),  // 10: 浅蓝
+        ((byte)255, (byte)200, (byte)150),  // 11: 浅橙
+        ((byte)200, (byte)255, (byte)150),  // 12: 浅绿
+        ((byte)255, (byte)150, (byte)200),  // 13: 粉红
+        ((byte)150, (byte)255, (byte)200),  // 14: 浅青
+        ((byte)200, (byte)150, (byte)255),  // 15: 浅紫
+    };
+
+    // 根据 MIDI 通道返回颜色（使用缓存数组）
     public static (byte r, byte g, byte b) GetChannelColor(int channel)
     {
-        // 预定义的通道颜色（鲜明区分）
-        return (channel % 16) switch
-        {
-            0  => (255, 100, 100),  // 红
-            1  => (100, 255, 100),  // 绿
-            2  => (100, 100, 255),  // 蓝
-            3  => (255, 255, 100),  // 黄
-            4  => (255, 100, 255),  // 品红
-            5  => (100, 255, 255),  // 青
-            6  => (255, 180, 100),  // 橙
-            7  => (180, 100, 255),  // 紫
-            8  => (100, 255, 180),  // 薄荷绿
-            9  => (200, 200, 200),  // 鼓（灰色，但不在钢琴卷帘显示）
-            10 => (150, 200, 255),  // 浅蓝
-            11 => (255, 200, 150),  // 浅橙
-            12 => (200, 255, 150),  // 浅绿
-            13 => (255, 150, 200),  // 粉红
-            14 => (150, 255, 200),  // 浅青
-            15 => (200, 150, 255),  // 浅紫
-            _  => (255, 255, 255)   // 白
-        };
+        return _channelColors[channel & 0xF];  // 等同于 channel % 16，但更快
     }
     
     // 获取打击乐器类型（根据 GM 标准 note number 映射）

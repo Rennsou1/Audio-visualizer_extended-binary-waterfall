@@ -11,11 +11,18 @@ MIDI格式
 Track View:
 View: Tracker
 .mod .it .s3m .xm 等Tracker格式
+https://openmpt.org/
 
 VGM View:
 View: Note and Register
 .VGM .VGZ 等VGM格式
+https://github.com/ValleyBell/libvgm
+https://github.com/kuma4649/MDPlayer
 
 MML View:
 View: Real Time MML + Register
-.MML .M .MDX 等MML格式
+.MML .M .MDX 等MML格式 (优先实现MDX)
+https://github.com/kuma4649/mml2vgm
+https://github.com/vampirefrog/mdxtools
+https://github.com/Rennsou1/MXDRV-Manual
+http://dmpsoft.s17.xrea.com/hoot/index.html

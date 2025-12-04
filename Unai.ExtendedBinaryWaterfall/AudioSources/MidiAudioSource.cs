@@ -165,6 +165,13 @@ public class MidiAudioSource : ISampleSource
             FluidSynth.fluid_settings_setnum(settings, "synth.sample-rate", _sampleRate);
             FluidSynth.fluid_settings_setnum(settings, "synth.gain", _effects.Gain);
             
+            // 性能优化：使用多核 CPU 渲染
+            FluidSynth.fluid_settings_setint(settings, "synth.cpu-cores", Environment.ProcessorCount);
+            // 性能优化：增加音频周期大小（减少处理开销）
+            FluidSynth.fluid_settings_setint(settings, "audio.period-size", 2048);
+            // 性能优化：减少音频周期数
+            FluidSynth.fluid_settings_setint(settings, "audio.periods", 2);
+            
             // 混响效果设置
             FluidSynth.fluid_settings_setint(settings, "synth.reverb.active", _effects.ReverbEnabled ? 1 : 0);
             FluidSynth.fluid_settings_setnum(settings, "synth.reverb.room-size", _effects.ReverbRoomSize);
@@ -242,8 +249,8 @@ public class MidiAudioSource : ISampleSource
             int bufferSize = totalSamples * _channels;
             float[] result = new float[bufferSize];
 
-            // 临时渲染缓冲区
-            const int blockSize = 8192;
+            // 临时渲染缓冲区（增大块大小提高渲染效率）
+            const int blockSize = 32768;
             float[] leftBuf = new float[blockSize];
             float[] rightBuf = new float[blockSize];
             int position = 0;
@@ -265,18 +272,20 @@ public class MidiAudioSource : ISampleSource
                     break;
                 }
 
-                // 交错存储到结果缓冲区
+                // 交错存储到结果缓冲区（使用 Span 优化内存访问）
                 if (_channels >= 2)
                 {
+                    var destSpan = result.AsSpan(position, samplesToRender * 2);
                     for (int i = 0; i < samplesToRender; i++)
                     {
-                        result[position++] = leftBuf[i];
-                        result[position++] = rightBuf[i];
+                        destSpan[i * 2] = leftBuf[i];
+                        destSpan[i * 2 + 1] = rightBuf[i];
                     }
+                    position += samplesToRender * 2;
                 }
                 else
                 {
-                    Array.Copy(leftBuf, 0, result, position, samplesToRender);
+                    leftBuf.AsSpan(0, samplesToRender).CopyTo(result.AsSpan(position));
                     position += samplesToRender;
                 }
                 

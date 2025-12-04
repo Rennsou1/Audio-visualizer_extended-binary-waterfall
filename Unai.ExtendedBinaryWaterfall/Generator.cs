@@ -142,6 +142,9 @@ public class Generator
     private VisualizerTransition _visualizerTransition = new();  // 可视化模式切换控制器
     private MidiVisualizer _currentMidiVisualizer = null;        // 当前 MIDI 可视化器
     private List<NoteVisualData> _visibleNotesBuffer = new();    // 可见音符缓冲（复用避免 GC）
+    private List<NoteVisualData> _sortedNotesBuffer = new();     // 按通道排序的音符缓冲（优化批量绘制）
+    private SKColor[] _channelColorCache = new SKColor[16];      // 预计算的通道颜色缓存
+    private bool _channelColorCacheValid = false;                // 颜色缓存是否有效
     
     // 打击乐器显示相关
     private List<(int noteNumber, int velocity, double triggerTimeMs)> _activeDrumNotes = new();
@@ -2361,11 +2364,19 @@ public class Generator
                 bool isMainSubfile = sfi == currentSubfileKey;
 
                 DrawText(subfileX1, subfileY, _fontSize24, isMainSubfile ? "▶" : " ", SKColors.White, VerticalAlign.Center);
-                DrawText(subfileX1 + 24 * s, subfileY, _fontSize24,
-                    $"{Utils.GetFileTypeEmoji(subfile)} {Utils.TruncateString(BuildSubfileDisplayLine(subfile), 50)}",
-                    SKColors.White, VerticalAlign.Center);
-                DrawText(subfileX2, subfileY, _fontSize24, Utils.ToByteSizeString(subfile.Length),
-                    SKColors.DimGray, VerticalAlign.Center, HorizontalAlign.Right);
+                
+                // 计算可用宽度
+                string sizeText = Utils.ToByteSizeString(subfile.Length);
+                float sizeWidth = MeasureTextWidth(sizeText, _fontSize24);
+                float textStartX = subfileX1 + 24 * s;
+                float availableWidth = subfileX2 - textStartX - sizeWidth - 16 * s;  // 留出间距
+                
+                // 根据可用宽度动态截断文本
+                string displayLine = $"{Utils.GetFileTypeEmoji(subfile)} {BuildSubfileDisplayLine(subfile)}";
+                string truncatedLine = ClampTextToWidth(displayLine, _fontSize24, availableWidth);
+                
+                DrawText(textStartX, subfileY, _fontSize24, truncatedLine, SKColors.White, VerticalAlign.Center);
+                DrawText(subfileX2, subfileY, _fontSize24, sizeText, SKColors.DimGray, VerticalAlign.Center, HorizontalAlign.Right);
 
                 if (isMainSubfile)
                 {
@@ -3028,8 +3039,6 @@ public class Generator
         float x, float y, float maxWidth, float animT, bool isInTransition, bool rightAlign = false)
     {
         if (_frameCanvas == null) return;
-        newText ??= string.Empty;
-        oldText ??= string.Empty;
         
         // 裁剪文本
         if (maxWidth > 0)
@@ -3777,7 +3786,7 @@ public class Generator
             string ext = System.IO.Path.GetExtension(subfile.FileName);
             if (!string.IsNullOrEmpty(ext))
             {
-                line += $" ({ext.TrimStart('.').ToUpperInvariant()})";
+                line += $" .{ext.TrimStart('.').ToUpperInvariant()}";
             }
         }
 
@@ -3832,46 +3841,69 @@ public class Generator
         // 获取可见音符
         _currentMidiVisualizer.GetVisibleNotes(currentTimeMs, windowMs, _visibleNotesBuffer);
         
+        // 初始化颜色缓存（仅首次）
+        if (!_channelColorCacheValid)
+        {
+            for (int ch = 0; ch < 16; ch++)
+            {
+                var (r, g, b) = MidiVisualizer.GetChannelColor(ch);
+                _channelColorCache[ch] = new SKColor(r, g, b, 220);
+            }
+            _channelColorCacheValid = true;
+        }
+        
+        // 按通道排序音符以减少颜色切换次数
+        _sortedNotesBuffer.Clear();
+        foreach (var note in _visibleNotesBuffer)
+        {
+            if (!_currentMidiVisualizer.IsDrumChannel(note.Channel))
+                _sortedNotesBuffer.Add(note);
+        }
+        _sortedNotesBuffer.Sort((a, b) => a.Channel.CompareTo(b.Channel));
+        
         // 按通道分组批量绘制音符
         using var notePath = new SKPath();
         using var activePath = new SKPath();
         
-        // 预计算所有音符的矩形
+        // 预计算常量
         int lastChannel = -1;
-        SKColor lastColor = SKColors.Transparent;
         float halfWidth = noteWidth * 0.4f;
+        float invMsPerPixel = 1f / msPerPixel;
+        float regionLeft = region.Left;
         
-        foreach (var note in _visibleNotesBuffer)
+        foreach (var note in _sortedNotesBuffer)
         {
-            // 跳过打击乐通道（在底部单独显示）
-            if (_currentMidiVisualizer.IsDrumChannel(note.Channel)) continue;
+            float noteX = regionLeft + (note.NoteNumber - minNote + 0.5f) * noteWidth;
             
-            float noteX = region.Left + (note.NoteNumber - minNote + 0.5f) * noteWidth;
-            
-            // Y 坐标
-            float noteStartY = playheadY - (float)(note.StartMs - currentTimeMs) / msPerPixel;
-            float noteEndY = playheadY - (float)(note.EndMs - currentTimeMs) / msPerPixel;
+            // Y 坐标（预乘优化）
+            float noteStartY = playheadY - (float)(note.StartMs - currentTimeMs) * invMsPerPixel;
+            float noteEndY = playheadY - (float)(note.EndMs - currentTimeMs) * invMsPerPixel;
             if (noteStartY > noteEndY) (noteStartY, noteEndY) = (noteEndY, noteStartY);
             
             float noteHeight = Math.Max(3, noteEndY - noteStartY);
             var noteRect = new SKRect(noteX - halfWidth, noteStartY, noteX + halfWidth, noteStartY + noteHeight);
             
-            // 颜色变化时，先绘制之前的批次
-            var (r, g, b) = MidiVisualizer.GetChannelColor(note.Channel);
-            float velocityScale = 0.5f + (note.Velocity / 127f) * 0.5f;
-            byte alpha = (byte)(220 * velocityScale);
-            var noteColor = new SKColor((byte)(r * velocityScale), (byte)(g * velocityScale), (byte)(b * velocityScale), alpha);
-            
+            // 通道变化时，先绘制之前的批次
             if (note.Channel != lastChannel && notePath.PointCount > 0)
             {
-                _pianoRollNotePaint.Color = lastColor;
                 _frameCanvas.DrawPath(notePath, _pianoRollNotePaint);
                 notePath.Reset();
             }
             
+            // 更新颜色（使用缓存的基础颜色）
+            if (note.Channel != lastChannel)
+            {
+                var baseColor = _channelColorCache[note.Channel & 0xF];
+                float velocityScale = 0.5f + (note.Velocity / 127f) * 0.5f;
+                _pianoRollNotePaint.Color = new SKColor(
+                    (byte)(baseColor.Red * velocityScale),
+                    (byte)(baseColor.Green * velocityScale),
+                    (byte)(baseColor.Blue * velocityScale),
+                    (byte)(220 * velocityScale));
+                lastChannel = note.Channel;
+            }
+            
             notePath.AddRect(noteRect);
-            lastChannel = note.Channel;
-            lastColor = noteColor;
             
             // 正在播放的音符
             if (note.StartMs <= currentTimeMs && note.EndMs >= currentTimeMs)
@@ -3883,7 +3915,6 @@ public class Generator
         // 绘制最后一批音符
         if (notePath.PointCount > 0)
         {
-            _pianoRollNotePaint.Color = lastColor;
             _frameCanvas.DrawPath(notePath, _pianoRollNotePaint);
         }
         

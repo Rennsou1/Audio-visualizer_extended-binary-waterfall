@@ -525,6 +525,18 @@ public class FfmpegExporter : IExporter
 			if (ret < 0)
 			{
 				FfmpegUtils.LogIfAvError(ret, "cannot open video codec");
+				// 释放已分配的视频编码器上下文（防止 NVENC 会话泄漏）
+				if (_videoCtx != null)
+				{
+					var videoCtx = _videoCtx;
+					ffmpeg.avcodec_free_context(&videoCtx);
+					_videoCtx = null;
+				}
+				if (_fmtCtx != null)
+				{
+					ffmpeg.avformat_free_context(_fmtCtx);
+					_fmtCtx = null;
+				}
 				throw new InvalidOperationException($"无法打开视频编码器 {encoderName}，错误码: {ret}");
 			}
 

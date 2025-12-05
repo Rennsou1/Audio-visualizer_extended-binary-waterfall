@@ -341,10 +341,14 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // OKIM6295 写入
+                // OKIM6295 写入 (支持双芯片: aa的bit7选择芯片)
+                // 但OKIM6295命令本身也需要bit7来区分采样选择和Key Off
+                // VGM规范假设OKIM6295采样选择时直接使用完整的aa字节
                 case 0xB8:
                     if (pos + 1 < _data.Length)
                     {
+                        // 对于OKIM6295，直接传递aa和dd，不处理双芯片选择
+                        // （双芯片通过Clock bit30激活，但在实践中很少使用）
                         _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_OKIM6295, Register = _data[pos], Value = _data[pos + 1] });
                         pos += 2;
                     }
@@ -595,9 +599,10 @@ public class VgmCommandParser
                     tick += (uint)(cmd - 0x6F);
                     break;
                 
-                // YM2612 端口 0 写入 + 短等待
+                // YM2612 端口 0 地址 2A 写入 + 短等待 (DAC 数据)
                 case >= 0x80 and <= 0x8F:
-                    // 写入 DAC 数据并等待
+                    // 生成 DAC 写入事件 (寄存器 0x2A)
+                    _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2612, Port = 0, Register = 0x2A, Value = 0x80 });
                     tick += (uint)(cmd - 0x80);
                     break;
                 
@@ -663,14 +668,92 @@ public class VgmCommandParser
                         pos += 5;
                     }
                     break;
-                case 0x93:  // Start Stream
-                    pos += 10;
+                case 0x93:  // Start Stream: ss aa*4 mm ll*4
+                    if (pos + 9 < _data.Length)
+                    {
+                        byte streamId = _data[pos];
+                        byte lengthMode = _data[pos + 5];
+                        // 为对应芯片生成 Key On 事件 (Register=0xFE表示DAC流开始)
+                        if (streamId < 16 && _streamChipType[streamId] != 0)
+                        {
+                            byte chipType = (byte)(_streamChipType[streamId] & 0x7F);
+                            byte chipIndex = (byte)((_streamChipType[streamId] >> 7) & 0x01);
+                            _events.Add(new VgmEvent
+                            {
+                                Tick = tick,
+                                ChipType = MapDacChipType(chipType),
+                                ChipIndex = chipIndex,
+                                Register = 0xFE,  // 特殊: DAC 流开始
+                                Value = streamId,
+                                Value2 = lengthMode
+                            });
+                        }
+                        pos += 10;
+                    }
                     break;
-                case 0x94:  // Stop Stream
-                    pos += 1;
+                case 0x94:  // Stop Stream: ss
+                    if (pos < _data.Length)
+                    {
+                        byte streamId = _data[pos];
+                        // 为对应芯片生成 Key Off 事件 (Register=0xFD表示DAC流停止)
+                        if (streamId < 16 && _streamChipType[streamId] != 0)
+                        {
+                            byte chipType = (byte)(_streamChipType[streamId] & 0x7F);
+                            byte chipIndex = (byte)((_streamChipType[streamId] >> 7) & 0x01);
+                            _events.Add(new VgmEvent
+                            {
+                                Tick = tick,
+                                ChipType = MapDacChipType(chipType),
+                                ChipIndex = chipIndex,
+                                Register = 0xFD,  // 特殊: DAC 流停止
+                                Value = streamId
+                            });
+                        }
+                        else if (streamId == 0xFF)
+                        {
+                            // 0xFF = 停止所有流
+                            for (int i = 0; i < 16; i++)
+                            {
+                                if (_streamChipType[i] != 0)
+                                {
+                                    byte ct = (byte)(_streamChipType[i] & 0x7F);
+                                    byte ci = (byte)((_streamChipType[i] >> 7) & 0x01);
+                                    _events.Add(new VgmEvent
+                                    {
+                                        Tick = tick,
+                                        ChipType = MapDacChipType(ct),
+                                        ChipIndex = ci,
+                                        Register = 0xFD,
+                                        Value = (byte)i
+                                    });
+                                }
+                            }
+                        }
+                        pos += 1;
+                    }
                     break;
-                case 0x95:  // Start Stream (fast)
-                    pos += 4;
+                case 0x95:  // Start Stream (fast): ss bb bb ff
+                    if (pos + 3 < _data.Length)
+                    {
+                        byte streamId = _data[pos];
+                        byte flags = _data[pos + 3];
+                        // 为对应芯片生成 Key On 事件
+                        if (streamId < 16 && _streamChipType[streamId] != 0)
+                        {
+                            byte chipType = (byte)(_streamChipType[streamId] & 0x7F);
+                            byte chipIndex = (byte)((_streamChipType[streamId] >> 7) & 0x01);
+                            _events.Add(new VgmEvent
+                            {
+                                Tick = tick,
+                                ChipType = MapDacChipType(chipType),
+                                ChipIndex = chipIndex,
+                                Register = 0xFE,  // 特殊: DAC 流开始
+                                Value = streamId,
+                                Value2 = flags
+                            });
+                        }
+                        pos += 4;
+                    }
                     break;
                 
                 // 双芯片命令 (0x30+xx = 第二芯片的 0x50+xx)

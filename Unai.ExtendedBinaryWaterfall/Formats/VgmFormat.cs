@@ -375,7 +375,10 @@ public static class VgmFormat
         AddChip("RF5C68", header.Rf5c68Clock, 8);
         AddChip("YM2203", header.Ym2203Clock, 6);
         AddChip("YM2608", header.Ym2608Clock, 16);
-        AddChip("YM2610", header.Ym2610Clock, 14);
+        // YM2610/YM2610B: bit31=1表示YM2610B (6 FM), bit31=0表示YM2610 (4 FM)
+        // 但有些VGM文件没有正确设置bit31，所以统一使用16通道以支持动态检测
+        bool isYm2610B = (header.Ym2610Clock & 0x80000000) != 0;
+        AddChip(isYm2610B ? "YM2610B" : "YM2610", header.Ym2610Clock & 0x7FFFFFFF, 16);
         AddChip("YM3812", header.Ym3812Clock, 9);
         AddChip("YM3526", header.Ym3526Clock, 9);
         AddChip("Y8950", header.Y8950Clock, 9);

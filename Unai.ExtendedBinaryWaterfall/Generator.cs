@@ -4605,16 +4605,16 @@ public class Generator
         // 列宽定义
         float labelWidth = 32 * s;       // 缩短通道标签宽度
         float noteNameWidth = 28 * s;    // 音符名称宽度
-        float detuneWidth = 42 * s;      // D: (Detune) 数值宽度
-        float volumeBarWidth = 50 * s;
+        float infoWidth = 48 * s;        // V:/D: 信息区域宽度
+        float volumeBarWidth = 40 * s;   // 缩短音量条，给钢琴窗腾出空间
         float gapWidth = 3 * s;
         
         // 钢琴区域宽度（剩余空间）
-        float pianoWidth = areaWidth - labelWidth - noteNameWidth - detuneWidth - volumeBarWidth - gapWidth * 4;
+        float pianoWidth = areaWidth - labelWidth - noteNameWidth - infoWidth - volumeBarWidth - gapWidth * 4;
         pianoWidth = Math.Max(pianoWidth, 100 * s);
         
-        // 钢琴参数（8个八度，96个半音）
-        int totalOctaves = 8;
+        // 钢琴参数（9个八度，108个半音，o0-o8）
+        int totalOctaves = 9;
         int totalKeys = totalOctaves * 12;
         float keyWidth = pianoWidth / totalKeys;
         
@@ -4642,14 +4642,16 @@ public class Generator
             DrawText(areaLeft, rowY + chipTitleHeight / 2, _fontSize16 * 0.7f,
                      chip.Info.Name, _chipNameColor, VerticalAlign.Center);
             
-            // 在第一个芯片名所在行绘制八度标记（与芯片名对齐）
+            // 在第一个芯片名所在行绘制八度标记（对齐到每个八度的C音符位置）
+            // 从o1开始
             if (!octaveLabelsDrawn)
             {
-                for (int oct = 0; oct < totalOctaves; oct++)
+                for (int oct = 1; oct < totalOctaves; oct++)
                 {
+                    // 八度标记对齐到该八度的起始位置（C音符）
                     float octX = pianoX + oct * 12 * keyWidth;
-                    DrawText(octX + 6 * keyWidth, rowY + chipTitleHeight / 2, _fontSize16 * 0.5f,
-                             $"o{oct}", _octaveLabelColor, VerticalAlign.Center, HorizontalAlign.Center);
+                    DrawText(octX, rowY + chipTitleHeight / 2, _fontSize16 * 0.5f,
+                             $"o{oct}", _octaveLabelColor, VerticalAlign.Center, HorizontalAlign.Left);
                 }
                 octaveLabelsDrawn = true;
             }
@@ -4679,11 +4681,21 @@ public class Generator
                          isOn ? _channelLabelOnColor : _channelLabelOffColor, VerticalAlign.Center);
                 colX += noteNameWidth + gapWidth;
                 
-                // D: (Detune) 数值显示
+                // V: (音量) 和 D: (Detune) 双行显示
+                float infoFontSize = _fontSize16 * 0.45f;
+                float lineSpacing = rowHeight * 0.45f;
+                
+                // 上行: V: (音量值)
+                string volStr = $"V:{channel.Volume}";
+                DrawText(colX, rowY + rowHeight / 2 - lineSpacing / 2, infoFontSize,
+                         volStr, _volumeInfoColor, VerticalAlign.Center);
+                
+                // 下行: D: (Detune值)
                 string detuneStr = channel.Detune > 0 ? $"D:+{channel.Detune}" : $"D:{channel.Detune}";
-                DrawText(colX, rowY + rowHeight / 2, _fontSize16 * 0.5f,
+                DrawText(colX, rowY + rowHeight / 2 + lineSpacing / 2, infoFontSize,
                          detuneStr, _pitchDeltaColor, VerticalAlign.Center);
-                colX += detuneWidth + gapWidth;
+                         
+                colX += infoWidth + gapWidth;
                 
                 // L/R音量条（双柱显示，C352等四声道芯片显示4条）
                 float barH = rowHeight - 4 * s;
@@ -4713,7 +4725,8 @@ public class Generator
     private static readonly SKColor _chipNameColor = new(255, 255, 255);
     private static readonly SKColor _channelLabelOnColor = new(200, 200, 200);
     private static readonly SKColor _channelLabelOffColor = new(80, 80, 80);
-    private static readonly SKColor _octaveLabelColor = new(120, 120, 120);
+    private static readonly SKColor _octaveLabelColor = new(200, 200, 200);  // 八度标签颜色（白灰色）
+    private static readonly SKColor _volumeInfoColor = new(255, 255, 255);  // V: 音量数值颜色（纯白）
     private static readonly SKColor _pitchDeltaColor = new(255, 255, 255);  // D: Detune 数值颜色（纯白）
     
     // 绘制方块式钢琴键盘

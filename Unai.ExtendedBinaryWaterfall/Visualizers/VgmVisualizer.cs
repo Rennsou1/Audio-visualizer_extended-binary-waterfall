@@ -548,6 +548,11 @@ public class VgmVisualizer : IDisposable
             "YM2608" => channelIndex < 6 ? $"FM{channelIndex + 1}" 
                       : channelIndex < 9 ? $"SSG{channelIndex - 5}" 
                       : channelIndex == 9 ? "ADPCM" : $"RHY{channelIndex - 9}",
+            // YM2610/YM2610B统一使用16通道布局，支持动态检测
+            "YM2610" or "YM2610B" => channelIndex < 6 ? $"FM{channelIndex + 1}"
+                       : channelIndex < 9 ? $"SSG{channelIndex - 5}"
+                       : channelIndex < 15 ? $"PCMA{channelIndex - 8}"
+                       : "PCMB",
             "YM2203" => channelIndex < 3 ? $"FM{channelIndex + 1}" : $"SSG{channelIndex - 2}",
             "SN76489" => channelIndex < 3 ? $"T{channelIndex + 1}" : "NOI",
             "AY-3-8910" => $"CH{(char)('A' + channelIndex)}",
@@ -649,6 +654,30 @@ public class VgmVisualizer : IDisposable
         // 12音阶系统：每八度倍频，每半音相差 2^(1/12)
         double semitones = 12.0 * Math.Log2(ratio);
         return baseNote + (int)Math.Round(semitones);
+    }
+    
+    // 计算频率相对于音符的音分偏移 (cent = 1/100 半音)
+    // 返回值: -50 ~ +50 (超出范围会被截断)
+    public static int FrequencyToCent(double frequency, int note)
+    {
+        if (frequency <= 0 || note < 0) return 0;
+        // 音符对应的标准频率: A4 (note 69) = 440 Hz
+        double noteFreq = 440.0 * Math.Pow(2.0, (note - 69) / 12.0);
+        // cent = 1200 * log2(actualFreq / noteFreq)
+        double cents = 1200.0 * Math.Log2(frequency / noteFreq);
+        // 限制范围到 -50 ~ +50
+        return Math.Clamp((int)Math.Round(cents), -50, 50);
+    }
+    
+    // 从频率同时获取音符和音分偏移
+    public static (int note, int cent) FrequencyToNoteAndCent(double frequency)
+    {
+        if (frequency <= 0) return (-1, 0);
+        double exactNote = 12.0 * Math.Log2(frequency / 440.0) + 69.0;
+        int note = (int)Math.Round(exactNote);
+        double noteFreq = 440.0 * Math.Pow(2.0, (note - 69) / 12.0);
+        double cents = 1200.0 * Math.Log2(frequency / noteFreq);
+        return (note, Math.Clamp((int)Math.Round(cents), -50, 50));
     }
 
     public void Dispose()

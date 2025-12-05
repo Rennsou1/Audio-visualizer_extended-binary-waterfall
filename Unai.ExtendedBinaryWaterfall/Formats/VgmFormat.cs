@@ -194,83 +194,114 @@ public static class VgmFormat
         if (header.FileId != VGM_MAGIC)
             throw new InvalidDataException("Invalid VGM file signature");
 
-        // 计算实际头部大小：VGM数据偏移+0x34，或者0x40（如果DataOffset=0或版本<1.50）
-        uint headerSize = header.DataOffset > 0 ? header.DataOffset + 0x34 : 0x40;
+        // 计算实际 VGM 数据开始位置
+        // DataOffset 是相对于 0x34 的偏移，所以实际位置 = DataOffset + 0x34
+        // 如果 DataOffset = 0 或版本 < 1.50，数据从 0x40 开始
+        uint dataStart = (header.Version >= 0x150 && header.DataOffset > 0) 
+            ? header.DataOffset + 0x34 
+            : 0x40;
         
-        // 版本 1.50+ 有更多字段（但必须在头部范围内）
-        if (header.Version >= 0x150 && headerSize >= 0x80 && data.Length >= 0x80)
+        // 根据 VGM 规范：如果数据开始位置小于头部字段位置，该字段应视为 0
+        // 辅助函数：检查某个偏移位置的字段是否有效
+        bool CanReadAt(uint offset, uint size) => 
+            dataStart > offset && data.Length >= offset + size;
+        
+        // === VGM 1.51+ 字段 (0x38-0x3F): Sega PCM ===
+        // 注意：虽然这些字段在 0x40 之前，但只有 1.51+ 版本才支持
+        if (header.Version >= 0x151 && CanReadAt(0x38, 8))
         {
+            ms.Position = 0x38;
             header.SegaPcmClock = br.ReadUInt32();
             header.SegaPcmIfReg = br.ReadUInt32();
-            header.Rf5c68Clock = br.ReadUInt32();
-            header.Ym2203Clock = br.ReadUInt32();
-            header.Ym2608Clock = br.ReadUInt32();
-            header.Ym2610Clock = br.ReadUInt32();
-            header.Ym3812Clock = br.ReadUInt32();
-            header.Ym3526Clock = br.ReadUInt32();
-            header.Y8950Clock = br.ReadUInt32();
-            header.Ymf262Clock = br.ReadUInt32();
-            header.Ymf278bClock = br.ReadUInt32();
-            header.Ymf271Clock = br.ReadUInt32();
-            header.Ymz280bClock = br.ReadUInt32();
-            header.Rf5c164Clock = br.ReadUInt32();
-            header.PwmClock = br.ReadUInt32();
-            header.Ay8910Clock = br.ReadUInt32();
-            header.Ay8910Type = br.ReadByte();
-            header.Ay8910Flags = br.ReadByte();
-            header.Ym2203Ay8910Flags = br.ReadByte();
-            header.Ym2608Ay8910Flags = br.ReadByte();
-            header.VolumeModifier = br.ReadByte();
-            header.Reserved1 = br.ReadByte();
-            header.LoopBase = br.ReadByte();
-            header.LoopModifier = br.ReadByte();
+        }
+        
+        // === VGM 1.51+ 字段 (0x40-0x7F): RF5C68, YM2203, YM2608 等 ===
+        if (header.Version >= 0x151 && CanReadAt(0x40, 0x40))
+        {
+            ms.Position = 0x40;
+            header.Rf5c68Clock = br.ReadUInt32();   // 0x40
+            header.Ym2203Clock = br.ReadUInt32();   // 0x44
+            header.Ym2608Clock = br.ReadUInt32();   // 0x48
+            header.Ym2610Clock = br.ReadUInt32();   // 0x4C
+            header.Ym3812Clock = br.ReadUInt32();   // 0x50
+            header.Ym3526Clock = br.ReadUInt32();   // 0x54
+            header.Y8950Clock = br.ReadUInt32();    // 0x58
+            header.Ymf262Clock = br.ReadUInt32();   // 0x5C
+            header.Ymf278bClock = br.ReadUInt32();  // 0x60
+            header.Ymf271Clock = br.ReadUInt32();   // 0x64
+            header.Ymz280bClock = br.ReadUInt32();  // 0x68
+            header.Rf5c164Clock = br.ReadUInt32();  // 0x6C
+            header.PwmClock = br.ReadUInt32();      // 0x70
+            header.Ay8910Clock = br.ReadUInt32();   // 0x74
+            header.Ay8910Type = br.ReadByte();      // 0x78
+            header.Ay8910Flags = br.ReadByte();     // 0x79
+            header.Ym2203Ay8910Flags = br.ReadByte(); // 0x7A
+            header.Ym2608Ay8910Flags = br.ReadByte(); // 0x7B
+            header.VolumeModifier = br.ReadByte();  // 0x7C (VGM 1.60)
+            header.Reserved1 = br.ReadByte();       // 0x7D
+            header.LoopBase = br.ReadByte();        // 0x7E (VGM 1.60)
+            header.LoopModifier = br.ReadByte();    // 0x7F (VGM 1.51)
         }
 
-        // 版本 1.51+ 有更多字段（0x80-0xBF 区域）
-        if (header.Version >= 0x151 && headerSize >= 0xC0 && data.Length >= 0xC0)
+        // === VGM 1.61+ 字段 (0x80-0xB7): GB DMG, NES APU, MultiPCM 等 ===
+        if (header.Version >= 0x161 && CanReadAt(0x80, 0x38))
         {
-            header.GbDmgClock = br.ReadUInt32();
-            header.NesApuClock = br.ReadUInt32();
-            header.MultiPcmClock = br.ReadUInt32();
-            header.Upd7759Clock = br.ReadUInt32();
-            header.Okim6258Clock = br.ReadUInt32();
-            header.Okim6258Flags = br.ReadByte();
-            header.K054539Flags = br.ReadByte();
-            header.C140Type = br.ReadByte();
-            header.Reserved2 = br.ReadByte();
-            header.Okim6295Clock = br.ReadUInt32();
-            header.K051649Clock = br.ReadUInt32();
-            header.K054539Clock = br.ReadUInt32();
-            header.HuC6280Clock = br.ReadUInt32();
-            header.C140Clock = br.ReadUInt32();
-            header.K053260Clock = br.ReadUInt32();
-            header.PokeyClock = br.ReadUInt32();
-            header.QsoundClock = br.ReadUInt32();
+            ms.Position = 0x80; // 确保从正确位置开始
+            header.GbDmgClock = br.ReadUInt32();    // 0x80
+            header.NesApuClock = br.ReadUInt32();   // 0x84
+            header.MultiPcmClock = br.ReadUInt32(); // 0x88
+            header.Upd7759Clock = br.ReadUInt32();  // 0x8C
+            header.Okim6258Clock = br.ReadUInt32(); // 0x90
+            header.Okim6258Flags = br.ReadByte();   // 0x94
+            header.K054539Flags = br.ReadByte();    // 0x95
+            header.C140Type = br.ReadByte();        // 0x96
+            header.Reserved2 = br.ReadByte();       // 0x97
+            header.Okim6295Clock = br.ReadUInt32(); // 0x98
+            header.K051649Clock = br.ReadUInt32();  // 0x9C
+            header.K054539Clock = br.ReadUInt32();  // 0xA0
+            header.HuC6280Clock = br.ReadUInt32();  // 0xA4
+            header.C140Clock = br.ReadUInt32();     // 0xA8
+            header.K053260Clock = br.ReadUInt32();  // 0xAC
+            header.PokeyClock = br.ReadUInt32();    // 0xB0
+            header.QsoundClock = br.ReadUInt32();   // 0xB4
+        }
+        
+        // === VGM 1.71+ 字段 (0xB8): SCSP ===
+        if (header.Version >= 0x171 && CanReadAt(0xB8, 4))
+        {
+            ms.Position = 0xB8;
+            header.ScspClock = br.ReadUInt32();     // 0xB8
+        }
+        
+        // === VGM 1.70+ 字段 (0xBC): Extra Header Offset ===
+        if (header.Version >= 0x170 && CanReadAt(0xBC, 4))
+        {
+            ms.Position = 0xBC;
+            header.ExtraHdrOffset = br.ReadUInt32(); // 0xBC
         }
 
-        // 版本 1.70+ 有更多字段（0xC0-0xFF 区域）
-        if (header.Version >= 0x170 && headerSize >= 0x100 && data.Length >= 0x100)
+        // === VGM 1.71+ 字段 (0xC0-0xEF): WonderSwan, VSU, SAA1099 等 ===
+        if (header.Version >= 0x171 && CanReadAt(0xC0, 0x28))
         {
-            header.ScspClock = br.ReadUInt32();
-            header.ExtraHdrOffset = br.ReadUInt32();
-            header.Wswan_Clock = br.ReadUInt32();
-            header.Vsu_Clock = br.ReadUInt32();
-            header.Saa1099Clock = br.ReadUInt32();
-            header.Es5503Clock = br.ReadUInt32();
-            header.Es5506Clock = br.ReadUInt32();
-            header.Es5503Channels = br.ReadByte();
-            header.Es5506Channels = br.ReadByte();
-            header.C352ClockDiv = br.ReadByte();
-            header.Reserved3 = br.ReadByte();
-            header.X1_010Clock = br.ReadUInt32();
-            header.C352Clock = br.ReadUInt32();
-            header.Ga20Clock = br.ReadUInt32();
-            header.Mikey_Clock = br.ReadUInt32();
+            ms.Position = 0xC0;
+            header.Wswan_Clock = br.ReadUInt32();   // 0xC0
+            header.Vsu_Clock = br.ReadUInt32();     // 0xC4
+            header.Saa1099Clock = br.ReadUInt32();  // 0xC8
+            header.Es5503Clock = br.ReadUInt32();   // 0xCC
+            header.Es5506Clock = br.ReadUInt32();   // 0xD0
+            header.Es5503Channels = br.ReadByte();  // 0xD4
+            header.Es5506Channels = br.ReadByte();  // 0xD5
+            header.C352ClockDiv = br.ReadByte();    // 0xD6
+            header.Reserved3 = br.ReadByte();       // 0xD7
+            header.X1_010Clock = br.ReadUInt32();   // 0xD8
+            header.C352Clock = br.ReadUInt32();     // 0xDC
+            header.Ga20Clock = br.ReadUInt32();     // 0xE0
+            header.Mikey_Clock = br.ReadUInt32();   // 0xE4 (VGM 1.72 中添加，为兼容性保留)
         }
 
         // 修正 DataOffset（版本 < 1.50 固定为 0x40）
         if (header.Version < 0x150 || header.DataOffset == 0)
-            header.DataOffset = 0x0C; // 相对于 0x34
+            header.DataOffset = 0x0C; // 相对于 0x34，即数据从 0x40 开始
         
         return header;
     }
@@ -402,10 +433,24 @@ public static class VgmFormat
         return ParseHeader(data);
     }
 
-    // 获取系统名称
-    public static string GetSystemName(VgmHeader header)
+    // 获取系统名称（优先使用 GD3 标签中的系统名，否则根据芯片推断）
+    public static string GetSystemName(VgmHeader header, Gd3Tag gd3 = null, Gd3Language lang = Gd3Language.English)
     {
-        // 根据芯片组合推断系统
+        // 优先使用 GD3 标签中的系统名称
+        if (gd3 != null)
+        {
+            string systemName = gd3.GetSystemName(lang);
+            if (!string.IsNullOrWhiteSpace(systemName))
+                return systemName;
+        }
+        
+        // GD3 不可用时，根据芯片组合推断系统
+        return GetSystemNameFromChips(header);
+    }
+    
+    // 根据芯片组合推断系统名称
+    public static string GetSystemNameFromChips(VgmHeader header)
+    {
         if (header.Ym2612Clock > 0 && header.Sn76489Clock > 0)
             return "Sega Genesis / Mega Drive";
         if (header.Ym2612Clock > 0)
@@ -430,6 +475,14 @@ public static class VgmFormat
             return "Capcom CPS Arcade";
         if (header.Ay8910Clock > 0)
             return "MSX / ZX Spectrum";
+        if (header.C352Clock > 0)
+            return "Namco Arcade";
+        if (header.ScspClock > 0)
+            return "Sega Saturn / Model 2";
+        if (header.Wswan_Clock > 0)
+            return "Bandai WonderSwan";
+        if (header.PokeyClock > 0)
+            return "Atari 8-bit";
         
         return "Unknown System";
     }

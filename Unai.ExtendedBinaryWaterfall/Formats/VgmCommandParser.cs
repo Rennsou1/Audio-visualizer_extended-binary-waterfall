@@ -21,6 +21,7 @@ public class VgmCommandParser
     private readonly List<VgmEvent> _events = new();
     private readonly VgmHeader _header;
     private readonly byte[] _data;
+    private readonly byte[] _streamChipType = new byte[16];  // DAC Stream ID 对应的芯片类型
     
     // 芯片类型常量
     public const byte CHIP_SN76489 = 0x01;
@@ -61,6 +62,9 @@ public class VgmCommandParser
     public const byte CHIP_ES5503 = 0x24;
     public const byte CHIP_ES5506 = 0x25;
     public const byte CHIP_YMF262 = 0x26;  // OPL3
+    public const byte CHIP_PWM = 0x27;
+    public const byte CHIP_UPD7759 = 0x28;
+    public const byte CHIP_OKIM6258 = 0x29;
     
     public IReadOnlyList<VgmEvent> Events => _events;
     public uint TotalTicks { get; private set; }
@@ -77,6 +81,57 @@ public class VgmCommandParser
         _events.Clear();
         _events.TrimExcess();  // 释放多余容量
         TotalTicks = 0;
+    }
+    
+    // 将 DAC Stream 的芯片类型映射到内部芯片类型常量
+    // VGM 规范中的芯片顺序与我们的常量不完全一致
+    private byte MapDacChipType(byte dacChipType)
+    {
+        return dacChipType switch
+        {
+            0x00 => CHIP_SN76489,
+            0x01 => CHIP_YM2413,
+            0x02 => CHIP_YM2612,
+            0x03 => CHIP_YM2151,
+            0x04 => CHIP_SEGAPCM,
+            0x05 => CHIP_RF5C68,
+            0x06 => CHIP_YM2203,
+            0x07 => CHIP_YM2608,
+            0x08 => CHIP_YM2610,
+            0x09 => CHIP_YM3812,
+            0x0A => CHIP_YM3526,
+            0x0B => CHIP_Y8950,
+            0x0C => CHIP_YMF262,
+            0x0D => CHIP_YMF278B,
+            0x0E => CHIP_YMF271,
+            0x0F => CHIP_YMZ280B,
+            0x10 => CHIP_RF5C164,
+            0x11 => CHIP_PWM,
+            0x12 => CHIP_AY8910,
+            0x13 => CHIP_GBDMG,
+            0x14 => CHIP_NESAPU,
+            0x15 => CHIP_MULTIPCM,
+            0x16 => CHIP_UPD7759,
+            0x17 => CHIP_OKIM6258,
+            0x18 => CHIP_OKIM6295,
+            0x19 => CHIP_K051649,
+            0x1A => CHIP_K054539,
+            0x1B => CHIP_HUC6280,
+            0x1C => CHIP_C140,
+            0x1D => CHIP_K053260,
+            0x1E => CHIP_POKEY,
+            0x1F => CHIP_QSOUND,
+            0x20 => CHIP_SCSP,
+            0x21 => CHIP_WSWAN,
+            0x22 => CHIP_VSU,
+            0x23 => CHIP_SAA1099,
+            0x24 => CHIP_ES5503,
+            0x25 => CHIP_ES5506,
+            0x26 => CHIP_X1010,
+            0x27 => CHIP_C352,
+            0x28 => CHIP_GA20,
+            _ => 0
+        };
     }
     
     // 解析所有命令
@@ -567,14 +622,46 @@ public class VgmCommandParser
                     break;
                 
                 // DAC 流控制命令
-                case 0x90:  // Setup Stream
-                    pos += 4;
+                case 0x90:  // Setup Stream: ss tt pp cc
+                    if (pos + 3 < _data.Length)
+                    {
+                        byte streamId = _data[pos];
+                        byte chipType = _data[pos + 1];
+                        // 记录流对应的芯片类型 (bit 7 用于第二芯片)
+                        if (streamId < 16) _streamChipType[streamId] = chipType;
+                        pos += 4;
+                    }
                     break;
                 case 0x91:  // Set Stream Data
                     pos += 4;
                     break;
-                case 0x92:  // Set Stream Frequency
-                    pos += 5;
+                case 0x92:  // Set Stream Frequency: ss ff ff ff ff
+                    if (pos + 4 < _data.Length)
+                    {
+                        byte streamId = _data[pos];
+                        uint freq = (uint)(_data[pos + 1] | (_data[pos + 2] << 8) | 
+                                          (_data[pos + 3] << 16) | (_data[pos + 4] << 24));
+                        // 根据流对应的芯片类型生成事件
+                        if (streamId < 16 && _streamChipType[streamId] != 0)
+                        {
+                            byte chipType = (byte)(_streamChipType[streamId] & 0x7F);
+                            byte chipIndex = (byte)((_streamChipType[streamId] >> 7) & 0x01);
+                            // 使用特殊寄存器 0xFF 表示 DAC 采样率
+                            // Value = 频率低 16 位的高字节, Value2 = 频率低 16 位的低字节
+                            // Port = 频率高 16 位的低字节, Register = 0xFF (特殊标记)
+                            _events.Add(new VgmEvent
+                            {
+                                Tick = tick,
+                                ChipType = MapDacChipType(chipType),
+                                ChipIndex = chipIndex,
+                                Register = 0xFF,  // 特殊: DAC 采样率
+                                Port = (byte)((freq >> 16) & 0xFF),
+                                Value = (byte)((freq >> 8) & 0xFF),
+                                Value2 = (byte)(freq & 0xFF)
+                            });
+                        }
+                        pos += 5;
+                    }
                     break;
                 case 0x93:  // Start Stream
                     pos += 10;

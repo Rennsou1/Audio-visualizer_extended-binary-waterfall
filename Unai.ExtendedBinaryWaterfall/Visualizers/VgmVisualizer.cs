@@ -32,6 +32,7 @@ public class VgmVisualizer : IDisposable
         public bool HasQuadChannel;   // 是否是四声道 (C352)
         public bool KeyOn;            // 是否按下
         public string Label;          // 通道标签
+        public int Detune;            // Detune 音高偏移值 (有符号)
     }
 
     // 芯片状态
@@ -205,20 +206,31 @@ public class VgmVisualizer : IDisposable
                 "WonderSwan" => new WSwanTracker(),
                 "X1-010" => new X1010Tracker(),
                 "OKIM6295" => new OKIM6295Tracker(),
+                "OKIM6258" => new OKIM6258Tracker(),
+                "uPD7759" => new GenericPcmTracker(),
                 "SegaPCM" => new SegaPCMTracker(),
                 "YMZ280B" => new YMZ280BTracker(),
                 "GA20" => new GA20Tracker(),
+                "PWM" => new GenericPcmTracker(),
+                "VSU" => new GenericPcmTracker(),
+                "YMF278B" => new OplTracker(),  // OPL4 兼容 OPL3
+                "YMF271" => new GenericFmTracker(),
+                "ES5503" => new GenericPcmTracker(),
+                "ES5506" => new GenericPcmTracker(),
                 _ => null
             };
             
             if (tracker != null)
             {
+                // 设置芯片时钟频率（从 VGM 头读取）
+                tracker.Clock = chip.Clock;
                 byte chipType = GetChipTypeForName(chip.Name);
                 _trackers[chipType] = tracker;
             }
         }
 
-        SystemName = VgmFormat.GetSystemName(_header);
+        // 使用 GD3 标签中的系统名，否则根据芯片推断
+        SystemName = VgmFormat.GetSystemName(_header, _gd3, Gd3Language);
     }
     
     // 加载 VGM 数据并解析命令
@@ -488,6 +500,8 @@ public class VgmVisualizer : IDisposable
         "YM2151" => VgmCommandParser.CHIP_YM2151,
         "YM2413" => VgmCommandParser.CHIP_YM2413,
         "YM2203" => VgmCommandParser.CHIP_YM2203,
+        "YM2608" => VgmCommandParser.CHIP_YM2608,
+        "YM2610" or "YM2610B" => VgmCommandParser.CHIP_YM2610,
         "NES APU" => VgmCommandParser.CHIP_NESAPU,
         "GB DMG" => VgmCommandParser.CHIP_GBDMG,
         "HuC6280" => VgmCommandParser.CHIP_HUC6280,
@@ -495,6 +509,8 @@ public class VgmVisualizer : IDisposable
         "YM3526" => VgmCommandParser.CHIP_YM3526,
         "Y8950" => VgmCommandParser.CHIP_Y8950,
         "YMF262" => VgmCommandParser.CHIP_YMF262,
+        "YMF278B" => VgmCommandParser.CHIP_YMF278B,
+        "YMF271" => VgmCommandParser.CHIP_YMF271,
         "QSound" => VgmCommandParser.CHIP_QSOUND,
         "K051649" => VgmCommandParser.CHIP_K051649,
         "POKEY" => VgmCommandParser.CHIP_POKEY,
@@ -508,11 +524,17 @@ public class VgmVisualizer : IDisposable
         "MultiPCM" => VgmCommandParser.CHIP_MULTIPCM,
         "SCSP" => VgmCommandParser.CHIP_SCSP,
         "WonderSwan" => VgmCommandParser.CHIP_WSWAN,
+        "VSU" => VgmCommandParser.CHIP_VSU,
         "X1-010" => VgmCommandParser.CHIP_X1010,
         "OKIM6295" => VgmCommandParser.CHIP_OKIM6295,
+        "OKIM6258" => VgmCommandParser.CHIP_OKIM6258,
+        "uPD7759" => VgmCommandParser.CHIP_UPD7759,
         "SegaPCM" => VgmCommandParser.CHIP_SEGAPCM,
         "YMZ280B" => VgmCommandParser.CHIP_YMZ280B,
         "GA20" => VgmCommandParser.CHIP_GA20,
+        "PWM" => VgmCommandParser.CHIP_PWM,
+        "ES5503" => VgmCommandParser.CHIP_ES5503,
+        "ES5506" => VgmCommandParser.CHIP_ES5506,
         _ => 0
     };
 

@@ -13,7 +13,7 @@ View: Tracker
 .mod .it .s3m .xm 等Tracker格式
 https://openmpt.org/
 
-VGM View:
+VGM View: 待完善
 View: Note and Register
 .VGM .VGZ 等VGM格式
 https://github.com/ValleyBell/libvgm

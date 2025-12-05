@@ -449,7 +449,7 @@ public class Generator
         
         // 左上角标签
         string leftLabel;
-        if (isVgm) leftLabel = "CHIPS";
+        if (isVgm) leftLabel = "SYSTEM";
         else if (isMidi) leftLabel = "MIDI SETTINGS";
         else leftLabel = "A/V SETTINGS";
         DrawText(32, labelY, _fontSize16, leftLabel, dimGray, VerticalAlign.Top, HorizontalAlign.Left);
@@ -487,15 +487,17 @@ public class Generator
         // 左上角数值
         if (isVgm)
         {
-            // VGM 模式：显示芯片信息
+            // VGM 模式：第一行显示系统名称，第二行显示芯片列表（含频率和通道数）
+            string systemName = _currentVgmVisualizer.SystemName;
             var chipStates = _currentVgmVisualizer.ChipStates;
-            var parts = new List<string>();
+            var chipParts = new List<string>();
             foreach (var chip in chipStates)
             {
                 double mhz = chip.Info.Clock / 1000000.0;
-                parts.Add($"{chip.Info.Name} @{mhz:F2}MHz, {chip.Info.ChannelCount}ch");
+                chipParts.Add($"{chip.Info.Name} @{mhz:F2}MHz, {chip.Info.ChannelCount}ch");
             }
-            DrawText(32, valueY, _fontSize24, string.Join("\n", parts), SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
+            string chipsLine = string.Join("  |  ", chipParts);
+            DrawText(32, valueY, _fontSize24, $"{systemName}\n{chipsLine}", SKColors.White, VerticalAlign.Top, HorizontalAlign.Left);
         }
         else if (isMidi && meta != null)
         {
@@ -2558,26 +2560,21 @@ public class Generator
                 // 如果是 VGM 文件，确保可视化器已加载
                 if (requiredMode == VisualizerMode.VgmView && !string.IsNullOrEmpty(currentFilePath))
                 {
-                    // 检测文件切换：通过版本号检测 MultiFileAudioSource 是否切换了文件
-                    bool fileChanged = false;
+                    // 检测文件切换：通过路径变化检测（视频渲染可能先于音频切换）
+                    bool fileChanged = _currentVgmFilePath != currentFilePath;
+                    
+                    // 同时检测 MultiFileAudioSource 的版本号
                     if (_multiFileAudioSource != null)
                     {
                         int currentVersion = _multiFileAudioSource.FileChangeVersion;
                         if (currentVersion != _lastFileChangeVersion)
                         {
-                            // 文件已切换，清除旧引用和数据（防止内存泄漏）
                             _lastFileChangeVersion = currentVersion;
-                            _currentVgmAudioSource = null;
-                            _currentVgmFilePath = null;
                             fileChanged = true;
-                            
-                            // 清理可视化器旧数据（释放内存但保留实例）
-                            _currentVgmVisualizer?.Clear();
-                            
-                            Logger.Debug($"[Generator] 检测到文件切换 (version={currentVersion})");
+                            Logger.Debug($"[Generator] 检测到音频源文件切换 (version={currentVersion})");
                         }
                         
-                        // 从 MultiFileAudioSource 获取当前的 VgmAudioSource
+                        // 从 MultiFileAudioSource 获取当前的 VgmAudioSource（用于播放位置等）
                         var currentVgmSource = _multiFileAudioSource.CurrentVgmAudioSource;
                         if (currentVgmSource != null)
                         {
@@ -2590,26 +2587,33 @@ public class Generator
                         _currentVgmVisualizer = new VgmVisualizer();
                     }
                     
-                    // 加载 VGM 可视化数据（文件路径变化或文件切换时重新加载）
-                    if (_currentVgmFilePath != currentFilePath || fileChanged)
+                    // 加载 VGM 可视化数据（文件路径变化时重新加载）
+                    // 关键修复：总是使用文件路径创建临时 VgmAudioSource 读取芯片信息
+                    // 这确保可视化器获取正确文件的芯片数据，而不是依赖可能滞后的音频源
+                    if (fileChanged)
                     {
-                        // 从 MultiFileAudioSource 获取 VgmAudioSource，或创建临时实例
-                        var vgmSourceForViz = _currentVgmAudioSource;
-                        bool needDisposeViz = false;
-                        if (vgmSourceForViz == null)
-                        {
-                            vgmSourceForViz = new VgmAudioSource();
-                            vgmSourceForViz.LoadFile(currentFilePath);
-                            needDisposeViz = true;
-                        }
+                        // 清理可视化器旧数据
+                        _currentVgmVisualizer?.Clear();
                         
-                        if (vgmSourceForViz != null && vgmSourceForViz.IsLoaded)
+                        // 保存前一个芯片布局（用于切换动画）
+                        SavePreviousChipLayout();
+                        
+                        // 创建临时 VgmAudioSource 读取新文件的芯片信息
+                        var vgmSourceForViz = new VgmAudioSource();
+                        vgmSourceForViz.LoopCount = VgmLoopCount;
+                        vgmSourceForViz.FadeOutEnabled = VgmFadeOutEnabled;
+                        vgmSourceForViz.FadeOutDuration = VgmFadeOutDuration;
+                        
+                        if (vgmSourceForViz.LoadFile(currentFilePath))
                         {
                             // 保存 Header 信息（VgmVisualizer 会保存副本，不持有引用）
                             var headerForViz = vgmSourceForViz.Header;
                             
                             _currentVgmVisualizer.Initialize(vgmSourceForViz);
                             _currentVgmVisualizer.Gd3Language = VgmGd3Language;
+                            
+                            // 启动芯片切换动画
+                            StartChipTransition();
                             
                             // 加载原始 VGM 数据用于命令解析
                             try
@@ -2631,21 +2635,17 @@ public class Generator
                                 Logger.Warning($"[Generator] 加载 VGM 数据失败: {ex.Message}");
                             }
                             
-                            // 如果是临时创建的，释放它（VgmVisualizer 已保存数据副本）
-                            if (needDisposeViz)
-                            {
-                                vgmSourceForViz.Dispose();
-                            }
+                            // 释放临时 VgmAudioSource（VgmVisualizer 已保存数据副本）
+                            vgmSourceForViz.Dispose();
                             
-                            Logger.Info($"[Generator] 已加载 VGM: {_currentVgmVisualizer.SystemName}");
+                            // 打印芯片列表用于调试
+                            var chips = _currentVgmVisualizer.GetChipsString();
+                            Logger.Info($"[Generator] 已加载 VGM: {_currentVgmVisualizer.SystemName}, 芯片: {chips}");
                             _currentVgmFilePath = currentFilePath;
                         }
                         else
                         {
-                            if (needDisposeViz && vgmSourceForViz != null)
-                            {
-                                vgmSourceForViz.Dispose();
-                            }
+                            vgmSourceForViz.Dispose();
                             Logger.Warning($"[Generator] 加载 VGM 失败: {currentFilePath}");
                             _currentVgmFilePath = null;
                         }
@@ -4556,7 +4556,7 @@ public class Generator
         }
     }
     
-    // 绘制 VGM 芯片可视化（分组显示芯片名称和通道）
+    // 绘制 VGM 芯片可视化（分组显示芯片名称和通道，支持切换动画）
     private void DrawChipView(SKRect region, double currentTimeMs, SubFile currentSubfile = null)
     {
         if (_currentVgmVisualizer == null) return;
@@ -4567,12 +4567,16 @@ public class Generator
         float s = ResolutionScale;
         float padding = 12 * s;
         
+        // 芯片切换动画（新芯片从右向左滑入）
+        float transitionProgress = GetChipTransitionProgress();
+        float slideOffset = (transitionProgress < 1f) ? region.Width * (1f - transitionProgress) : 0f;
+        
         // 使用静态颜色常量（避免每帧创建）
         var chipStates = _currentVgmVisualizer.ChipStates;
         if (chipStates.Count == 0) return;
         
-        // 布局参数
-        float areaLeft = region.Left + padding;
+        // 布局参数（加上滑动偏移）
+        float areaLeft = region.Left + padding + slideOffset;
         float areaTop = region.Top + padding;
         float areaWidth = region.Width - padding * 2;
         float areaHeight = region.Height - padding * 2;
@@ -4586,14 +4590,12 @@ public class Generator
         }
         totalRows += chipStates.Count - 1;  // 芯片之间的空行
         
-        // 八度标记行高度
-        float octaveLabelHeight = 14 * s;
-        // 芯片标题行高度
+        // 芯片标题行高度（八度标记现在与芯片名同行）
         float chipTitleHeight = 18 * s;
         // 空行高度
         float emptyRowHeight = 8 * s;
         // 通道行高度（动态计算）
-        float availableHeight = areaHeight - octaveLabelHeight - chipStates.Count * chipTitleHeight - (chipStates.Count - 1) * emptyRowHeight;
+        float availableHeight = areaHeight - chipStates.Count * chipTitleHeight - (chipStates.Count - 1) * emptyRowHeight;
         int totalChannels = 0;
         foreach (var chip in chipStates)
             totalChannels += chip.Channels?.Length ?? 0;
@@ -4601,13 +4603,14 @@ public class Generator
         rowHeight = Math.Max(rowHeight, 10 * s);
         
         // 列宽定义
-        float labelWidth = 50 * s;
-        float noteNameWidth = 32 * s;
+        float labelWidth = 32 * s;       // 缩短通道标签宽度
+        float noteNameWidth = 28 * s;    // 音符名称宽度
+        float detuneWidth = 42 * s;      // D: (Detune) 数值宽度
         float volumeBarWidth = 50 * s;
-        float gapWidth = 4 * s;
+        float gapWidth = 3 * s;
         
         // 钢琴区域宽度（剩余空间）
-        float pianoWidth = areaWidth - labelWidth - noteNameWidth - volumeBarWidth - gapWidth * 3;
+        float pianoWidth = areaWidth - labelWidth - noteNameWidth - detuneWidth - volumeBarWidth - gapWidth * 4;
         pianoWidth = Math.Max(pianoWidth, 100 * s);
         
         // 钢琴参数（8个八度，96个半音）
@@ -4615,17 +4618,13 @@ public class Generator
         int totalKeys = totalOctaves * 12;
         float keyWidth = pianoWidth / totalKeys;
         
-        // 绘制八度标记（顶部）
+        // 钢琴 X 坐标
         float pianoX = areaLeft + labelWidth + gapWidth;
-        for (int oct = 0; oct < totalOctaves; oct++)
-        {
-            float octX = pianoX + oct * 12 * keyWidth;
-            DrawText(octX + 6 * keyWidth, areaTop + octaveLabelHeight / 2, _fontSize16 * 0.5f,
-                     $"o{oct}", _octaveLabelColor, VerticalAlign.Center, HorizontalAlign.Center);
-        }
         
-        float rowY = areaTop + octaveLabelHeight;
+        // 八度标记将在第一个芯片名所在行绘制
+        float rowY = areaTop;
         bool isFirstChip = true;
+        bool octaveLabelsDrawn = false;
         
         foreach (var chip in chipStates)
         {
@@ -4642,6 +4641,18 @@ public class Generator
             if (rowY + chipTitleHeight > region.Bottom - padding) break;
             DrawText(areaLeft, rowY + chipTitleHeight / 2, _fontSize16 * 0.7f,
                      chip.Info.Name, _chipNameColor, VerticalAlign.Center);
+            
+            // 在第一个芯片名所在行绘制八度标记（与芯片名对齐）
+            if (!octaveLabelsDrawn)
+            {
+                for (int oct = 0; oct < totalOctaves; oct++)
+                {
+                    float octX = pianoX + oct * 12 * keyWidth;
+                    DrawText(octX + 6 * keyWidth, rowY + chipTitleHeight / 2, _fontSize16 * 0.5f,
+                             $"o{oct}", _octaveLabelColor, VerticalAlign.Center, HorizontalAlign.Center);
+                }
+                octaveLabelsDrawn = true;
+            }
             rowY += chipTitleHeight;
             
             // 通道列表
@@ -4667,6 +4678,12 @@ public class Generator
                          channel.Note >= 0 ? VgmVisualizer.GetNoteName(channel.Note) : "--",
                          isOn ? _channelLabelOnColor : _channelLabelOffColor, VerticalAlign.Center);
                 colX += noteNameWidth + gapWidth;
+                
+                // D: (Detune) 数值显示
+                string detuneStr = channel.Detune > 0 ? $"D:+{channel.Detune}" : $"D:{channel.Detune}";
+                DrawText(colX, rowY + rowHeight / 2, _fontSize16 * 0.5f,
+                         detuneStr, _pitchDeltaColor, VerticalAlign.Center);
+                colX += detuneWidth + gapWidth;
                 
                 // L/R音量条（双柱显示，C352等四声道芯片显示4条）
                 float barH = rowHeight - 4 * s;
@@ -4697,6 +4714,7 @@ public class Generator
     private static readonly SKColor _channelLabelOnColor = new(200, 200, 200);
     private static readonly SKColor _channelLabelOffColor = new(80, 80, 80);
     private static readonly SKColor _octaveLabelColor = new(120, 120, 120);
+    private static readonly SKColor _pitchDeltaColor = new(255, 255, 255);  // D: Detune 数值颜色（纯白）
     
     // 绘制方块式钢琴键盘
     private void DrawPianoBlocks(float x, float y, float width, float height, int note, bool isOn, int octaves)
@@ -4873,6 +4891,84 @@ public class Generator
         int mins = (int)(seconds / 60);
         int secs = (int)(seconds % 60);
         return $"{mins}:{secs:D2}";
+    }
+    
+    // 保存前一个 VGM 的芯片布局（用于切换动画）
+    private void SavePreviousChipLayout()
+    {
+        _prevChipLayout.Clear();
+        if (_currentVgmVisualizer == null) return;
+        
+        var chipStates = _currentVgmVisualizer.ChipStates;
+        if (chipStates.Count == 0) return;
+        
+        // 计算布局参数（与 DrawChipView 保持一致）
+        float s = ResolutionScale;
+        float rowHeight = 14 * s;
+        float chipTitleHeight = 18 * s;
+        float emptyRowHeight = 8 * s;
+        float currentY = 0;
+        
+        foreach (var chip in chipStates)
+        {
+            if (chip.Channels == null) continue;
+            
+            float chipHeight = chipTitleHeight + chip.Channels.Length * rowHeight;
+            _prevChipLayout.Add(ChipLayoutInfo.FromChipState(chip, currentY, chipHeight));
+            currentY += chipHeight + emptyRowHeight;
+        }
+    }
+    
+    // 启动芯片切换动画
+    private void StartChipTransition()
+    {
+        _currChipLayout.Clear();
+        if (_currentVgmVisualizer == null) return;
+        
+        var chipStates = _currentVgmVisualizer.ChipStates;
+        if (chipStates.Count == 0) return;
+        
+        // 计算新的布局信息
+        float s = ResolutionScale;
+        float rowHeight = 14 * s;
+        float chipTitleHeight = 18 * s;
+        float emptyRowHeight = 8 * s;
+        float currentY = 0;
+        
+        foreach (var chip in chipStates)
+        {
+            if (chip.Channels == null) continue;
+            
+            float chipHeight = chipTitleHeight + chip.Channels.Length * rowHeight;
+            _currChipLayout.Add(ChipLayoutInfo.FromChipState(chip, currentY, chipHeight));
+            currentY += chipHeight + emptyRowHeight;
+        }
+        
+        // 启动动画
+        _chipTransitionStartTime = _currentVideoTime;
+        _chipTransitionActive = _prevChipLayout.Count > 0;
+        
+        if (_chipTransitionActive)
+        {
+            Logger.Debug($"[Generator] 芯片切换动画开始: {_prevChipLayout.Count} -> {_currChipLayout.Count} 芯片");
+        }
+    }
+    
+    // 获取芯片切换动画进度 (0=开始, 1=完成)
+    private float GetChipTransitionProgress()
+    {
+        if (!_chipTransitionActive || _chipTransitionStartTime < 0) return 1f;
+        
+        double elapsed = _currentVideoTime - _chipTransitionStartTime;
+        float progress = (float)(elapsed / ChipTransitionDuration);
+        
+        if (progress >= 1f)
+        {
+            _chipTransitionActive = false;
+            return 1f;
+        }
+        
+        return EaseOutCubic(Math.Clamp(progress, 0f, 1f));
     }
     #endregion
     

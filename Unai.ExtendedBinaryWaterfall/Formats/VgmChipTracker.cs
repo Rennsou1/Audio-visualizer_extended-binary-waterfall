@@ -5,6 +5,9 @@ namespace Unai.ExtendedBinaryWaterfall;
 // 芯片状态追踪器基类
 public abstract class VgmChipTracker
 {
+    // 芯片时钟频率（从 VGM 头读取）
+    public uint Clock { get; set; }
+    
     public abstract void ProcessEvent(VgmEvent evt);
     public abstract void Reset();
     public abstract void UpdateVisualizerState(VgmVisualizer.ChipState state);
@@ -13,14 +16,17 @@ public abstract class VgmChipTracker
 // YM2612 状态追踪器（Mega Drive/Genesis FM 芯片）
 public class YM2612Tracker : VgmChipTracker
 {
-    // 6 个 FM 通道 + 1 个 DAC
+    // 6 个 FM 通道，通道 6 可切换为 DAC/PCM 模式
     private readonly int[] _fnum = new int[6];
     private readonly int[] _block = new int[6];
     private readonly int[,] _tl = new int[6, 4];  // 每通道 4 个算子的 TL
     private readonly int[] _algo = new int[6];    // 算法
     private readonly int[] _lr = new int[6];      // Left/Right 输出选择
     private readonly bool[] _keyOn = new bool[6];
-    private bool _dacEnable;
+    private bool _dacEnable;                      // DAC 使能 (0x2B bit 7)
+    private int _dacData;                         // DAC 数据 (0x2A)
+    private bool _dacActive;                      // DAC 是否有数据输出
+    private uint _dacSampleRate;                  // DAC 采样率 (从 VGM DAC Stream 命令获取)
     
     // 算法对应的载波算子掩码 (S1=bit0, S2=bit1, S3=bit2, S4=bit3)
     // 算法 0-3: 只有 S4 是载波
@@ -81,16 +87,31 @@ public class YM2612Tracker : VgmChipTracker
                 _tl[ch, slot] = val & 0x7F;
             }
         }
+        // DAC 数据 (0x2A)
+        else if (reg == 0x2A)
+        {
+            _dacData = val;
+            // 写入 DAC 数据时，标记 DAC 活动
+            if (_dacEnable) _dacActive = true;
+        }
         // DAC 使能 (0x2B)
         else if (reg == 0x2B)
         {
             _dacEnable = (val & 0x80) != 0;
+            // DAC 关闭时，清除活动状态
+            if (!_dacEnable) _dacActive = false;
         }
         // L/R 输出选择 (0xB4-0xB6)
         else if (reg >= 0xB4 && reg <= 0xB6)
         {
             int ch = (reg - 0xB4) + chOffset;
             if (ch < 6) _lr[ch] = (val >> 6) & 0x03;  // bit7=L, bit6=R
+        }
+        // 特殊: DAC 采样率 (从 VGM DAC Stream 命令 0x92 获取)
+        // Register=0xFF, Port=freq[23:16], Value=freq[15:8], Value2=freq[7:0]
+        else if (reg == 0xFF)
+        {
+            _dacSampleRate = (uint)((evt.Port << 16) | (val << 8) | evt.Value2);
         }
     }
     
@@ -103,60 +124,100 @@ public class YM2612Tracker : VgmChipTracker
         Array.Clear(_lr);
         Array.Clear(_keyOn);
         _dacEnable = false;
+        _dacData = 0;
+        _dacActive = false;
+        _dacSampleRate = 0;
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        for (int ch = 0; ch < 6; ch++)
+        // FM 通道 1-5 (索引 0-4)
+        for (int ch = 0; ch < 5; ch++)
         {
             if (ch >= state.Channels.Length) break;
-            
-            state.Channels[ch].KeyOn = _keyOn[ch];
-            
-            // 根据算法计算载波算子的最小 TL（最大音量）
-            int mask = CarrierMask[_algo[ch]];
-            int minTl = 127;
-            for (int op = 0; op < 4; op++)
+            UpdateFmChannel(state, ch);
+        }
+        
+        // 通道 6 (索引 5): DAC 启用时显示 PCM，否则显示 FM
+        if (state.Channels.Length > 5)
+        {
+            if (_dacEnable)
             {
-                if ((mask & (1 << op)) != 0)
-                    minTl = Math.Min(minTl, _tl[ch, op]);
-            }
-            int vol = Math.Max(0, 127 - minTl);
-            state.Channels[ch].Volume = vol;
-            
-            // 设置左右声道 (bit1=L, bit0=R)
-            int lr = _lr[ch];
-            state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
-            state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
-            
-            if (_keyOn[ch] && _fnum[ch] > 0)
-            {
-                state.Channels[ch].Note = FnumToNote(_fnum[ch], _block[ch]);
+                // DAC/PCM 模式: 通道 6 被 DAC 占用
+                state.Channels[5].KeyOn = _dacActive;
+                state.Channels[5].Volume = _dacActive ? 127 : 0;
+                state.Channels[5].PanLeft = _dacActive ? 127 : 0;
+                state.Channels[5].PanRight = _dacActive ? 127 : 0;
+                
+                // 使用采样率映射音高 (以 22050 Hz 为基准 = C5)
+                if (_dacActive && _dacSampleRate > 0)
+                {
+                    // 采样率比例转音高: ratio = sampleRate / 22050
+                    // 每翻倍采样率，音高上升 12 个半音
+                    double ratio = _dacSampleRate / 22050.0;
+                    state.Channels[5].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);  // C5 = 60
+                    state.Channels[5].Detune = (int)(_dacSampleRate & 0xFF);
+                }
+                else
+                {
+                    state.Channels[5].Note = -1;
+                    state.Channels[5].Detune = 0;
+                }
             }
             else
             {
-                state.Channels[ch].Note = -1;
+                // FM 模式
+                UpdateFmChannel(state, 5);
             }
         }
         
-        // DAC 通道
-        if (state.Channels.Length > 6)
+        // DAC 活动状态在下一帧重置（需要持续写入才保持活动）
+        _dacActive = false;
+    }
+    
+    // 更新单个 FM 通道状态
+    private void UpdateFmChannel(VgmVisualizer.ChipState state, int ch)
+    {
+        state.Channels[ch].KeyOn = _keyOn[ch];
+        
+        // 根据算法计算载波算子的最小 TL（最大音量）
+        int mask = CarrierMask[_algo[ch]];
+        int minTl = 127;
+        for (int op = 0; op < 4; op++)
         {
-            int dacVol = _dacEnable ? 127 : 0;
-            state.Channels[6].KeyOn = _dacEnable;
-            state.Channels[6].Note = -1;
-            state.Channels[6].Volume = dacVol;
-            state.Channels[6].PanLeft = dacVol;
-            state.Channels[6].PanRight = dacVol;
+            if ((mask & (1 << op)) != 0)
+                minTl = Math.Min(minTl, _tl[ch, op]);
+        }
+        int vol = Math.Max(0, 127 - minTl);
+        state.Channels[ch].Volume = vol;
+        
+        // 设置左右声道 (bit1=L, bit0=R)
+        int lr = _lr[ch];
+        state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+        state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
+        
+        // Detune: F-Number 低 8 位作为精细音高偏移
+        state.Channels[ch].Detune = _fnum[ch] & 0xFF;
+        
+        if (_keyOn[ch] && _fnum[ch] > 0)
+        {
+            state.Channels[ch].Note = FnumToNote(_fnum[ch], _block[ch]);
+        }
+        else
+        {
+            state.Channels[ch].Note = -1;
         }
     }
     
     // YM2612 F-Number 转音符
-    private static int FnumToNote(int fnum, int block)
+    // 公式: freq = (fnum * 2^(block-1) * clock) / 2^20 / 144
+    // 简化: freq = fnum * clock / (144 * 2^(21-block))
+    private int FnumToNote(int fnum, int block)
     {
         if (fnum == 0) return -1;
-        // YM2612: freq = fnum * clock / (144 * 2^(21-block))
-        double freq = fnum * 7670454.0 / (144.0 * Math.Pow(2, 21 - block));
+        // 使用 VGM 头中的时钟频率，如果为 0 则使用默认值 (NTSC: 7670453 Hz)
+        double clock = Clock > 0 ? Clock : 7670453.0;
+        double freq = fnum * clock / (144.0 * Math.Pow(2, 21 - block));
         return VgmVisualizer.FrequencyToNote(freq);
     }
 }
@@ -214,6 +275,8 @@ public class SN76489Tracker : VgmChipTracker
             int vol = (15 - _volume[ch]) * 127 / 15;
             state.Channels[ch].KeyOn = active;
             state.Channels[ch].Volume = vol;
+            // Detune: 频率寄存器低 4 位
+            state.Channels[ch].Detune = _tone[ch] & 0x0F;
             // SN76489 是单声道芯片，左右相同
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
@@ -240,11 +303,14 @@ public class SN76489Tracker : VgmChipTracker
         }
     }
     
-    // SN76489 周期转音符（假设 3579545 Hz 时钟）
-    private static int PeriodToNote(int period)
+    // SN76489 周期转音符
+    // 公式: freq = clock / (2 * period * 16) = clock / (32 * period)
+    private int PeriodToNote(int period)
     {
-        if (period == 0) return -1;
-        double freq = 3579545.0 / (32.0 * period);
+        if (period <= 1) return -1;  // period=0 或 1 通常表示静音或超高频
+        // 使用 VGM 头中的时钟频率，如果为 0 则使用默认值 (NTSC: 3579545 Hz)
+        double clock = Clock > 0 ? Clock : 3579545.0;
+        double freq = clock / (32.0 * period);
         return VgmVisualizer.FrequencyToNote(freq);
     }
 }
@@ -302,11 +368,15 @@ public class AY8910Tracker : VgmChipTracker
             // AY8910 是单声道芯片，左右相同
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            // Detune: 频率寄存器低 8 位
+            state.Channels[ch].Detune = _tonePeriod[ch] & 0xFF;
             
             if (active)
             {
-                // 假设 1.78 MHz 时钟
-                double freq = 1789773.0 / (16.0 * _tonePeriod[ch]);
+                // AY-3-8910: freq = clock / (16 * period)
+                // 使用 VGM 头中的时钟，默认 1789773 Hz
+                double clock = Clock > 0 ? Clock : 1789773.0;
+                double freq = clock / (16.0 * _tonePeriod[ch]);
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -323,9 +393,11 @@ public class YM2151Tracker : VgmChipTracker
     private readonly int[] _kc = new int[8];       // Key Code
     private readonly int[] _kf = new int[8];       // Key Fraction
     private readonly int[,] _tl = new int[8, 4];   // 每通道 4 个算子的 TL
+    private readonly int[,] _dt1 = new int[8, 4];  // DT1 (Detune 1) 每算子
     private readonly int[] _algo = new int[8];     // 算法
     private readonly int[] _rl = new int[8];       // RL (Right/Left) 声道选择
     private readonly bool[] _keyOn = new bool[8];
+    private readonly int[] _pms = new int[8];      // PMS (LFO Pitch Modulation Sensitivity)
     
     // YM2151 与 YM2612 使用相同的 8 种算法
     private static readonly int[] CarrierMask = { 0x08, 0x08, 0x08, 0x08, 0x0A, 0x0E, 0x0E, 0x0F };
@@ -346,7 +418,7 @@ public class YM2151Tracker : VgmChipTracker
         {
             int ch = reg & 0x07;
             _algo[ch] = val & 0x07;
-            _rl[ch] = val & 0xC0;  // 保存 RL 位
+            _rl[ch] = val & 0xC0;
         }
         // Key Code (0x28-0x2F)
         else if (reg >= 0x28 && reg <= 0x2F)
@@ -360,10 +432,23 @@ public class YM2151Tracker : VgmChipTracker
             int ch = reg & 0x07;
             _kf[ch] = (val >> 2) & 0x3F;
         }
+        // PMS/AMS (0x38-0x3F): bit6-4=PMS, bit1-0=AMS
+        else if (reg >= 0x38 && reg <= 0x3F)
+        {
+            int ch = reg & 0x07;
+            _pms[ch] = (val >> 4) & 0x07;
+        }
+        // DT1/MUL (0x40-0x5F: 4 算子 x 8 通道)
+        else if (reg >= 0x40 && reg <= 0x5F)
+        {
+            int op = (reg - 0x40) / 8;
+            int ch = reg & 0x07;
+            _dt1[ch, op] = (val >> 4) & 0x07;  // DT1: bit6-4
+        }
         // TL (0x60-0x7F: 4 个算子 x 8 通道)
         else if (reg >= 0x60 && reg <= 0x7F)
         {
-            int op = (reg - 0x60) / 8;  // 0-3
+            int op = (reg - 0x60) / 8;
             int ch = reg & 0x07;
             _tl[ch, op] = val & 0x7F;
         }
@@ -374,9 +459,11 @@ public class YM2151Tracker : VgmChipTracker
         Array.Clear(_kc);
         Array.Clear(_kf);
         Array.Clear(_tl);
+        Array.Clear(_dt1);
         Array.Clear(_algo);
         Array.Clear(_rl);
         Array.Clear(_keyOn);
+        Array.Clear(_pms);
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
@@ -388,13 +475,25 @@ public class YM2151Tracker : VgmChipTracker
             // 根据算法计算载波算子的最小 TL
             int mask = CarrierMask[_algo[ch]];
             int minTl = 127;
+            int sumDt1 = 0;
+            int carrierCount = 0;
             for (int op = 0; op < 4; op++)
             {
                 if ((mask & (1 << op)) != 0)
+                {
                     minTl = Math.Min(minTl, _tl[ch, op]);
+                    // DT1: 0-3=正向 detune, 4-7=负向 detune (4=0, 5=-1, 6=-2, 7=-3)
+                    int dt = _dt1[ch, op];
+                    sumDt1 += (dt < 4) ? dt : -(dt - 4);
+                    carrierCount++;
+                }
             }
             int vol = Math.Max(0, 127 - minTl);
             state.Channels[ch].Volume = vol;
+            
+            // Detune: Key Fraction (KF) 精细音高偏移
+            // KF: 0-63，表示半音的 1/64 偏移，用于滑音/弯音效果
+            state.Channels[ch].Detune = _kf[ch];
             
             // 设置声像显示（根据 RL 寄存器）
             int rl = _rl[ch];
@@ -496,11 +595,14 @@ public class YM2413Tracker : VgmChipTracker
             // YM2413 是单声道芯片
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            // Detune: F-Number 低 8 位
+            state.Channels[ch].Detune = _fnum[ch] & 0xFF;
             
             if (_keyOn[ch] && _fnum[ch] > 0)
             {
                 // OPLL: freq = fnum * clock / (72 * 2^(19-block))
-                double freq = _fnum[ch] * 3579545.0 / (72.0 * Math.Pow(2, 19 - _block[ch]));
+                double clock = Clock > 0 ? Clock : 3579545.0;
+                double freq = _fnum[ch] * clock / (72.0 * Math.Pow(2, 19 - _block[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -618,10 +720,14 @@ public class YM2203Tracker : VgmChipTracker
             // YM2203 FM 是单声道
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            // Detune: F-Number 低 8 位
+            state.Channels[ch].Detune = _fmFnum[ch] & 0xFF;
             
             if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
             {
-                double freq = _fmFnum[ch] * 3993600.0 / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
+                // YM2203 (OPN): freq = fnum * clock / (72 * 2^(21-block))
+                double clock = Clock > 0 ? Clock : 4000000.0;
+                double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -639,10 +745,15 @@ public class YM2203Tracker : VgmChipTracker
             state.Channels[ch + 3].Volume = vol;
             state.Channels[ch + 3].PanLeft = vol;
             state.Channels[ch + 3].PanRight = vol;
+            // Detune: SSG 频率低 8 位
+            state.Channels[ch + 3].Detune = _ssgPeriod[ch] & 0xFF;
             
             if (active)
             {
-                double freq = 3993600.0 / (32.0 * _ssgPeriod[ch]);
+                // YM2203 SSG: freq = clock / (16 * period)
+                // SSG 时钟为 FM 时钟的 1/2
+                double clock = Clock > 0 ? Clock / 2.0 : 2000000.0;
+                double freq = clock / (16.0 * _ssgPeriod[ch]);
                 state.Channels[ch + 3].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -660,7 +771,8 @@ public class NesApuTracker : VgmChipTracker
     private readonly int[] _volume = new int[3];      // Pulse1, Pulse2, Noise (Triangle无音量控制)
     private readonly bool[] _enable = new bool[5];    // Pulse1, Pulse2, Triangle, Noise, DMC
     private readonly bool[] _lengthHalt = new bool[4];// 长度计数器停止标志
-    private int _linearCounter;                       // Triangle 线性计数器
+    private int _linearCounterReload;                 // Triangle 线性计数器重载值
+    private bool _triangleKeyOn;                      // Triangle 是否处于 Key On 状态
     private int _dmcFreq;
     
     public override void ProcessEvent(VgmEvent evt)
@@ -690,10 +802,17 @@ public class NesApuTracker : VgmChipTracker
         else if (reg == 0x08)
         {
             _lengthHalt[2] = (val & 0x80) != 0;
-            _linearCounter = val & 0x7F;
+            _linearCounterReload = val & 0x7F;
+            // 线性计数器重载值为 0 时，Key Off
+            if (_linearCounterReload == 0) _triangleKeyOn = false;
         }
         else if (reg == 0x0A) _period[2] = (_period[2] & 0x700) | val;
-        else if (reg == 0x0B) _period[2] = (_period[2] & 0x0FF) | ((val & 0x07) << 8);
+        else if (reg == 0x0B)
+        {
+            _period[2] = (_period[2] & 0x0FF) | ((val & 0x07) << 8);
+            // 写入 0x0B 会重新加载线性计数器，触发 Key On
+            if (_linearCounterReload > 0) _triangleKeyOn = true;
+        }
         
         // Noise (0x0C-0x0F)
         else if (reg == 0x0C)
@@ -711,6 +830,8 @@ public class NesApuTracker : VgmChipTracker
             _enable[2] = (val & 0x04) != 0;
             _enable[3] = (val & 0x08) != 0;
             _enable[4] = (val & 0x10) != 0;
+            // 清除 Triangle enable 时，Key Off
+            if (!_enable[2]) _triangleKeyOn = false;
         }
         
         // DMC (0x10)
@@ -723,7 +844,8 @@ public class NesApuTracker : VgmChipTracker
         Array.Clear(_volume);
         Array.Clear(_enable);
         Array.Clear(_lengthHalt);
-        _linearCounter = 0;
+        _linearCounterReload = 0;
+        _triangleKeyOn = false;
         _dmcFreq = 0;
     }
     
@@ -738,6 +860,7 @@ public class NesApuTracker : VgmChipTracker
             state.Channels[0].Volume = vol;
             state.Channels[0].PanLeft = vol;
             state.Channels[0].PanRight = vol;
+            state.Channels[0].Detune = _period[0] & 0xFF;
             state.Channels[0].Note = active ? PeriodToNote(_period[0]) : -1;
         }
         
@@ -750,18 +873,21 @@ public class NesApuTracker : VgmChipTracker
             state.Channels[1].Volume = vol;
             state.Channels[1].PanLeft = vol;
             state.Channels[1].PanRight = vol;
+            state.Channels[1].Detune = _period[1] & 0xFF;
             state.Channels[1].Note = active ? PeriodToNote(_period[1]) : -1;
         }
         
-        // Triangle (无音量控制，始终最大音量)
+        // Triangle (无音量控制)
         if (state.Channels.Length > 2)
         {
-            bool active = _enable[2] && _linearCounter > 0 && _period[2] >= 2;
+            // Triangle 活动条件: enable && keyOn && period 有效
+            bool active = _enable[2] && _triangleKeyOn && _period[2] >= 2;
             int vol = active ? 127 : 0;
             state.Channels[2].KeyOn = active;
             state.Channels[2].Volume = vol;
             state.Channels[2].PanLeft = vol;
             state.Channels[2].PanRight = vol;
+            state.Channels[2].Detune = _period[2] & 0xFF;
             state.Channels[2].Note = active ? TrianglePeriodToNote(_period[2]) : -1;
         }
         
@@ -788,19 +914,22 @@ public class NesApuTracker : VgmChipTracker
         }
     }
     
-    // Pulse 频率: f = CPU / (16 * (t + 1))
-    private static int PeriodToNote(int period)
+    // NES APU Pulse 频率: f = CPU_clock / (16 * (period + 1))
+    private int PeriodToNote(int period)
     {
         if (period < 8) return -1;
-        double freq = 1789773.0 / (16.0 * (period + 1));
+        // 使用 VGM 头中的时钟，默认 NTSC 1789773 Hz
+        double clock = Clock > 0 ? Clock : 1789773.0;
+        double freq = clock / (16.0 * (period + 1));
         return VgmVisualizer.FrequencyToNote(freq);
     }
     
-    // Triangle 频率: f = CPU / (32 * (t + 1)) - 比 Pulse 低一个八度
-    private static int TrianglePeriodToNote(int period)
+    // NES APU Triangle 频率: f = CPU_clock / (32 * (period + 1))
+    private int TrianglePeriodToNote(int period)
     {
         if (period < 2) return -1;
-        double freq = 1789773.0 / (32.0 * (period + 1));
+        double clock = Clock > 0 ? Clock : 1789773.0;
+        double freq = clock / (32.0 * (period + 1));
         return VgmVisualizer.FrequencyToNote(freq);
     }
 }
@@ -808,9 +937,11 @@ public class NesApuTracker : VgmChipTracker
 // Game Boy DMG 状态追踪器
 public class GbDmgTracker : VgmChipTracker
 {
-    private readonly int[] _freq = new int[3];    // CH1, CH2, Wave
-    private readonly int[] _volume = new int[4];
-    private readonly bool[] _enable = new bool[4];
+    private readonly int[] _freq = new int[3];      // CH1, CH2, Wave
+    private readonly int[] _nrx2 = new int[4];      // NRx2 寄存器值 (DAC 控制)
+    private readonly bool[] _keyOn = new bool[4];   // Key On 状态
+    private bool _dacCh3;                           // CH3 DAC enable (NR30 bit 7)
+    private bool _masterEnable;                     // 主开关 (NR52 bit 7)
     
     public override void ProcessEvent(VgmEvent evt)
     {
@@ -818,31 +949,72 @@ public class GbDmgTracker : VgmChipTracker
         byte val = evt.Value;
         
         // CH1 (0x10-0x14)
-        if (reg == 0x12) _volume[0] = (val >> 4) & 0x0F;
+        if (reg == 0x12)
+        {
+            _nrx2[0] = val;
+            // DAC off 时 Key Off
+            if ((val & 0xF8) == 0) _keyOn[0] = false;
+        }
         else if (reg == 0x13) _freq[0] = (_freq[0] & 0x700) | val;
-        else if (reg == 0x14) { _freq[0] = (_freq[0] & 0x0FF) | ((val & 0x07) << 8); if ((val & 0x80) != 0) _enable[0] = true; }
+        else if (reg == 0x14)
+        {
+            _freq[0] = (_freq[0] & 0x0FF) | ((val & 0x07) << 8);
+            // bit 7 = trigger, DAC 开启时触发 Key On
+            if ((val & 0x80) != 0 && (_nrx2[0] & 0xF8) != 0)
+                _keyOn[0] = true;
+        }
         
         // CH2 (0x16-0x19)
-        else if (reg == 0x17) _volume[1] = (val >> 4) & 0x0F;
+        else if (reg == 0x17)
+        {
+            _nrx2[1] = val;
+            if ((val & 0xF8) == 0) _keyOn[1] = false;
+        }
         else if (reg == 0x18) _freq[1] = (_freq[1] & 0x700) | val;
-        else if (reg == 0x19) { _freq[1] = (_freq[1] & 0x0FF) | ((val & 0x07) << 8); if ((val & 0x80) != 0) _enable[1] = true; }
+        else if (reg == 0x19)
+        {
+            _freq[1] = (_freq[1] & 0x0FF) | ((val & 0x07) << 8);
+            if ((val & 0x80) != 0 && (_nrx2[1] & 0xF8) != 0)
+                _keyOn[1] = true;
+        }
         
         // CH3 Wave (0x1A-0x1E)
-        else if (reg == 0x1A) _enable[2] = (val & 0x80) != 0;
-        else if (reg == 0x1C) _volume[2] = (val >> 5) & 0x03;
+        else if (reg == 0x1A)
+        {
+            _dacCh3 = (val & 0x80) != 0;
+            // DAC off 时 Key Off
+            if (!_dacCh3) _keyOn[2] = false;
+        }
+        else if (reg == 0x1C) _nrx2[2] = val;  // 音量代码 (0-3)
         else if (reg == 0x1D) _freq[2] = (_freq[2] & 0x700) | val;
-        else if (reg == 0x1E) _freq[2] = (_freq[2] & 0x0FF) | ((val & 0x07) << 8);
+        else if (reg == 0x1E)
+        {
+            _freq[2] = (_freq[2] & 0x0FF) | ((val & 0x07) << 8);
+            // DAC 开启时触发 Key On
+            if ((val & 0x80) != 0 && _dacCh3)
+                _keyOn[2] = true;
+        }
         
         // CH4 Noise (0x20-0x23)
-        else if (reg == 0x21) _volume[3] = (val >> 4) & 0x0F;
-        else if (reg == 0x23) if ((val & 0x80) != 0) _enable[3] = true;
+        else if (reg == 0x21)
+        {
+            _nrx2[3] = val;
+            if ((val & 0xF8) == 0) _keyOn[3] = false;
+        }
+        else if (reg == 0x23)
+        {
+            if ((val & 0x80) != 0 && (_nrx2[3] & 0xF8) != 0)
+                _keyOn[3] = true;
+        }
         
-        // Master control (0x26)
+        // NR52 Master control (0x26)
         else if (reg == 0x26)
         {
-            if ((val & 0x80) == 0)
+            _masterEnable = (val & 0x80) != 0;
+            // 关闭主开关时，所有通道 Key Off
+            if (!_masterEnable)
             {
-                Array.Clear(_enable);
+                Array.Clear(_keyOn);
             }
         }
     }
@@ -850,25 +1022,31 @@ public class GbDmgTracker : VgmChipTracker
     public override void Reset()
     {
         Array.Clear(_freq);
-        Array.Clear(_volume);
-        Array.Clear(_enable);
+        Array.Clear(_nrx2);
+        Array.Clear(_keyOn);
+        _dacCh3 = false;
+        _masterEnable = false;
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        // CH1, CH2
+        // CH1, CH2: 音量从 NRx2 高 4 位获取
         for (int ch = 0; ch < 2 && ch < state.Channels.Length; ch++)
         {
-            bool active = _enable[ch] && _volume[ch] > 0;
-            int vol = _volume[ch] * 127 / 15;
+            int volume = (_nrx2[ch] >> 4) & 0x0F;
+            bool active = _keyOn[ch] && volume > 0;
+            int vol = volume * 127 / 15;
             state.Channels[ch].KeyOn = active;
             state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active && _freq[ch] > 0)
             {
-                double freq = 131072.0 / (2048 - _freq[ch]);
+                // GB DMG: freq = clock / (32 * (2048 - freq_reg))
+                double clock = Clock > 0 ? Clock / 32.0 : 131072.0;
+                double freq = clock / (2048 - _freq[ch]);
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -877,19 +1055,25 @@ public class GbDmgTracker : VgmChipTracker
             }
         }
         
-        // CH3 Wave
+        // CH3 Wave: 音量从 NR32 (0x1C) 的 bit 5-6 获取 (0-3)
         if (state.Channels.Length > 2)
         {
-            bool active = _enable[2] && _volume[2] > 0;
-            int vol = _volume[2] * 42;
+            int volCode = (_nrx2[2] >> 5) & 0x03;
+            // 音量代码: 0=静音, 1=100%, 2=50%, 3=25%
+            int[] volTable = { 0, 127, 64, 32 };
+            int vol = volTable[volCode];
+            bool active = _keyOn[2] && volCode > 0;
             state.Channels[2].KeyOn = active;
             state.Channels[2].Volume = vol;
             state.Channels[2].PanLeft = vol;
             state.Channels[2].PanRight = vol;
+            state.Channels[2].Detune = _freq[2] & 0xFF;
             
             if (active && _freq[2] > 0)
             {
-                double freq = 65536.0 / (2048 - _freq[2]);
+                // CH3 频率是 CH1/CH2 的两倍 (clock/64 vs clock/32)
+                double clock = Clock > 0 ? Clock / 64.0 : 65536.0;
+                double freq = clock / (2048 - _freq[2]);
                 state.Channels[2].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -898,11 +1082,12 @@ public class GbDmgTracker : VgmChipTracker
             }
         }
         
-        // CH4 Noise
+        // CH4 Noise: 音量从 NR42 (0x21) 高 4 位获取
         if (state.Channels.Length > 3)
         {
-            int vol = _volume[3] * 127 / 15;
-            state.Channels[3].KeyOn = _enable[3] && _volume[3] > 0;
+            int volume = (_nrx2[3] >> 4) & 0x0F;
+            int vol = volume * 127 / 15;
+            state.Channels[3].KeyOn = _keyOn[3] && volume > 0;
             state.Channels[3].Volume = vol;
             state.Channels[3].PanLeft = vol;
             state.Channels[3].PanRight = vol;
@@ -953,10 +1138,13 @@ public class HuC6280Tracker : VgmChipTracker
             state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active)
             {
-                double freq = 3579545.0 / (32.0 * _freq[ch]);
+                // HuC6280: freq = clock / (32 * period)
+                double clock = Clock > 0 ? Clock : 3579545.0;
+                double freq = clock / (32.0 * _freq[ch]);
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -1022,11 +1210,13 @@ public class OplTracker : VgmChipTracker
             // OPL 是单声道芯片
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            state.Channels[ch].Detune = _fnum[ch] & 0xFF;
             
             if (_keyOn[ch] && _fnum[ch] > 0)
             {
                 // OPL: freq = fnum * clock / (72 * 2^(20-block))
-                double freq = _fnum[ch] * 3579545.0 / (72.0 * Math.Pow(2, 20 - _block[ch]));
+                double clock = Clock > 0 ? Clock : 3579545.0;
+                double freq = _fnum[ch] * clock / (72.0 * Math.Pow(2, 20 - _block[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -1112,6 +1302,8 @@ public class QSoundTracker : VgmChipTracker
             state.Channels[ch].PanRight = Math.Min(127, pan & 0xFF);
             
             // QSound: pitch=0x1000 为原始音高
+            // Detune: 相对于 0x1000 的偏移
+            state.Channels[ch].Detune = _pitch[ch] - 0x1000;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 4096.0;
@@ -1176,10 +1368,13 @@ public class K051649Tracker : VgmChipTracker
             state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active)
             {
-                double freq = 3579545.0 / (32.0 * _freq[ch]);
+                // K051649 (SCC): freq = clock / (32 * period)
+                double clock = Clock > 0 ? Clock : 3579545.0;
+                double freq = clock / (32.0 * _freq[ch]);
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -1229,9 +1424,12 @@ public class PokeyTracker : VgmChipTracker
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
             
+            state.Channels[ch].Detune = _freq[ch];
             if (active)
             {
-                double freq = 1789773.0 / (2.0 * (_freq[ch] + 1));
+                // POKEY: freq = clock / (2 * (period + 1))
+                double clock = Clock > 0 ? Clock : 1789773.0;
+                double freq = clock / (2.0 * (_freq[ch] + 1));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -1296,10 +1494,13 @@ public class SAA1099Tracker : VgmChipTracker
             // SAA1099 有立体声，但简化为单声道
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            state.Channels[ch].Detune = _freq[ch];
             
             if (active && _freq[ch] > 0)
             {
-                double freq = 7159090.0 / (512.0 * _freq[ch] * Math.Pow(2, 8 - _octave[ch]));
+                // SAA1099: freq = clock / (512 * period * 2^(8-octave))
+                double clock = Clock > 0 ? Clock : 7159090.0;
+                double freq = clock / (512.0 * _freq[ch] * Math.Pow(2, 8 - _octave[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -1383,9 +1584,10 @@ public class RF5CTracker : VgmChipTracker
             state.Channels[ch].PanRight = panR * 8;
             
             // 从频率增量计算音高: FD=0x800 为原始音高
+            int fd = _fdLow[ch] | (_fdHigh[ch] << 8);
+            state.Channels[ch].Detune = fd - 0x800;
             if (active)
             {
-                int fd = _fdLow[ch] | (_fdHigh[ch] << 8);
                 if (fd > 0)
                 {
                     double ratio = fd / 2048.0;
@@ -1452,9 +1654,10 @@ public class C140Tracker : VgmChipTracker
             state.Channels[ch].PanRight = _volumeR[ch];
             
             // C140: freq16=0x1000 为原始音高
+            int freq16 = (_freqH[ch] << 8) | _freqL[ch];
+            state.Channels[ch].Detune = freq16 - 0x1000;
             if (_keyOn[ch])
             {
-                int freq16 = (_freqH[ch] << 8) | _freqL[ch];
                 if (freq16 > 0)
                 {
                     double ratio = freq16 / 4096.0;
@@ -1567,6 +1770,7 @@ public class C352Tracker : VgmChipTracker
             state.Channels[ch].HasQuadChannel = true;  // C352 是四声道芯片
             
             // Pitch -> Note: C352 freq=0x10000 为原始音高
+            state.Channels[ch].Detune = _freq[ch] - 0x10000;
             if (_busy[ch] && _freq[ch] > 0)
             {
                 double ratio = _freq[ch] / 65536.0;
@@ -1659,6 +1863,7 @@ public class K053260Tracker : VgmChipTracker
             state.Channels[ch].PanRight = K053260_PanTable[pan, 1] * _volume[ch] / 127;
             
             // Pitch -> Note: K053260 pitch=0x800 为原始音高
+            state.Channels[ch].Detune = _pitch[ch] - 0x800;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 2048.0;
@@ -1730,6 +1935,7 @@ public class K054539Tracker : VgmChipTracker
             state.Channels[ch].PanRight = _panR[ch];
             
             // K054539: 24位pitch，pitch=0x10000 为原始音高
+            state.Channels[ch].Detune = (_pitch[ch] - 0x10000) >> 8;  // 取高 16 位
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 65536.0;
@@ -1794,6 +2000,7 @@ public class MultiPCMTracker : VgmChipTracker
             
             // MultiPCM: Octave + Pitch -> Note
             // pitch=0x400 为基准，octave 调整八度
+            state.Channels[ch].Detune = _pitch[ch] - 0x400;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 int octave = (_oct[ch] & 0x07) - 4;
@@ -1859,6 +2066,7 @@ public class ScspTracker : VgmChipTracker
             state.Channels[ch].PanRight = _panR[ch] * 8;
             
             // SCSP: OCT + FNS -> Note
+            state.Channels[ch].Detune = _fns[ch];
             if (_keyOn[ch])
             {
                 int oct = _oct[ch];
@@ -1926,10 +2134,13 @@ public class WSwanTracker : VgmChipTracker
             // WonderSwan 立体声支持，但此处简化为单声道
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
+            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active && _freq[ch] > 0)
             {
-                double freq = 3072000.0 / (32.0 * (2048 - _freq[ch]));
+                // WonderSwan: freq = clock / (32 * (2048 - freq_reg))
+                double clock = Clock > 0 ? Clock : 3072000.0;
+                double freq = clock / (32.0 * (2048 - _freq[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -1980,10 +2191,13 @@ public class X1010Tracker : VgmChipTracker
 
 // OKIM6295 状态追踪器
 // 参考: https://vgmrips.net/wiki/OKIM6295
+// 4通道 ADPCM 采样播放芯片，采样率 = clock / 132 (pin7=H) 或 clock / 165 (pin7=L)
 public class OKIM6295Tracker : VgmChipTracker
 {
     private readonly bool[] _keyOn = new bool[4];
     private readonly int[] _attenuation = new int[4];  // 衰减值 (0-15, 0=最大, 15=静音)
+    private readonly int[] _sampleNum = new int[4];    // 正在播放的采样号 (0-127)
+    private int _pendingSample = -1;                   // 等待分配的采样号
     
     public override void ProcessEvent(VgmEvent evt)
     {
@@ -1995,21 +2209,35 @@ public class OKIM6295Tracker : VgmChipTracker
             // 命令字节
             if ((val & 0x80) != 0)
             {
-                // Key On: bit 0-3 选择通道
-                for (int i = 0; i < 4; i++)
-                    if ((val & (1 << i)) != 0) _keyOn[i] = true;
+                // 采样选择命令: bit7=1, bit0-6=采样号
+                _pendingSample = val & 0x7F;
             }
             else if ((val & 0x78) != 0)
             {
-                // Key Off: bit 3-6 选择通道
+                // Key Off: bit 3-6 选择通道 (0x08=ch0, 0x10=ch1, 0x20=ch2, 0x40=ch3)
                 for (int i = 0; i < 4; i++)
-                    if ((val & (8 << i)) != 0) _keyOn[i] = false;
+                {
+                    if ((val & (8 << i)) != 0)
+                    {
+                        _keyOn[i] = false;
+                        _sampleNum[i] = -1;
+                    }
+                }
             }
-        }
-        else if (reg >= 0x08 && reg <= 0x0B)
-        {
-            // 音量寄存器：高4位是衰减值
-            _attenuation[reg - 0x08] = (val >> 4) & 0x0F;
+            else if ((val & 0x0F) != 0 && _pendingSample >= 0)
+            {
+                // Key On: bit0-3 选择通道，使用之前设置的采样号
+                for (int i = 0; i < 4; i++)
+                {
+                    if ((val & (1 << i)) != 0)
+                    {
+                        _keyOn[i] = true;
+                        _sampleNum[i] = _pendingSample;
+                        _attenuation[i] = (val >> 4) & 0x0F;  // 高4位是衰减值
+                    }
+                }
+                _pendingSample = -1;
+            }
         }
     }
     
@@ -2017,6 +2245,8 @@ public class OKIM6295Tracker : VgmChipTracker
     {
         Array.Clear(_keyOn);
         Array.Clear(_attenuation);
+        Array.Clear(_sampleNum);
+        _pendingSample = -1;
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
@@ -2031,7 +2261,17 @@ public class OKIM6295Tracker : VgmChipTracker
             // OKIM6295 是单声道，左右相同
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Note = -1;  // PCM 采样器无固定音高
+            
+            // 采样号映射到音高显示 (采样号 0-127 映射到 MIDI note 24-96)
+            // 这样可以在钢琴卷帘上显示不同采样的位置
+            if (_keyOn[ch] && _sampleNum[ch] >= 0)
+            {
+                state.Channels[ch].Note = 24 + (_sampleNum[ch] % 73);  // 限制在合理范围内
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+            }
         }
     }
 }
@@ -2050,20 +2290,25 @@ public class SegaPCMTracker : VgmChipTracker
         int addr = evt.Register | (evt.Port << 8);
         byte val = evt.Value;
         
-        // SegaPCM: 地址0x00-0x7F是通道寄存器区
-        // 每通道8字节，共16通道
-        if (addr < 0x80)
+        // SegaPCM 寄存器布局 (参考 MAME segapcm.cpp):
+        // 地址 0x00-0x7F: 通道 0-15 的寄存器 0-7 (每通道8字节)
+        //   reg 0x02: volume left
+        //   reg 0x03: volume right
+        //   reg 0x07: address delta (采样增量/音高)
+        // 地址 0x80-0xFF: 通道 0-15 的控制寄存器
+        //   reg 0x86: bit 0 = channel disable (1=停止, 0=播放)
+        
+        int ch = (addr >> 3) & 0x0F;
+        int reg = addr & 0x87;  // 保留 bit 7 和 bit 0-2
+        
+        switch (reg)
         {
-            int ch = (addr >> 3) & 0x0F;
-            int reg = addr & 0x07;
-            
-            switch (reg)
-            {
-                case 0x02: _volumeL[ch] = val; break;  // 左声道音量
-                case 0x03: _volumeR[ch] = val; break;  // 右声道音量
-                case 0x06: _keyOn[ch] = (val & 0x01) == 0; break;  // bit0=0表示播放
-                case 0x07: _delta[ch] = val; break;  // 采样增量（音高）
-            }
+            case 0x02: _volumeL[ch] = val & 0x7F; break;  // 左声道音量 (7-bit)
+            case 0x03: _volumeR[ch] = val & 0x7F; break;  // 右声道音量 (7-bit)
+            case 0x07: _delta[ch] = val; break;          // 采样增量（音高）
+            case 0x86:                                    // 通道控制寄存器
+                _keyOn[ch] = (val & 0x01) == 0;          // bit 0: 0=播放, 1=停止
+                break;
         }
     }
     
@@ -2079,13 +2324,23 @@ public class SegaPCMTracker : VgmChipTracker
     {
         for (int ch = 0; ch < 16 && ch < state.Channels.Length; ch++)
         {
-            state.Channels[ch].KeyOn = _keyOn[ch];
-            state.Channels[ch].Volume = Math.Max(_volumeL[ch], _volumeR[ch]) / 2;
+            int vol = Math.Max(_volumeL[ch], _volumeR[ch]);
+            
+            // 如果有音量，即使没有检测到 KeyOn 也认为在播放
+            // (有些 VGM 可能先设置音量再触发播放，或者 KeyOn 事件丢失)
+            bool active = _keyOn[ch] || vol > 0;
+            
+            state.Channels[ch].KeyOn = active;
+            state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = _volumeL[ch];
             state.Channels[ch].PanRight = _volumeR[ch];
             
-            // Delta -> Note: delta=0x80 为原始音高
-            if (_keyOn[ch] && _delta[ch] > 0)
+            // Detune: 相对于原始速率 (0x80) 的采样率偏移
+            // <0x80 = 慢速(低音), >0x80 = 快速(高音)
+            state.Channels[ch].Detune = _delta[ch] - 0x80;
+            
+            // Delta -> Note: delta=0x80 为原始音高 (31250 * delta/256 Hz)
+            if (active && _delta[ch] > 0)
             {
                 double ratio = _delta[ch] / 128.0;
                 state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
@@ -2144,6 +2399,7 @@ public class YMZ280BTracker : VgmChipTracker
             state.Channels[ch].PanRight = _panR[ch] * 8;
             
             // YMZ280B: pitch=0x100 为原始音高
+            state.Channels[ch].Detune = _pitch[ch] - 0x100;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 256.0;
@@ -2367,10 +2623,13 @@ public class YM2608Tracker : VgmChipTracker
             int lr = _fmLr[ch];
             state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
             state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
+            state.Channels[ch].Detune = _fmFnum[ch] & 0xFF;
             
             if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
             {
-                double freq = _fmFnum[ch] * 7987200.0 / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
+                // YM2608 (OPNA): freq = fnum * clock / (72 * 2^(21-block))
+                double clock = Clock > 0 ? Clock : 7987200.0;
+                double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -2388,10 +2647,14 @@ public class YM2608Tracker : VgmChipTracker
             state.Channels[ch + 6].Volume = vol;
             state.Channels[ch + 6].PanLeft = vol;
             state.Channels[ch + 6].PanRight = vol;
+            state.Channels[ch + 6].Detune = _ssgPeriod[ch] & 0xFF;
             
             if (active)
             {
-                double freq = 7987200.0 / (64.0 * _ssgPeriod[ch]);
+                // YM2608 SSG: freq = clock / (16 * period)
+                // SSG 时钟为 FM 时钟的 1/4
+                double clock = Clock > 0 ? Clock / 4.0 : 1996800.0;
+                double freq = clock / (16.0 * _ssgPeriod[ch]);
                 state.Channels[ch + 6].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -2422,6 +2685,7 @@ public class YM2608Tracker : VgmChipTracker
             state.Channels[15].PanRight = (_adpcmPan & 0x01) != 0 ? vol : 0;
             
             // ADPCM-B: delta=0x49BA 约等于 8kHz 采样率
+            state.Channels[15].Detune = _adpcmDelta - 0x49BA;
             if (_adpcmKeyOn && _adpcmDelta > 0)
             {
                 double ratio = _adpcmDelta / 18874.0;  // 0x49BA = 18874
@@ -2470,6 +2734,10 @@ public class YM2610Tracker : VgmChipTracker
         byte val = evt.Value;
         int port = evt.Port;
         
+        // YM2610 寄存器布局 (参考 Neo Geo Dev Wiki):
+        // Port 0 (0x58): SSG (0x00-0x0F), ADPCM-A (0x00-0x1F in separate range), FM ch1-2
+        // Port 1 (0x59): FM ch3-4, ADPCM-B (0x10-0x1C)
+        
         if (port == 0)
         {
             // SSG (0x00-0x0F)
@@ -2491,12 +2759,56 @@ public class YM2610Tracker : VgmChipTracker
             {
                 _ssgVolume[reg - 0x08] = val & 0x0F;
             }
-            // ADPCM-A
+            // ADPCM-A (0x00-0x2D in ADPCM register space)
             else if (reg == 0x00) _adpcmAKeyOn = val & 0x3F;
             else if (reg == 0x01) _adpcmATotalVol = val & 0x3F;
             else if (reg >= 0x08 && reg <= 0x0D)
             {
                 _adpcmAVol[reg - 0x08] = val & 0x1F;
+            }
+            // FM Key On (0x28) - 在 Port 0
+            else if (reg == 0x28)
+            {
+                // YM2610: bit 0-1 = channel (0-2), bit 2 = port (0=ch1-2, 1=ch3-4)
+                int rawCh = val & 0x03;
+                int portBit = (val >> 2) & 0x01;
+                int ch = rawCh + portBit * 2;
+                if (ch < 4 && rawCh < 3) _fmKeyOn[ch] = (val & 0xF0) != 0;
+            }
+            // FM ch1-2 频率寄存器
+            else if (reg >= 0xA0 && reg <= 0xA2)
+            {
+                int ch = reg - 0xA0;
+                if (ch < 2) _fmFnum[ch] = (_fmFnum[ch] & 0x700) | val;
+            }
+            else if (reg >= 0xA4 && reg <= 0xA6)
+            {
+                int ch = reg - 0xA4;
+                if (ch < 2)
+                {
+                    _fmFnum[ch] = (_fmFnum[ch] & 0xFF) | ((val & 0x07) << 8);
+                    _fmBlock[ch] = (val >> 3) & 0x07;
+                }
+            }
+            else if (reg >= 0xB0 && reg <= 0xB2)
+            {
+                int ch = reg - 0xB0;
+                if (ch < 2) _fmAlgo[ch] = val & 0x07;
+            }
+            else if (reg >= 0xB4 && reg <= 0xB6)
+            {
+                int ch = reg - 0xB4;
+                if (ch < 2) _fmLr[ch] = (val >> 6) & 0x03;
+            }
+            else if (reg >= 0x40 && reg <= 0x4F)
+            {
+                int op = (reg - 0x40) / 4;
+                int ch = (reg - 0x40) % 4;
+                if (ch < 2 && ch < 3)
+                {
+                    int slot = op == 0 ? 0 : op == 1 ? 2 : op == 2 ? 1 : 3;
+                    _fmTl[ch, slot] = val & 0x7F;
+                }
             }
         }
         else if (port == 1)
@@ -2507,22 +2819,15 @@ public class YM2610Tracker : VgmChipTracker
             else if (reg == 0x19) _adpcmBDelta = (_adpcmBDelta & 0xFF00) | val;
             else if (reg == 0x1A) _adpcmBDelta = (_adpcmBDelta & 0x00FF) | (val << 8);
             else if (reg == 0x1B) _adpcmBVolume = val;
-            // FM
-            else if (reg == 0x28)
-            {
-                int ch = val & 0x03;
-                if (ch < 4) _fmKeyOn[ch] = (val & 0xF0) != 0;
-            }
+            // FM ch3-4 频率寄存器 (映射到内部索引 2-3)
             else if (reg >= 0xA0 && reg <= 0xA2)
             {
-                int ch = reg - 0xA0;
-                if (ch == 2) ch = 3;  // 通道映射
+                int ch = reg - 0xA0 + 2;  // 映射到索引 2-3
                 if (ch < 4) _fmFnum[ch] = (_fmFnum[ch] & 0x700) | val;
             }
             else if (reg >= 0xA4 && reg <= 0xA6)
             {
-                int ch = reg - 0xA4;
-                if (ch == 2) ch = 3;
+                int ch = reg - 0xA4 + 2;
                 if (ch < 4)
                 {
                     _fmFnum[ch] = (_fmFnum[ch] & 0xFF) | ((val & 0x07) << 8);
@@ -2531,22 +2836,19 @@ public class YM2610Tracker : VgmChipTracker
             }
             else if (reg >= 0xB0 && reg <= 0xB2)
             {
-                int ch = reg - 0xB0;
-                if (ch == 2) ch = 3;
+                int ch = reg - 0xB0 + 2;
                 if (ch < 4) _fmAlgo[ch] = val & 0x07;
             }
             else if (reg >= 0xB4 && reg <= 0xB6)
             {
-                int ch = reg - 0xB4;
-                if (ch == 2) ch = 3;
+                int ch = reg - 0xB4 + 2;
                 if (ch < 4) _fmLr[ch] = (val >> 6) & 0x03;
             }
             else if (reg >= 0x40 && reg <= 0x4F)
             {
                 int op = (reg - 0x40) / 4;
-                int ch = (reg - 0x40) % 4;
-                if (ch == 2) ch = 3;
-                if (ch < 4)
+                int ch = (reg - 0x40) % 4 + 2;  // 映射到索引 2-3
+                if (ch < 4 && (reg - 0x40) % 4 < 3)
                 {
                     int slot = op == 0 ? 0 : op == 1 ? 2 : op == 2 ? 1 : 3;
                     _fmTl[ch, slot] = val & 0x7F;
@@ -2595,10 +2897,13 @@ public class YM2610Tracker : VgmChipTracker
             int lr = _fmLr[ch];
             state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
             state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
+            state.Channels[ch].Detune = _fmFnum[ch] & 0xFF;
             
             if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
             {
-                double freq = _fmFnum[ch] * 8000000.0 / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
+                // YM2610 (OPNB): freq = fnum * clock / (72 * 2^(21-block))
+                double clock = Clock > 0 ? Clock : 8000000.0;
+                double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
                 state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -2616,10 +2921,14 @@ public class YM2610Tracker : VgmChipTracker
             state.Channels[ch + 4].Volume = vol;
             state.Channels[ch + 4].PanLeft = vol;
             state.Channels[ch + 4].PanRight = vol;
+            state.Channels[ch + 4].Detune = _ssgPeriod[ch] & 0xFF;
             
             if (active)
             {
-                double freq = 8000000.0 / (64.0 * _ssgPeriod[ch]);
+                // YM2610 SSG: freq = clock / (16 * period)
+                // SSG 时钟为 FM 时钟的 1/4
+                double clock = Clock > 0 ? Clock / 4.0 : 2000000.0;
+                double freq = clock / (16.0 * _ssgPeriod[ch]);
                 state.Channels[ch + 4].Note = VgmVisualizer.FrequencyToNote(freq);
             }
             else
@@ -2628,7 +2937,7 @@ public class YM2610Tracker : VgmChipTracker
             }
         }
         
-        // ADPCM-A 通道 (7-12)
+        // ADPCM-A 通道 (7-12) - 固定采样率，无音高
         for (int ch = 0; ch < 6 && ch + 7 < state.Channels.Length; ch++)
         {
             bool active = ((_adpcmAKeyOn >> ch) & 1) != 0;
@@ -2638,10 +2947,11 @@ public class YM2610Tracker : VgmChipTracker
             state.Channels[ch + 7].Volume = vol;
             state.Channels[ch + 7].PanLeft = vol;
             state.Channels[ch + 7].PanRight = vol;
-            state.Channels[ch + 7].Note = -1;  // ADPCM-A 无音高
+            state.Channels[ch + 7].Note = -1;
+            state.Channels[ch + 7].Detune = 0;
         }
         
-        // ADPCM-B 通道 (13)
+        // ADPCM-B 通道 (13) - 可变采样率
         if (state.Channels.Length > 13)
         {
             int vol = _adpcmBVolume / 2;
@@ -2649,9 +2959,11 @@ public class YM2610Tracker : VgmChipTracker
             state.Channels[13].Volume = vol;
             state.Channels[13].PanLeft = (_adpcmBPan & 0x02) != 0 ? vol : 0;
             state.Channels[13].PanRight = (_adpcmBPan & 0x01) != 0 ? vol : 0;
+            state.Channels[13].Detune = _adpcmBDelta - 0x49BA;
             
             if (_adpcmBKeyOn && _adpcmBDelta > 0)
             {
+                // ADPCM-B: delta=0x49BA (18874) 约等于 8kHz 采样率
                 double ratio = _adpcmBDelta / 18874.0;
                 state.Channels[13].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
             }
@@ -2659,6 +2971,165 @@ public class YM2610Tracker : VgmChipTracker
             {
                 state.Channels[13].Note = -1;
             }
+        }
+    }
+}
+
+// 通用 PCM 追踪器（用于固定采样率 PCM 芯片如 PWM, uPD7759, VSU, ES5503, ES5506）
+// 这些芯片播放预录采样，采样率固定，无音高控制
+public class GenericPcmTracker : VgmChipTracker
+{
+    private readonly bool[] _keyOn = new bool[32];
+    private readonly int[] _volume = new int[32];
+    private readonly int[] _sampleNum = new int[32];  // 采样号
+    
+    public override void ProcessEvent(VgmEvent evt)
+    {
+        // 通用处理：根据寄存器写入推断通道状态
+        int ch = evt.Register % 32;
+        if (ch < _keyOn.Length)
+        {
+            // 非零值表示播放，值本身可能是采样号或音量
+            if (evt.Value > 0)
+            {
+                _keyOn[ch] = true;
+                _volume[ch] = Math.Min(127, (int)evt.Value);
+                _sampleNum[ch] = evt.Value;  // 使用值作为采样号
+            }
+            else
+            {
+                _keyOn[ch] = false;
+            }
+        }
+    }
+    
+    public override void Reset()
+    {
+        Array.Clear(_keyOn);
+        Array.Clear(_volume);
+        Array.Clear(_sampleNum);
+    }
+    
+    public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
+    {
+        for (int i = 0; i < state.Channels.Length && i < _keyOn.Length; i++)
+        {
+            state.Channels[i].KeyOn = _keyOn[i];
+            state.Channels[i].Volume = _volume[i];
+            state.Channels[i].PanLeft = _volume[i] / 2;
+            state.Channels[i].PanRight = _volume[i] / 2;
+            // 固定采样率 PCM：采样号映射到音高显示
+            // 采样号映射到 MIDI note 36-96 范围
+            if (_keyOn[i])
+            {
+                state.Channels[i].Note = 36 + (_sampleNum[i] % 61);
+            }
+            else
+            {
+                state.Channels[i].Note = -1;
+            }
+        }
+    }
+}
+
+// 通用 FM 追踪器（用于 YMF271 等）
+public class GenericFmTracker : VgmChipTracker
+{
+    private readonly bool[] _keyOn = new bool[12];
+    private readonly int[] _volume = new int[12];
+    private readonly int[] _fnum = new int[12];
+    
+    public override void ProcessEvent(VgmEvent evt)
+    {
+        int ch = evt.Register % 12;
+        if (ch < _keyOn.Length)
+        {
+            // 简单处理：检测 Key On/Off
+            if ((evt.Register & 0xF0) == 0x20)
+            {
+                _keyOn[ch] = (evt.Value & 0x80) != 0;
+            }
+            else if ((evt.Register & 0xF0) == 0x40)
+            {
+                _volume[ch] = 127 - (evt.Value & 0x7F);
+            }
+        }
+    }
+    
+    public override void Reset()
+    {
+        Array.Clear(_keyOn);
+        Array.Clear(_volume);
+        Array.Clear(_fnum);
+    }
+    
+    public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
+    {
+        for (int i = 0; i < state.Channels.Length && i < _keyOn.Length; i++)
+        {
+            state.Channels[i].KeyOn = _keyOn[i];
+            state.Channels[i].Volume = _volume[i];
+            state.Channels[i].PanLeft = _volume[i] / 2;
+            state.Channels[i].PanRight = _volume[i] / 2;
+            state.Channels[i].Note = -1;
+        }
+    }
+}
+
+// OKIM6258 ADPCM 追踪器
+// 单通道 4-bit ADPCM 编解码器，无可变频率，采样率由芯片时钟决定
+// 采样率 = clock / divider (divider = 1024, 768, 或 512)
+public class OKIM6258Tracker : VgmChipTracker
+{
+    private bool _playing;
+    private int _volume = 127;
+    private int _dataCount;  // 数据写入计数，用于判断活动状态
+    
+    public override void ProcessEvent(VgmEvent evt)
+    {
+        // OKIM6258 命令格式
+        switch (evt.Register)
+        {
+            case 0x00: // 控制寄存器
+                // bit 0: 录音/播放选择
+                // bit 1: 播放启动
+                // bit 2: 录音启动
+                if ((evt.Value & 0x02) != 0)
+                {
+                    _playing = true;
+                    _dataCount = 0;
+                }
+                else if ((evt.Value & 0x01) == 0)
+                {
+                    _playing = false;
+                }
+                break;
+            case 0x01: // 数据写入
+                if (_playing && evt.Value != 0)
+                {
+                    _dataCount++;
+                }
+                break;
+        }
+    }
+    
+    public override void Reset()
+    {
+        _playing = false;
+        _volume = 127;
+        _dataCount = 0;
+    }
+    
+    public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
+    {
+        if (state.Channels.Length > 0)
+        {
+            state.Channels[0].KeyOn = _playing;
+            state.Channels[0].Volume = _playing ? _volume : 0;
+            state.Channels[0].PanLeft = _volume / 2;
+            state.Channels[0].PanRight = _volume / 2;
+            // OKIM6258 是固定采样率的 ADPCM 编解码器，显示固定音高 C4
+            state.Channels[0].Note = _playing ? 60 : -1;
         }
     }
 }

@@ -9,9 +9,10 @@ public struct VgmEvent
     public uint Tick;       // Tick
     public byte ChipType;   // 芯片类型
     public byte ChipIndex;  // 芯片实例（0 或 1，用于双芯片）
-    public byte Port;       // 端口号（部分芯片有多个端口）
-    public byte Register;   // 寄存器地址
-    public byte Value;      // 写入值
+    public byte Port;       // 端口号/地址高字节
+    public byte Register;   // 寄存器地址/地址低字节
+    public byte Value;      // 写入值（高字节）
+    public byte Value2;     // 写入值（低字节，16位芯片使用）
 }
 
 // VGM 命令解析器
@@ -70,10 +71,22 @@ public class VgmCommandParser
         _header = header;
     }
     
+    // 清理事件列表释放内存
+    public void Clear()
+    {
+        _events.Clear();
+        _events.TrimExcess();  // 释放多余容量
+        TotalTicks = 0;
+    }
+    
     // 解析所有命令
     public void Parse()
     {
         _events.Clear();
+        // 预估事件数量以减少重新分配（假设平均每4字节一个事件）
+        int estimatedEvents = Math.Max(1000, _data.Length / 4);
+        if (_events.Capacity < estimatedEvents)
+            _events.Capacity = estimatedEvents;
         
         // 计算 VGM 数据起始偏移（版本 < 1.50 固定为 0x40，否则为 DataOffset + 0x34）
         int dataOffset;
@@ -244,11 +257,12 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // QSound 写入
+                // QSound 写入: mmll rr (mm=数据MSB, ll=数据LSB, rr=寄存器)
                 case 0xC4:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_QSOUND, Register = _data[pos], Value = _data[pos + 1] });
+                        // Register=rr, Port=mm(data high), Value=ll(data low)
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_QSOUND, Register = _data[pos + 2], Port = _data[pos], Value = _data[pos + 1] });
                         pos += 3;
                     }
                     break;
@@ -262,11 +276,12 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // SegaPCM 写入
+                // SegaPCM 写入 (16位地址)
                 case 0xC0:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_SEGAPCM, Register = (byte)(_data[pos] | (_data[pos + 1] << 8)), Value = _data[pos + 2] });
+                        // Port=高字节, Register=低字节
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_SEGAPCM, Port = _data[pos + 1], Register = _data[pos], Value = _data[pos + 2] });
                         pos += 3;
                     }
                     break;
@@ -477,20 +492,21 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // ES5506 16-bit 写入
+                // ES5506 16-bit 写入: aa ddee
                 case 0xD6:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_ES5506, Register = _data[pos], Value = _data[pos + 1] });
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_ES5506, Register = _data[pos], Value = _data[pos + 1], Value2 = _data[pos + 2] });
                         pos += 3;
                     }
                     break;
                 
-                // C352 写入
+                // C352 写入: aabb ddee (aa=地址MSB, bb=地址LSB, dd=数据MSB, ee=数据LSB)
                 case 0xE1:
                     if (pos + 3 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_C352, Register = _data[pos], Value = _data[pos + 2] });
+                        // Register=aa, Port=bb, Value=dd, Value2=ee
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_C352, Register = _data[pos], Port = _data[pos + 1], Value = _data[pos + 2], Value2 = _data[pos + 3] });
                         pos += 4;
                     }
                     break;
@@ -541,17 +557,197 @@ public class VgmCommandParser
                     }
                     break;
                 
+                // PCM RAM 写入
+                case 0x68:
+                    if (pos + 11 < _data.Length)
+                    {
+                        pos++; // 跳过 0x66
+                        pos += 11; // cc + oo*3 + dd*3 + ss*3
+                    }
+                    break;
+                
+                // DAC 流控制命令
+                case 0x90:  // Setup Stream
+                    pos += 4;
+                    break;
+                case 0x91:  // Set Stream Data
+                    pos += 4;
+                    break;
+                case 0x92:  // Set Stream Frequency
+                    pos += 5;
+                    break;
+                case 0x93:  // Start Stream
+                    pos += 10;
+                    break;
+                case 0x94:  // Stop Stream
+                    pos += 1;
+                    break;
+                case 0x95:  // Start Stream (fast)
+                    pos += 4;
+                    break;
+                
+                // 双芯片命令 (0x30+xx = 第二芯片的 0x50+xx)
+                case 0x30:  // 第二SN76489
+                    if (pos < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_SN76489, ChipIndex = 1, Value = _data[pos++] });
+                    }
+                    break;
+                case 0x3F:  // Game Gear PSG stereo (第二芯片)
+                    if (pos < _data.Length)
+                    {
+                        pos++;
+                    }
+                    break;
+                    
+                // Game Gear PSG stereo
+                case 0x4F:
+                    if (pos < _data.Length)
+                    {
+                        pos++;
+                    }
+                    break;
+                    
+                // PWM 写入: a ddd (a=通道, ddd=12位数据)
+                case 0xB2:
+                    if (pos + 1 < _data.Length)
+                    {
+                        pos += 2;
+                    }
+                    break;
+                    
+                // uPD7759 写入
+                case 0xB6:
+                    if (pos + 1 < _data.Length)
+                    {
+                        pos += 2;
+                    }
+                    break;
+                    
+                // OKIM6258 写入
+                case 0xB7:
+                    if (pos + 1 < _data.Length)
+                    {
+                        pos += 2;
+                    }
+                    break;
+                    
+                // PCM Seek (设置DAC数据读取位置)
+                case 0xE0:
+                    if (pos + 3 < _data.Length)
+                    {
+                        pos += 4;
+                    }
+                    break;
+                
+                // 双芯片 YM/AY 系列 (0xA1-0xAF = 第二芯片的 0x51-0x5F)
+                case 0xA1:  // 第二YM2413
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2413, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA2:  // 第二YM2612 端口0
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2612, ChipIndex = 1, Port = 0, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA3:  // 第二YM2612 端口1
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2612, ChipIndex = 1, Port = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA4:  // 第二YM2151
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2151, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA5:  // 第二YM2203
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2203, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA6:  // 第二YM2608 端口0
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2608, ChipIndex = 1, Port = 0, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA7:  // 第二YM2608 端口1
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2608, ChipIndex = 1, Port = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xA8:  // 第二YM2610 端口0
+                case 0xA9:  // 第二YM2610 端口1
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM2610, ChipIndex = 1, Port = (byte)(cmd - 0xA8), Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xAA:  // 第二YM3812
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM3812, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xAB:  // 第二YM3526
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YM3526, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xAC:  // 第二Y8950
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_Y8950, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xAD:  // 第二YMZ280B
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YMZ280B, ChipIndex = 1, Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                case 0xAE:  // 第二YMF262 端口0
+                case 0xAF:  // 第二YMF262 端口1
+                    if (pos + 1 < _data.Length)
+                    {
+                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YMF262, ChipIndex = 1, Port = (byte)(cmd - 0xAE), Register = _data[pos], Value = _data[pos + 1] });
+                        pos += 2;
+                    }
+                    break;
+                
                 // 其他命令（跳过）
                 default:
-                    // 未知命令，尝试跳过
-                    if (cmd >= 0x30 && cmd <= 0x4E)
-                        pos += 1;
+                    // 未知命令，按VGM规范跳过
+                    if (cmd >= 0x31 && cmd <= 0x3E)
+                        pos += 1;  // 双芯片命令，1操作数
                     else if (cmd >= 0x40 && cmd <= 0x4E)
-                        pos += 2;
-                    else if (cmd >= 0xC0 && cmd <= 0xDF)
-                        pos += 3;
-                    else if (cmd >= 0xE0 && cmd <= 0xFF)
-                        pos += 4;
+                        pos += 2;  // 2操作数 (v1.60+)
+                    else if (cmd >= 0xC9 && cmd <= 0xCF)
+                        pos += 3;  // 3操作数
+                    else if (cmd >= 0xD7 && cmd <= 0xDF)
+                        pos += 3;  // 3操作数
+                    else if (cmd >= 0xE2 && cmd <= 0xFF)
+                        pos += 4;  // 4操作数
                     break;
             }
         }

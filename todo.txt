@@ -4,7 +4,7 @@ Stream View: 已完成
 View: Binary Waterfall
 wav，flac等流式传输格式
 
-MIDI View: 基本完成
+MIDI View: 已完成
 View: Piano Roll
 MIDI格式
 

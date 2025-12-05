@@ -142,27 +142,34 @@ public class VisualizerTransition
     }
 
     // 计算滑动偏移量（像素）
-    // 返回：(瀑布偏移, 钢琴卷帘偏移)
-    public (float waterfallOffset, float pianoRollOffset) GetOffsets(float panelWidth)
+    // 返回：(瀑布偏移, 钢琴卷帘偏移, VGM视图偏移)
+    // 统一逻辑：当前视图向左滑出，目标视图从右向左滑入，其他视图保持在屏幕外
+    public (float waterfallOffset, float pianoRollOffset, float vgmViewOffset) GetOffsets(float panelWidth)
     {
         float eased = EaseOutCubic(_transitionProgress);
-
-        if (_targetMode == VisualizerMode.PianoRoll)
+        
+        // 计算单个视图的偏移量
+        float CalcOffset(VisualizerMode mode)
         {
-            // 瀑布向左滑出，钢琴卷帘从右滑入
-            return (
-                waterfallOffset: -panelWidth * eased,
-                pianoRollOffset: panelWidth * (1f - eased)
-            );
+            if (mode == _targetMode)
+            {
+                // 目标视图：从右滑入（panelWidth -> 0）
+                return panelWidth * (1f - eased);
+            }
+            if (mode == _currentMode && _currentMode != _targetMode)
+            {
+                // 当前视图（正在过渡）：向左滑出（0 -> -panelWidth）
+                return -panelWidth * eased;
+            }
+            // 其他视图：保持在屏幕右侧外
+            return panelWidth;
         }
-        else
-        {
-            // 钢琴卷帘向右滑出，瀑布从左滑入
-            return (
-                waterfallOffset: -panelWidth * (1f - eased),
-                pianoRollOffset: panelWidth * eased
-            );
-        }
+        
+        return (
+            CalcOffset(VisualizerMode.BinaryWaterfall),
+            CalcOffset(VisualizerMode.PianoRoll),
+            CalcOffset(VisualizerMode.VgmView)
+        );
     }
 
     // 获取标签状态

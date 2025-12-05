@@ -13,10 +13,23 @@ public class VgmVisualizer : IDisposable
         public int Note;              // 当前音符 (0-127, -1 表示无声)
         public int Volume;            // 当前音量 (0-127)
         public int Panning;           // 声像 (-64 ~ 63，0=居中)
-        public int PanLeft;           // 左声道音量 (0-127)
-        public int PanRight;          // 右声道音量 (0-127)
-        public float DisplayPanLeft;  // 显示用左声道 (带衰减)
-        public float DisplayPanRight; // 显示用右声道 (带衰减)
+        public int PanLeft;           // 前左声道音量 (0-255)
+        public int PanRight;          // 前右声道音量 (0-255)
+        public int RearLeft;          // 后左声道音量 (0-255, C352等四声道芯片)
+        public int RearRight;         // 后右声道音量 (0-255)
+        public float SmoothedPanLeft; // 平滑后的左声道输入值 (减少输入抖动)
+        public float SmoothedPanRight;// 平滑后的右声道输入值
+        public float SmoothedRearLeft;// 平滑后的后左声道
+        public float SmoothedRearRight;//平滑后的后右声道
+        public float DisplayPanLeft;  // 显示用前左声道 (带衰减)
+        public float DisplayPanRight; // 显示用前右声道 (带衰减)
+        public float DisplayRearLeft; // 显示用后左声道 (带衰减)
+        public float DisplayRearRight;// 显示用后右声道 (带衰减)
+        public float PeakPanLeft;     // 峰值保持前左 (避免跳动)
+        public float PeakPanRight;    // 峰值保持前右
+        public float PeakRearLeft;    // 峰值保持后左
+        public float PeakRearRight;   // 峰值保持后右
+        public bool HasQuadChannel;   // 是否是四声道 (C352)
         public bool KeyOn;            // 是否按下
         public string Label;          // 通道标签
     }
@@ -31,57 +44,106 @@ public class VgmVisualizer : IDisposable
 
     private readonly List<ChipState> _chipStates = new();
     private readonly Dictionary<byte, VgmChipTracker> _trackers = new();
-    private VgmAudioSource _audioSource;
     private VgmCommandParser _parser;
     private byte[] _vgmData;
     private int _lastEventIndex = -1;
     private bool _disposed;
     private double _lastUpdateTime;
     
-    // 声像衰减设置（毫秒）
-    private const float PAN_RELEASE_MS = 300f;
+    // 保存 VgmAudioSource 的数据副本（避免持有引用导致悬空指针）
+    private VgmHeader _header;
+    private Gd3Tag _gd3;
+    private VgmChipInfo[] _chipList;
+    private bool _hasLoop;
+    private int _loopCount = 2;       // 用户设置的循环次数
+    private bool _fadeOutEnabled;     // 是否启用淡出
+    private double _fadeOutDuration;  // 淡出时长（秒）
+    
+    // 缓存的循环点计算值（避免每帧重复计算）
+    private double _cachedLoopPointMs;
+    private double _cachedLoopLengthMs;
+    private double _cachedTotalMs;         // VGM 文件原始时长（毫秒）
+    private double _cachedPlayDurationMs;  // 实际播放总时长（考虑循环+淡出）
+    private bool _loopCacheValid;
+    
+    // 芯片类型查找表（避免每帧调用 GetChipTypeForName）
+    private byte[] _chipTypeLookup;
+    
+    // 缓存的芯片列表字符串（避免每帧创建新字符串）
+    private string _cachedChipsString;
+    private string _cachedVersionString;
+    
+    // 声像平滑设置（毫秒）
+    // 平衡抖动抑制和冲击感
+    private const float PAN_RELEASE_MS = 120f;   // 释放时间（保持冲击感）
+    private const float PAN_ATTACK_MS = 15f;     // 上升时间（快速响应）
+    private const float PEAK_DECAY_MS = 150f;    // 峰值衰减时间（较大值抑制抖动）
 
     public IReadOnlyList<ChipState> ChipStates => _chipStates;
-    public VgmHeader Header => _audioSource?.Header ?? default;
-    public Gd3Tag Gd3 => _audioSource?.Gd3;
-    public VgmAudioSource AudioSource => _audioSource;
+    public VgmHeader Header => _header;
+    public Gd3Tag Gd3 => _gd3;
     public string SystemName { get; private set; } = "";
     public Gd3Language Gd3Language { get; set; } = Gd3Language.English;
     
-    // 获取 VGM 版本字符串（BCD格式解析）
+    // 获取 VGM 版本字符串（BCD格式解析，带缓存）
     public string GetVersionString()
     {
+        if (_cachedVersionString != null) return _cachedVersionString;
         uint ver = Header.Version;
         // VGM版本号是BCD格式：0x161 = 1.61
         int major = (int)(ver >> 8);
         int minor = (int)(ver & 0xFF);
-        return $"{major}.{minor:X2}";
+        _cachedVersionString = $"{major}.{minor:X2}";
+        return _cachedVersionString;
     }
     
-    // 获取芯片列表字符串
+    // 获取芯片列表字符串（带缓存，避免每帧创建新字符串）
     public string GetChipsString()
     {
+        if (_cachedChipsString != null) return _cachedChipsString;
         if (_chipStates.Count == 0) return "";
-        var names = new List<string>();
-        foreach (var chip in _chipStates)
+        
+        // 使用 Span 和 stackalloc 避免临时数组分配
+        var names = new string[_chipStates.Count];
+        for (int i = 0; i < _chipStates.Count; i++)
         {
-            names.Add(chip.Info.Name);
+            names[i] = _chipStates[i].Info.Name;
         }
-        return string.Join(", ", names);
+        _cachedChipsString = string.Join(", ", names);
+        return _cachedChipsString;
     }
 
-    // 初始化可视化器
+    // 初始化可视化器（保存数据副本，避免持有 VgmAudioSource 引用）
     public void Initialize(VgmAudioSource audioSource)
     {
-        _audioSource = audioSource;
         _chipStates.Clear();
         _trackers.Clear();
         _lastEventIndex = -1;
+        _loopCacheValid = false;
+        
+        // 清除缓存
+        _cachedChipsString = null;
+        _cachedVersionString = null;
+        _cachedLoopPointMs = 0;
+        _cachedLoopLengthMs = 0;
+        _cachedTotalMs = 0;
+        _cachedPlayDurationMs = 0;
+        
+        if (audioSource == null) return;
+        
+        // 保存数据副本
+        _header = audioSource.Header;
+        _gd3 = audioSource.Gd3;
+        _chipList = audioSource.ChipList;
+        _hasLoop = audioSource.HasLoop;
+        _loopCount = audioSource.LoopCount;
+        _fadeOutEnabled = audioSource.FadeOutEnabled;
+        _fadeOutDuration = audioSource.FadeOutDuration;
 
-        if (audioSource?.ChipList == null) return;
+        if (_chipList == null) return;
 
         // 根据芯片列表初始化状态和追踪器
-        foreach (var chip in audioSource.ChipList)
+        foreach (var chip in _chipList)
         {
             var state = new ChipState
             {
@@ -103,8 +165,18 @@ public class VgmVisualizer : IDisposable
             }
 
             _chipStates.Add(state);
-            
-            // 创建对应的追踪器
+        }
+        
+        // 构建芯片类型查找表（避免每帧调用 GetChipTypeForName）
+        _chipTypeLookup = new byte[_chipStates.Count];
+        for (int i = 0; i < _chipStates.Count; i++)
+        {
+            _chipTypeLookup[i] = GetChipTypeForName(_chipStates[i].Info.Name);
+        }
+        
+        // 创建对应的追踪器
+        foreach (var chip in _chipList)
+        {
             VgmChipTracker tracker = chip.Name switch
             {
                 "YM2612" => new YM2612Tracker(),
@@ -113,6 +185,8 @@ public class VgmVisualizer : IDisposable
                 "YM2151" => new YM2151Tracker(),
                 "YM2413" => new YM2413Tracker(),
                 "YM2203" => new YM2203Tracker(),
+                "YM2608" => new YM2608Tracker(),
+                "YM2610" or "YM2610B" => new YM2610Tracker(),
                 "NES APU" => new NesApuTracker(),
                 "GB DMG" => new GbDmgTracker(),
                 "HuC6280" => new HuC6280Tracker(),
@@ -144,7 +218,7 @@ public class VgmVisualizer : IDisposable
             }
         }
 
-        SystemName = VgmFormat.GetSystemName(audioSource.Header);
+        SystemName = VgmFormat.GetSystemName(_header);
     }
     
     // 加载 VGM 数据并解析命令
@@ -154,6 +228,7 @@ public class VgmVisualizer : IDisposable
         _parser = new VgmCommandParser(data, header);
         _parser.Parse();
         _lastEventIndex = -1;
+        _loopCacheValid = false;
         
         // 重置所有追踪器
         foreach (var tracker in _trackers.Values)
@@ -169,27 +244,63 @@ public class VgmVisualizer : IDisposable
     {
         if (_parser == null || _parser.Events.Count == 0) return;
         
-        // 循环支持：如果有循环点且时间超过循环点，使用模运算计算循环内时间
-        double effectiveTimeMs = timeMs;
-        if (_audioSource != null && _audioSource.HasLoop)
+        // 缓存循环点计算（只计算一次）
+        if (!_loopCacheValid)
         {
-            // 循环点时间（毫秒）
-            double loopPointMs = (_audioSource.Header.TotalSamples - _audioSource.Header.LoopSamples) / 44100.0 * 1000.0;
-            // 循环段时间（毫秒）
-            double loopLengthMs = _audioSource.Header.LoopSamples / 44100.0 * 1000.0;
+            // 计算 VGM 文件原始时长（毫秒）
+            _cachedTotalMs = _header.TotalSamples / 44100.0 * 1000.0;
             
-            if (loopLengthMs > 0 && timeMs > loopPointMs)
+            // 有循环点时缓存循环信息
+            if (_hasLoop && _header.LoopSamples > 0)
             {
-                // 计算循环内偏移
-                double loopOffset = (timeMs - loopPointMs) % loopLengthMs;
-                effectiveTimeMs = loopPointMs + loopOffset;
+                _cachedLoopPointMs = (_header.TotalSamples - _header.LoopSamples) / 44100.0 * 1000.0;
+                _cachedLoopLengthMs = _header.LoopSamples / 44100.0 * 1000.0;
             }
+            
+            // 计算实际播放总时长（与 VgmAudioSource.CalculateTotalLength 逻辑一致）
+            _cachedPlayDurationMs = _cachedTotalMs;
+            if (_hasLoop && _cachedLoopLengthMs > 0)
+            {
+                // LoopCount=1: 播放到循环结束点（即 _cachedTotalMs）
+                // LoopCount=2: 额外播放1次循环
+                if (_loopCount > 1)
+                {
+                    _cachedPlayDurationMs += _cachedLoopLengthMs * (_loopCount - 1);
+                }
+                // 淡出期间继续播放循环
+                if (_fadeOutEnabled && _fadeOutDuration > 0)
+                {
+                    _cachedPlayDurationMs += _fadeOutDuration * 1000.0;
+                }
+            }
+            
+            _loopCacheValid = true;
+        }
+        
+        // 时间检查：如果时间为负数（新歌曲还没开始）或数据无效，不更新
+        if (timeMs < 0 || _cachedTotalMs <= 0)
+        {
+            return;
+        }
+        
+        // 时间超过实际播放时长，停止更新（歌曲已结束）
+        if (timeMs > _cachedPlayDurationMs)
+        {
+            return;
+        }
+        
+        // 循环支持：在实际播放时长内循环显示（包括淡出期间）
+        double effectiveTimeMs = timeMs;
+        if (_cachedLoopLengthMs > 0 && timeMs > _cachedLoopPointMs)
+        {
+            double loopOffset = (timeMs - _cachedLoopPointMs) % _cachedLoopLengthMs;
+            effectiveTimeMs = _cachedLoopPointMs + loopOffset;
         }
         
         uint targetTick = VgmCommandParser.MsToTick(effectiveTimeMs);
         int targetIndex = _parser.GetEventIndexAtTick(targetTick);
         
-        // 计算时间差（用于声像衰减，使用原始时间保持动画连续）
+        // 计算时间差（用于声像衰减）
         float deltaMs = (float)(timeMs - _lastUpdateTime);
         _lastUpdateTime = timeMs;
         
@@ -205,9 +316,10 @@ public class VgmVisualizer : IDisposable
         }
         
         // 处理从上次位置到当前位置的所有事件
-        for (int i = _lastEventIndex + 1; i <= targetIndex && i < _parser.Events.Count; i++)
+        var events = _parser.Events;
+        for (int i = _lastEventIndex + 1; i <= targetIndex && i < events.Count; i++)
         {
-            var evt = _parser.Events[i];
+            var evt = events[i];
             if (_trackers.TryGetValue(evt.ChipType, out var tracker))
             {
                 tracker.ProcessEvent(evt);
@@ -216,59 +328,154 @@ public class VgmVisualizer : IDisposable
         
         _lastEventIndex = targetIndex;
         
-        // 更新可视化状态
-        foreach (var state in _chipStates)
+        // 更新可视化状态（使用缓存的芯片类型查找表）
+        for (int i = 0; i < _chipStates.Count; i++)
         {
-            byte chipType = GetChipTypeForName(state.Info.Name);
+            var state = _chipStates[i];
+            byte chipType = _chipTypeLookup[i];
             if (_trackers.TryGetValue(chipType, out var tracker))
             {
                 tracker.UpdateVisualizerState(state);
             }
-            
-            // 更新声像显示（带衰减）
             UpdatePanDisplay(state, deltaMs);
         }
     }
     
-    // 更新声像显示（带衰减效果）
+    // 更新声像显示（使用双层平滑 + 峰值保持避免跳动）
+    // 第一层：输入平滑（减少追踪器数据的抖动）
+    // 第二层：峰值保持 + 显示平滑（减少视觉跳动）
     private void UpdatePanDisplay(ChipState state, float deltaMs)
     {
-        float decayFactor = deltaMs > 0 ? deltaMs / PAN_RELEASE_MS : 0;
-        
-        foreach (var ch in state.Channels)
+        // deltaMs = 0 表示循环跳回，保持当前显示值不变（避免跳动）
+        if (deltaMs <= 0)
         {
-            // 计算目标声像值（从音量和Panning计算左右声道）
-            float targetLeft = 0, targetRight = 0;
+            return;
+        }
+        
+        // 容差值：避免微小波动导致跳动（约 5% 的变化会被忽略）
+        const float TOLERANCE = 0.05f;
+        // 输入平滑时间常数（毫秒）
+        const float INPUT_SMOOTH_MS = 40f;
+        
+        float peakDecay = deltaMs / PEAK_DECAY_MS;
+        float attackFactor = MathF.Min(1f, deltaMs / PAN_ATTACK_MS);
+        float releaseFactor = deltaMs / PAN_RELEASE_MS;
+        // 输入平滑因子（低通滤波器系数）
+        float inputSmoothFactor = MathF.Min(1f, deltaMs / INPUT_SMOOTH_MS);
+        
+        var channels = state.Channels;
+        for (int i = 0; i < channels.Length; i++)
+        {
+            var ch = channels[i];
+            
+            // 第一层：输入值平滑（低通滤波）
+            // 从追踪器获取原始输入值
+            float rawLeft = 0, rawRight = 0;
+            float rawRearLeft = 0, rawRearRight = 0;
             
             if (ch.KeyOn && ch.Volume > 0)
             {
-                float vol = ch.Volume / 127f;
+                // 判断音量范围：如果超过 127，使用 255 作为最大值
+                float maxVol = (ch.PanLeft > 127 || ch.PanRight > 127 || ch.Volume > 127) ? 255f : 127f;
                 
-                // 如果有独立的左右声道值
                 if (ch.PanLeft > 0 || ch.PanRight > 0)
                 {
-                    targetLeft = ch.PanLeft / 127f * vol;
-                    targetRight = ch.PanRight / 127f * vol;
+                    rawLeft = ch.PanLeft / maxVol;
+                    rawRight = ch.PanRight / maxVol;
                 }
                 else
                 {
-                    // 从Panning值计算（-64~63）
-                    float pan = ch.Panning / 64f; // -1 ~ 1
-                    targetLeft = vol * (1f - Math.Max(0, pan));
-                    targetRight = vol * (1f + Math.Min(0, pan));
+                    float vol = ch.Volume / maxVol;
+                    float pan = ch.Panning * (1f / 64f);
+                    rawLeft = vol * (1f - MathF.Max(0, pan));
+                    rawRight = vol * (1f + MathF.Min(0, pan));
+                }
+                
+                if (ch.HasQuadChannel)
+                {
+                    rawRearLeft = ch.RearLeft / maxVol;
+                    rawRearRight = ch.RearRight / maxVol;
                 }
             }
             
-            // 应用衰减（只往下衰减，不往上）
-            if (targetLeft > ch.DisplayPanLeft)
-                ch.DisplayPanLeft = targetLeft;
+            // 平滑输入值（向目标值逐渐靠近，避免突变）
+            ch.SmoothedPanLeft += (rawLeft - ch.SmoothedPanLeft) * inputSmoothFactor;
+            ch.SmoothedPanRight += (rawRight - ch.SmoothedPanRight) * inputSmoothFactor;
+            if (ch.HasQuadChannel)
+            {
+                ch.SmoothedRearLeft += (rawRearLeft - ch.SmoothedRearLeft) * inputSmoothFactor;
+                ch.SmoothedRearRight += (rawRearRight - ch.SmoothedRearRight) * inputSmoothFactor;
+            }
+            
+            // 使用平滑后的输入值作为目标值
+            float targetLeft = ch.SmoothedPanLeft;
+            float targetRight = ch.SmoothedPanRight;
+            float targetRearLeft = ch.SmoothedRearLeft;
+            float targetRearRight = ch.SmoothedRearRight;
+            
+            // 第二层：峰值保持 + 显示平滑
+            // 峰值保持：目标值高于峰值时立即更新，否则缓慢衰减
+            if (targetLeft >= ch.PeakPanLeft - TOLERANCE)
+                ch.PeakPanLeft = targetLeft;
             else
-                ch.DisplayPanLeft = Math.Max(0, ch.DisplayPanLeft - decayFactor);
+                ch.PeakPanLeft = MathF.Max(targetLeft, ch.PeakPanLeft - peakDecay);
+            
+            if (targetRight >= ch.PeakPanRight - TOLERANCE)
+                ch.PeakPanRight = targetRight;
+            else
+                ch.PeakPanRight = MathF.Max(targetRight, ch.PeakPanRight - peakDecay);
+            
+            // 显示值跟随峰值平滑变化（添加死区检测避免维持音量时抖动）
+            float diffLeft = ch.PeakPanLeft - ch.DisplayPanLeft;
+            if (MathF.Abs(diffLeft) < 0.005f)
+            {
+                // 死区：差值很小时直接锁定到目标值
+                ch.DisplayPanLeft = ch.PeakPanLeft;
+            }
+            else if (diffLeft > 0)
+                ch.DisplayPanLeft += diffLeft * attackFactor;
+            else
+                ch.DisplayPanLeft = MathF.Max(0, ch.DisplayPanLeft - releaseFactor);
                 
-            if (targetRight > ch.DisplayPanRight)
-                ch.DisplayPanRight = targetRight;
+            float diffRight = ch.PeakPanRight - ch.DisplayPanRight;
+            if (MathF.Abs(diffRight) < 0.005f)
+            {
+                ch.DisplayPanRight = ch.PeakPanRight;
+            }
+            else if (diffRight > 0)
+                ch.DisplayPanRight += diffRight * attackFactor;
             else
-                ch.DisplayPanRight = Math.Max(0, ch.DisplayPanRight - decayFactor);
+                ch.DisplayPanRight = MathF.Max(0, ch.DisplayPanRight - releaseFactor);
+            
+            // 四声道后声道
+            if (ch.HasQuadChannel)
+            {
+                if (targetRearLeft >= ch.PeakRearLeft - TOLERANCE)
+                    ch.PeakRearLeft = targetRearLeft;
+                else
+                    ch.PeakRearLeft = MathF.Max(targetRearLeft, ch.PeakRearLeft - peakDecay);
+                
+                if (targetRearRight >= ch.PeakRearRight - TOLERANCE)
+                    ch.PeakRearRight = targetRearRight;
+                else
+                    ch.PeakRearRight = MathF.Max(targetRearRight, ch.PeakRearRight - peakDecay);
+                
+                float diffRearLeft = ch.PeakRearLeft - ch.DisplayRearLeft;
+                if (MathF.Abs(diffRearLeft) < 0.005f)
+                    ch.DisplayRearLeft = ch.PeakRearLeft;
+                else if (diffRearLeft > 0)
+                    ch.DisplayRearLeft += diffRearLeft * attackFactor;
+                else
+                    ch.DisplayRearLeft = MathF.Max(0, ch.DisplayRearLeft - releaseFactor);
+                    
+                float diffRearRight = ch.PeakRearRight - ch.DisplayRearRight;
+                if (MathF.Abs(diffRearRight) < 0.005f)
+                    ch.DisplayRearRight = ch.PeakRearRight;
+                else if (diffRearRight > 0)
+                    ch.DisplayRearRight += diffRearRight * attackFactor;
+                else
+                    ch.DisplayRearRight = MathF.Max(0, ch.DisplayRearRight - releaseFactor);
+            }
         }
     }
     
@@ -362,7 +569,7 @@ public class VgmVisualizer : IDisposable
         chip.Registers[address] = value;
     }
 
-    // 获取芯片颜色（纯白灰黑色方案）
+    // 获取芯片颜色
     public static SKColor GetChipColor(int chipIndex)
     {
         // 不同芯片使用不同灰度
@@ -410,11 +617,50 @@ public class VgmVisualizer : IDisposable
         double freq = clockHz / (32.0 * period);
         return FrequencyToNote(freq);
     }
+    
+    // PCM 播放速率转音符（C352/SegaPCM/K054539 等）
+    // ratio: 播放速率相对于基准速率的倍率（1.0=原始音高）
+    // baseNote: 基准音高对应的音符（默认 C4=60）
+    public static int PcmRatioToNote(double ratio, int baseNote = 60)
+    {
+        if (ratio <= 0) return -1;
+        // 12音阶系统：每八度倍频，每半音相差 2^(1/12)
+        double semitones = 12.0 * Math.Log2(ratio);
+        return baseNote + (int)Math.Round(semitones);
+    }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        
+        // 释放所有状态
         _chipStates.Clear();
+        _trackers.Clear();
+        
+        // 释放解析器持有的数据
+        _parser = null;
+        _vgmData = null;
+        
+        // 释放缓存
+        _cachedChipsString = null;
+        _cachedVersionString = null;
+        _chipTypeLookup = null;
+        _chipList = null;
+    }
+    
+    // 清理资源但保留实例（用于重复使用）
+    public void Clear()
+    {
+        _chipStates.Clear();
+        _trackers.Clear();
+        _parser = null;
+        _vgmData = null;
+        _cachedChipsString = null;
+        _cachedVersionString = null;
+        _chipTypeLookup = null;
+        _chipList = null;
+        _lastEventIndex = -1;
+        _loopCacheValid = false;
     }
 }

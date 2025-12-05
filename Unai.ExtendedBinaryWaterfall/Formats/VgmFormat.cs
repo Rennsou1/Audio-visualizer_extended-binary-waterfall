@@ -72,12 +72,11 @@ public struct VgmHeader
     public uint Saa1099Clock;     // SAA1099 时钟
     public uint Es5503Clock;      // ES5503 时钟
     public uint Es5506Clock;      // ES5506 时钟
-    public ushort Es5503Channels; // ES5503 通道数
-    public ushort Es5506Channels; // ES5506 通道数
-    public byte C352ClockDiv;     // C352 时钟分频
-    public byte Reserved3;
-    public ushort Reserved4;
-    public uint X1_010Clock;      // X1-010 时钟
+    public byte Es5503Channels;   // ES5503 通道数 (0xD4)
+    public byte Es5506Channels;   // ES5506 通道数 (0xD5)
+    public byte C352ClockDiv;     // C352 时钟分频 (0xD6)
+    public byte Reserved3;        // 保留字节 (0xD7)
+    public uint X1_010Clock;      // X1-010 时钟 (0xD8)
     public uint C352Clock;        // C352 时钟
     public uint Ga20Clock;        // GA20 时钟
     public uint Mikey_Clock;      // Atari Lynx 时钟
@@ -195,8 +194,11 @@ public static class VgmFormat
         if (header.FileId != VGM_MAGIC)
             throw new InvalidDataException("Invalid VGM file signature");
 
-        // 版本 1.50+ 有更多字段
-        if (header.Version >= 0x150 && data.Length >= 0x80)
+        // 计算实际头部大小：VGM数据偏移+0x34，或者0x40（如果DataOffset=0或版本<1.50）
+        uint headerSize = header.DataOffset > 0 ? header.DataOffset + 0x34 : 0x40;
+        
+        // 版本 1.50+ 有更多字段（但必须在头部范围内）
+        if (header.Version >= 0x150 && headerSize >= 0x80 && data.Length >= 0x80)
         {
             header.SegaPcmClock = br.ReadUInt32();
             header.SegaPcmIfReg = br.ReadUInt32();
@@ -224,8 +226,8 @@ public static class VgmFormat
             header.LoopModifier = br.ReadByte();
         }
 
-        // 版本 1.61+ 有更多字段
-        if (header.Version >= 0x161 && data.Length >= 0xC0)
+        // 版本 1.51+ 有更多字段（0x80-0xBF 区域）
+        if (header.Version >= 0x151 && headerSize >= 0xC0 && data.Length >= 0xC0)
         {
             header.GbDmgClock = br.ReadUInt32();
             header.NesApuClock = br.ReadUInt32();
@@ -246,8 +248,8 @@ public static class VgmFormat
             header.QsoundClock = br.ReadUInt32();
         }
 
-        // 版本 1.71+ 有更多字段
-        if (header.Version >= 0x171 && data.Length >= 0x100)
+        // 版本 1.70+ 有更多字段（0xC0-0xFF 区域）
+        if (header.Version >= 0x170 && headerSize >= 0x100 && data.Length >= 0x100)
         {
             header.ScspClock = br.ReadUInt32();
             header.ExtraHdrOffset = br.ReadUInt32();
@@ -256,11 +258,10 @@ public static class VgmFormat
             header.Saa1099Clock = br.ReadUInt32();
             header.Es5503Clock = br.ReadUInt32();
             header.Es5506Clock = br.ReadUInt32();
-            header.Es5503Channels = br.ReadUInt16();
-            header.Es5506Channels = br.ReadUInt16();
+            header.Es5503Channels = br.ReadByte();
+            header.Es5506Channels = br.ReadByte();
             header.C352ClockDiv = br.ReadByte();
             header.Reserved3 = br.ReadByte();
-            header.Reserved4 = br.ReadUInt16();
             header.X1_010Clock = br.ReadUInt32();
             header.C352Clock = br.ReadUInt32();
             header.Ga20Clock = br.ReadUInt32();

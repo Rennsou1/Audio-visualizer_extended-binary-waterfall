@@ -669,19 +669,20 @@ public class YM2413Tracker : VgmChipTracker
             // YM2413 是单声道芯片
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            // Detune: F-Number 低 8 位
-            state.Channels[ch].Detune = _fnum[ch] & 0xFF;
             
             if (_keyOn[ch] && _fnum[ch] > 0)
             {
                 // OPLL: freq = fnum * clock / (72 * 2^(19-block))
                 double clock = Clock > 0 ? Clock : 3579545.0;
                 double freq = _fnum[ch] * clock / (72.0 * Math.Pow(2, 19 - _block[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -794,19 +795,20 @@ public class YM2203Tracker : VgmChipTracker
             // YM2203 FM 是单声道
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            // Detune: F-Number 低 8 位
-            state.Channels[ch].Detune = _fmFnum[ch] & 0xFF;
             
             if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
             {
                 // YM2203 (OPN): freq = fnum * clock / (72 * 2^(21-block))
                 double clock = Clock > 0 ? Clock : 4000000.0;
                 double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
         
@@ -819,8 +821,6 @@ public class YM2203Tracker : VgmChipTracker
             state.Channels[ch + 3].Volume = vol;
             state.Channels[ch + 3].PanLeft = vol;
             state.Channels[ch + 3].PanRight = vol;
-            // Detune: SSG 频率低 8 位
-            state.Channels[ch + 3].Detune = _ssgPeriod[ch] & 0xFF;
             
             if (active)
             {
@@ -828,11 +828,14 @@ public class YM2203Tracker : VgmChipTracker
                 // SSG 时钟为 FM 时钟的 1/2
                 double clock = Clock > 0 ? Clock / 2.0 : 2000000.0;
                 double freq = clock / (16.0 * _ssgPeriod[ch]);
-                state.Channels[ch + 3].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch + 3].Note = note;
+                state.Channels[ch + 3].Detune = cent;
             }
             else
             {
                 state.Channels[ch + 3].Note = -1;
+                state.Channels[ch + 3].Detune = 0;
             }
         }
     }
@@ -934,8 +937,17 @@ public class NesApuTracker : VgmChipTracker
             state.Channels[0].Volume = vol;
             state.Channels[0].PanLeft = vol;
             state.Channels[0].PanRight = vol;
-            state.Channels[0].Detune = _period[0] & 0xFF;
-            state.Channels[0].Note = active ? PeriodToNote(_period[0]) : -1;
+            if (active)
+            {
+                var (note, cent) = PeriodToNoteAndCent(_period[0]);
+                state.Channels[0].Note = note;
+                state.Channels[0].Detune = cent;
+            }
+            else
+            {
+                state.Channels[0].Note = -1;
+                state.Channels[0].Detune = 0;
+            }
         }
         
         // Pulse 2
@@ -947,8 +959,17 @@ public class NesApuTracker : VgmChipTracker
             state.Channels[1].Volume = vol;
             state.Channels[1].PanLeft = vol;
             state.Channels[1].PanRight = vol;
-            state.Channels[1].Detune = _period[1] & 0xFF;
-            state.Channels[1].Note = active ? PeriodToNote(_period[1]) : -1;
+            if (active)
+            {
+                var (note, cent) = PeriodToNoteAndCent(_period[1]);
+                state.Channels[1].Note = note;
+                state.Channels[1].Detune = cent;
+            }
+            else
+            {
+                state.Channels[1].Note = -1;
+                state.Channels[1].Detune = 0;
+            }
         }
         
         // Triangle (无音量控制)
@@ -961,8 +982,17 @@ public class NesApuTracker : VgmChipTracker
             state.Channels[2].Volume = vol;
             state.Channels[2].PanLeft = vol;
             state.Channels[2].PanRight = vol;
-            state.Channels[2].Detune = _period[2] & 0xFF;
-            state.Channels[2].Note = active ? TrianglePeriodToNote(_period[2]) : -1;
+            if (active)
+            {
+                var (note, cent) = TrianglePeriodToNoteAndCent(_period[2]);
+                state.Channels[2].Note = note;
+                state.Channels[2].Detune = cent;
+            }
+            else
+            {
+                state.Channels[2].Note = -1;
+                state.Channels[2].Detune = 0;
+            }
         }
         
         // Noise
@@ -989,22 +1019,21 @@ public class NesApuTracker : VgmChipTracker
     }
     
     // NES APU Pulse 频率: f = CPU_clock / (16 * (period + 1))
-    private int PeriodToNote(int period)
+    private (int note, int cent) PeriodToNoteAndCent(int period)
     {
-        if (period < 8) return -1;
-        // 使用 VGM 头中的时钟，默认 NTSC 1789773 Hz
+        if (period < 8) return (-1, 0);
         double clock = Clock > 0 ? Clock : 1789773.0;
         double freq = clock / (16.0 * (period + 1));
-        return VgmVisualizer.FrequencyToNote(freq);
+        return VgmVisualizer.FrequencyToNoteAndCent(freq);
     }
     
     // NES APU Triangle 频率: f = CPU_clock / (32 * (period + 1))
-    private int TrianglePeriodToNote(int period)
+    private (int note, int cent) TrianglePeriodToNoteAndCent(int period)
     {
-        if (period < 2) return -1;
+        if (period < 2) return (-1, 0);
         double clock = Clock > 0 ? Clock : 1789773.0;
         double freq = clock / (32.0 * (period + 1));
-        return VgmVisualizer.FrequencyToNote(freq);
+        return VgmVisualizer.FrequencyToNoteAndCent(freq);
     }
 }
 
@@ -1114,18 +1143,20 @@ public class GbDmgTracker : VgmChipTracker
             state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active && _freq[ch] > 0)
             {
                 // GB DMG: freq = clock / (32 * (2048 - freq_reg))
                 double clock = Clock > 0 ? Clock / 32.0 : 131072.0;
                 double freq = clock / (2048 - _freq[ch]);
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
         
@@ -1141,18 +1172,20 @@ public class GbDmgTracker : VgmChipTracker
             state.Channels[2].Volume = vol;
             state.Channels[2].PanLeft = vol;
             state.Channels[2].PanRight = vol;
-            state.Channels[2].Detune = _freq[2] & 0xFF;
             
             if (active && _freq[2] > 0)
             {
                 // CH3 频率是 CH1/CH2 的两倍 (clock/64 vs clock/32)
                 double clock = Clock > 0 ? Clock / 64.0 : 65536.0;
                 double freq = clock / (2048 - _freq[2]);
-                state.Channels[2].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[2].Note = note;
+                state.Channels[2].Detune = cent;
             }
             else
             {
                 state.Channels[2].Note = -1;
+                state.Channels[2].Detune = 0;
             }
         }
         
@@ -1212,18 +1245,20 @@ public class HuC6280Tracker : VgmChipTracker
             state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active)
             {
                 // HuC6280: freq = clock / (32 * period)
                 double clock = Clock > 0 ? Clock : 3579545.0;
                 double freq = clock / (32.0 * _freq[ch]);
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1284,18 +1319,20 @@ public class OplTracker : VgmChipTracker
             // OPL 是单声道芯片
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Detune = _fnum[ch] & 0xFF;
             
             if (_keyOn[ch] && _fnum[ch] > 0)
             {
                 // OPL: freq = fnum * clock / (72 * 2^(20-block))
                 double clock = Clock > 0 ? Clock : 3579545.0;
                 double freq = _fnum[ch] * clock / (72.0 * Math.Pow(2, 20 - _block[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1376,16 +1413,20 @@ public class QSoundTracker : VgmChipTracker
             state.Channels[ch].PanRight = Math.Min(127, pan & 0xFF);
             
             // QSound: pitch=0x1000 为原始音高
-            // Detune: 相对于 0x1000 的偏移
-            state.Channels[ch].Detune = _pitch[ch] - 0x1000;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 4096.0;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                // 使用 FrequencyToNoteAndCent 来计算音符和音分偏移
+                // ratio 转换为频率：假设基准为 440 Hz (A4)
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1442,18 +1483,20 @@ public class K051649Tracker : VgmChipTracker
             state.Channels[ch].Volume = vol;
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active)
             {
                 // K051649 (SCC): freq = clock / (32 * period)
                 double clock = Clock > 0 ? Clock : 3579545.0;
                 double freq = clock / (32.0 * _freq[ch]);
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1498,17 +1541,19 @@ public class PokeyTracker : VgmChipTracker
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
             
-            state.Channels[ch].Detune = _freq[ch];
             if (active)
             {
                 // POKEY: freq = clock / (2 * (period + 1))
                 double clock = Clock > 0 ? Clock : 1789773.0;
                 double freq = clock / (2.0 * (_freq[ch] + 1));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1568,18 +1613,20 @@ public class SAA1099Tracker : VgmChipTracker
             // SAA1099 有立体声，但简化为单声道
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Detune = _freq[ch];
             
             if (active && _freq[ch] > 0)
             {
                 // SAA1099: freq = clock / (512 * period * 2^(8-octave))
                 double clock = Clock > 0 ? Clock : 7159090.0;
                 double freq = clock / (512.0 * _freq[ch] * Math.Pow(2, 8 - _octave[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1671,22 +1718,19 @@ public class RF5CTracker : VgmChipTracker
             
             // 从频率步进计算音高: step=0x800 (2048) 为原始音高
             int step = _step[ch];
-            state.Channels[ch].Detune = step;
-            if (active)
+            if (active && step > 0)
             {
-                if (step > 0)
-                {
-                    double ratio = step / 2048.0;
-                    state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
-                }
-                else
-                {
-                    state.Channels[ch].Note = -1;
-                }
+                double ratio = step / 2048.0;
+                // ratio 转换为频率来计算音符和 cent
+                double freq = 440.0 * ratio;  // 使用 A4 作为基准
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1741,22 +1785,18 @@ public class C140Tracker : VgmChipTracker
             
             // C140: freq16=0x1000 为原始音高
             int freq16 = (_freqH[ch] << 8) | _freqL[ch];
-            state.Channels[ch].Detune = freq16 - 0x1000;
-            if (_keyOn[ch])
+            if (_keyOn[ch] && freq16 > 0)
             {
-                if (freq16 > 0)
-                {
-                    double ratio = freq16 / 4096.0;
-                    state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
-                }
-                else
-                {
-                    state.Channels[ch].Note = -1;
-                }
+                double ratio = freq16 / 4096.0;
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1856,15 +1896,18 @@ public class C352Tracker : VgmChipTracker
             state.Channels[ch].HasQuadChannel = true;  // C352 是四声道芯片
             
             // Pitch -> Note: C352 freq=0x10000 为原始音高
-            state.Channels[ch].Detune = _freq[ch] - 0x10000;
             if (_busy[ch] && _freq[ch] > 0)
             {
                 double ratio = _freq[ch] / 65536.0;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -1949,15 +1992,18 @@ public class K053260Tracker : VgmChipTracker
             state.Channels[ch].PanRight = K053260_PanTable[pan, 1] * _volume[ch] / 127;
             
             // Pitch -> Note: K053260 pitch=0x800 为原始音高
-            state.Channels[ch].Detune = _pitch[ch] - 0x800;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 2048.0;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -2021,55 +2067,115 @@ public class K054539Tracker : VgmChipTracker
             state.Channels[ch].PanRight = _panR[ch];
             
             // K054539: 24位pitch，pitch=0x10000 为原始音高
-            state.Channels[ch].Detune = (_pitch[ch] - 0x10000) >> 8;  // 取高 16 位
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 65536.0;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
 }
 
-// MultiPCM 状态追踪器（Sega/Yamaha）
+// MultiPCM (YMW258-F) 状态追踪器（Sega/Yamaha）
+// VGM 命令 0xB5: offset=0 写数据, offset=1 选通道, offset=2 选寄存器
+// 寄存器: 0=Pan, 1=Sample, 2=PitchL, 3=PitchH+Oct, 4=KeyOn, 5=TL, 6=LFO freq, 7=LFO amp
 public class MultiPCMTracker : VgmChipTracker
 {
-    private readonly int[] _volume = new int[28];
-    private readonly int[] _panpot = new int[28];
-    private readonly int[] _oct = new int[28];
-    private readonly int[] _pitch = new int[28];
-    private readonly bool[] _keyOn = new bool[28];
+    // 通道映射表 (与 MAME/libvgm 一致)
+    private static readonly int[] VALUE_TO_CHANNEL = {
+        0, 1, 2, 3, 4, 5, 6, -1,
+        7, 8, 9, 10, 11, 12, 13, -1,
+        14, 15, 16, 17, 18, 19, 20, -1,
+        21, 22, 23, 24, 25, 26, 27, -1
+    };
+    
+    // 当前选定的通道和寄存器 (间接寻址)
+    private int _currentSlot = -1;
+    private int _currentAddress = 0;
+    
+    // 每通道的寄存器状态
+    private readonly int[] _pan = new int[28];        // reg 0: Pan (高4位)
+    private readonly int[] _sample = new int[28];     // reg 1 + reg 2 bit0: 采样号 (9位)
+    private readonly int[] _pitch = new int[28];      // reg 2 (bit2-7) + reg 3 (bit0-3): Pitch (10位)
+    private readonly int[] _octave = new int[28];     // reg 3 (bit4-7): Octave (4位有符号)
+    private readonly bool[] _keyOn = new bool[28];    // reg 4 bit7: Key On
+    private readonly int[] _tl = new int[28];         // reg 5 (bit1-7): Total Level (0=max, 127=min)
     
     public override void ProcessEvent(VgmEvent evt)
     {
-        byte reg = evt.Register;
-        byte val = evt.Value;
+        byte offset = evt.Register;  // VGM 命令中的 offset
+        byte data = evt.Value;
         
-        int ch = reg >> 3;
-        int type = reg & 0x07;
-        
-        if (ch < 28)
+        switch (offset)
         {
-            if (type == 0) _keyOn[ch] = (val & 0x80) != 0;
-            else if (type == 1) _panpot[ch] = val & 0x0F;
-            else if (type == 2) _pitch[ch] = (_pitch[ch] & 0xFF00) | val;  // Pitch Low
-            else if (type == 3) _pitch[ch] = (_pitch[ch] & 0x00FF) | (val << 8);  // Pitch High
-            else if (type == 4) _volume[ch] = val & 0x7F;
-            else if (type == 5) _oct[ch] = (val >> 4) & 0x0F;  // Octave
+            case 0:  // 数据写入到当前通道的当前寄存器
+                if (_currentSlot < 0 || _currentSlot >= 28)
+                    return;
+                WriteSlot(_currentSlot, _currentAddress, data);
+                break;
+                
+            case 1:  // 选择通道
+                int slotIndex = data & 0x1F;
+                _currentSlot = slotIndex < 32 ? VALUE_TO_CHANNEL[slotIndex] : -1;
+                break;
+                
+            case 2:  // 选择寄存器地址
+                _currentAddress = Math.Min((int)data, 7);
+                break;
+        }
+    }
+    
+    // 写入指定通道的指定寄存器
+    private void WriteSlot(int ch, int reg, byte data)
+    {
+        switch (reg)
+        {
+            case 0:  // Pan (高4位)
+                _pan[ch] = (data >> 4) & 0x0F;
+                break;
+                
+            case 1:  // Sample 低8位 (高1位在 reg 2 bit 0)
+                _sample[ch] = (_sample[ch] & 0x100) | data;
+                break;
+                
+            case 2:  // Pitch 低6位 (bit2-7) + Sample 高1位 (bit0)
+                _sample[ch] = (_sample[ch] & 0x0FF) | ((data & 0x01) << 8);
+                _pitch[ch] = (_pitch[ch] & 0x3C0) | ((data >> 2) & 0x3F);
+                break;
+                
+            case 3:  // Octave (bit4-7) + Pitch 高4位 (bit0-3)
+                _pitch[ch] = (_pitch[ch] & 0x03F) | ((data & 0x0F) << 6);
+                _octave[ch] = (data >> 4) & 0x0F;
+                break;
+                
+            case 4:  // Key On/Off (bit7)
+                _keyOn[ch] = (data & 0x80) != 0;
+                break;
+                
+            case 5:  // TL + Interpolation (bit1-7 = TL, bit0 = interpolate)
+                _tl[ch] = (data >> 1) & 0x7F;
+                break;
         }
     }
     
     public override void Reset()
     {
-        Array.Clear(_volume);
-        Array.Clear(_panpot);
-        Array.Clear(_oct);
+        _currentSlot = -1;
+        _currentAddress = 0;
+        Array.Clear(_pan);
+        Array.Clear(_sample);
         Array.Clear(_pitch);
+        Array.Clear(_octave);
         Array.Clear(_keyOn);
+        Array.Clear(_tl);
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
@@ -2077,27 +2183,45 @@ public class MultiPCMTracker : VgmChipTracker
         for (int ch = 0; ch < 28 && ch < state.Channels.Length; ch++)
         {
             state.Channels[ch].KeyOn = _keyOn[ch];
-            state.Channels[ch].Volume = _volume[ch];
             
-            // Pan: 0=L, 7=Center, 15=R
-            float pan = (_panpot[ch] - 7) / 8f;
-            state.Channels[ch].PanLeft = (int)(127 * (1f - Math.Max(0, pan)));
-            state.Channels[ch].PanRight = (int)(127 * (1f + Math.Min(0, pan)));
+            // TL: 0=最大音量, 127=最小音量
+            int vol = Math.Max(0, 127 - _tl[ch]);
+            state.Channels[ch].Volume = vol;
             
-            // MultiPCM: Octave + Pitch -> Note
-            // pitch=0x400 为基准，octave 调整八度
-            state.Channels[ch].Detune = _pitch[ch] - 0x400;
+            // Pan: 0=全左, 7=中心, 15=全右
+            int pan = _pan[ch];
+            if (pan <= 7)
+            {
+                state.Channels[ch].PanLeft = vol;
+                state.Channels[ch].PanRight = vol * pan / 7;
+            }
+            else
+            {
+                state.Channels[ch].PanLeft = vol * (15 - pan) / 8;
+                state.Channels[ch].PanRight = vol;
+            }
+            
+            // Pitch + Octave -> 音高
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
-                int octave = (_oct[ch] & 0x07) - 4;
-                double ratio = _pitch[ch] / 1024.0;
-                // octave 调整的基准音符
-                int baseNote = 60 + octave * 12;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, baseNote);
+                // Octave: 4位有符号 (0-7 正, 8-15 负)
+                int octave = _octave[ch];
+                if (octave > 7) octave -= 16;
+                
+                // Pitch: 10位，0x200 (512) 为基准 (1.0x)
+                // 频率 = 基准频率 * pitch / 512 * 2^octave
+                double ratio = _pitch[ch] / 512.0;
+                double baseFreq = 261.63;  // C4
+                double freq = baseFreq * ratio * Math.Pow(2, octave);
+                
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -2152,17 +2276,19 @@ public class ScspTracker : VgmChipTracker
             state.Channels[ch].PanRight = _panR[ch] * 8;
             
             // SCSP: OCT + FNS -> Note
-            state.Channels[ch].Detune = _fns[ch];
             if (_keyOn[ch])
             {
                 int oct = _oct[ch];
                 if (oct > 7) oct -= 16;  // 符号扩展
                 double freq = 261.63 * Math.Pow(2, oct) * (1.0 + _fns[ch] / 1024.0);
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -2220,18 +2346,20 @@ public class WSwanTracker : VgmChipTracker
             // WonderSwan 立体声支持，但此处简化为单声道
             state.Channels[ch].PanLeft = vol;
             state.Channels[ch].PanRight = vol;
-            state.Channels[ch].Detune = _freq[ch] & 0xFF;
             
             if (active && _freq[ch] > 0)
             {
                 // WonderSwan: freq = clock / (32 * (2048 - freq_reg))
                 double clock = Clock > 0 ? Clock : 3072000.0;
                 double freq = clock / (32.0 * (2048 - _freq[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -2513,19 +2641,19 @@ public class SegaPCMTracker : VgmChipTracker
             state.Channels[ch].PanLeft = _volumeL[ch];
             state.Channels[ch].PanRight = _volumeR[ch];
             
-            // Detune: 相对于原始速率 (0x80) 的采样率偏移
-            // <0x80 = 慢速(低音), >0x80 = 快速(高音)
-            state.Channels[ch].Detune = _delta[ch] - 0x80;
-            
             // Delta -> Note: delta=0x80 为原始音高 (31250 * delta/256 Hz)
             if (active && _delta[ch] > 0)
             {
                 double ratio = _delta[ch] / 128.0;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -2577,15 +2705,18 @@ public class YMZ280BTracker : VgmChipTracker
             state.Channels[ch].PanRight = _panR[ch] * 8;
             
             // YMZ280B: pitch=0x100 为原始音高
-            state.Channels[ch].Detune = _pitch[ch] - 0x100;
             if (_keyOn[ch] && _pitch[ch] > 0)
             {
                 double ratio = _pitch[ch] / 256.0;
-                state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                double freq = 440.0 * ratio;
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
     }
@@ -2805,18 +2936,20 @@ public class YM2608Tracker : VgmChipTracker
             int lr = _fmLr[ch];
             state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
             state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
-            state.Channels[ch].Detune = _fmFnum[ch] & 0xFF;
             
             if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
             {
                 // YM2608 (OPNA): freq = fnum * clock / (72 * 2^(21-block))
                 double clock = Clock > 0 ? Clock : 7987200.0;
                 double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
         
@@ -2829,7 +2962,6 @@ public class YM2608Tracker : VgmChipTracker
             state.Channels[ch + 6].Volume = vol;
             state.Channels[ch + 6].PanLeft = vol;
             state.Channels[ch + 6].PanRight = vol;
-            state.Channels[ch + 6].Detune = _ssgPeriod[ch] & 0xFF;
             
             if (active)
             {
@@ -2837,11 +2969,14 @@ public class YM2608Tracker : VgmChipTracker
                 // SSG 时钟为 FM 时钟的 1/4
                 double clock = Clock > 0 ? Clock / 4.0 : 1996800.0;
                 double freq = clock / (16.0 * _ssgPeriod[ch]);
-                state.Channels[ch + 6].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch + 6].Note = note;
+                state.Channels[ch + 6].Detune = cent;
             }
             else
             {
                 state.Channels[ch + 6].Note = -1;
+                state.Channels[ch + 6].Detune = 0;
             }
         }
         
@@ -3261,18 +3396,20 @@ public class YM2610Tracker : VgmChipTracker
             if (lr == 0) lr = 3;  // 默认立体声
             state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
             state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
-            state.Channels[ch].Detune = _fmFnum[ch] & 0xFF;
             
             if (keyOn && _fmFnum[ch] > 0)
             {
                 // YM2610/B: freq = fnum * clock / (72 * 2^(21-block))
                 double clock = Clock > 0 ? Clock : 8000000.0;
                 double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
-                state.Channels[ch].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
             }
             else
             {
                 state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
             }
         }
         
@@ -3286,18 +3423,20 @@ public class YM2610Tracker : VgmChipTracker
             state.Channels[idx].Volume = vol;
             state.Channels[idx].PanLeft = vol;
             state.Channels[idx].PanRight = vol;
-            state.Channels[idx].Detune = _ssgPeriod[ch] & 0xFF;
             
             if (active)
             {
                 // SSG: freq = clock / (16 * period), SSG时钟为FM时钟的1/4
                 double clock = Clock > 0 ? Clock / 4.0 : 2000000.0;
                 double freq = clock / (16.0 * _ssgPeriod[ch]);
-                state.Channels[idx].Note = VgmVisualizer.FrequencyToNote(freq);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[idx].Note = note;
+                state.Channels[idx].Detune = cent;
             }
             else
             {
                 state.Channels[idx].Note = -1;
+                state.Channels[idx].Detune = 0;
             }
         }
         

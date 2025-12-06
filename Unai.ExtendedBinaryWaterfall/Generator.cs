@@ -4575,6 +4575,25 @@ public class Generator
         var chipStates = _currentVgmVisualizer.ChipStates;
         if (chipStates.Count == 0) return;
         
+        // 检测是否包含 MultiPCM 芯片，如果有则使用 Piano Roll 视图
+        bool hasMultiPCM = false;
+        VgmVisualizer.ChipState multiPcmState = null;
+        foreach (var chip in chipStates)
+        {
+            if (chip.Info.Name == "MultiPCM")
+            {
+                hasMultiPCM = true;
+                multiPcmState = chip;
+                break;
+            }
+        }
+        
+        if (hasMultiPCM && multiPcmState != null)
+        {
+            DrawMultiPCMPianoRoll(region, currentTimeMs, multiPcmState, slideOffset);
+            return;
+        }
+        
         // 布局参数（加上滑动偏移）
         float areaLeft = region.Left + padding + slideOffset;
         float areaTop = region.Top + padding;
@@ -4714,6 +4733,243 @@ public class Generator
                 rowY += rowHeight;
             }
         }
+    }
+    
+    // MultiPCM 专用 Piano Roll 视图
+    // 横轴: 音高 (C0-B8)，顶部: 现在，底部: 历史
+    private void DrawMultiPCMPianoRoll(SKRect region, double currentTimeMs, VgmVisualizer.ChipState chipState, float slideOffset)
+    {
+        float s = ResolutionScale;
+        float padding = 12 * s;
+        
+        // 布局参数
+        float areaLeft = region.Left + padding + slideOffset;
+        float areaTop = region.Top + padding;
+        float areaWidth = region.Width - padding * 2;
+        float areaHeight = region.Height - padding * 2;
+        
+        float leftMargin = 5 * s;     // 左边边距
+        float topMargin = 48 * s;     // 顶部信息区（音符/D:/V:）- 增加避免重叠
+        float bottomMargin = 55 * s;  // 底部（八度标签 + 通道池）- 增加避免重叠
+        float rightMargin = 5 * s;
+        
+        float pianoW = areaWidth - leftMargin - rightMargin;
+        float pianoH = areaHeight - topMargin - bottomMargin;
+        
+        // 音高范围: C0 (0) 到 B8 (107) = 108个键
+        int minNote = 0;
+        int maxNote = 108;
+        int totalKeys = maxNote - minNote;
+        float keyWidth = pianoW / totalKeys;
+        
+        // 时间范围
+        float historyWindowMs = 4000f;
+        
+        // 绘制黑键背景
+        int[] blackKeys = { 1, 3, 6, 8, 10 };
+        using var blackKeyBgPaint = new SKPaint { Color = new SKColor(15, 15, 15), IsAntialias = false };
+        for (int note = minNote; note < maxNote; note++)
+        {
+            int semitone = note % 12;
+            if (Array.IndexOf(blackKeys, semitone) >= 0)
+            {
+                float x = areaLeft + leftMargin + (note - minNote) * keyWidth;
+                _frameCanvas.DrawRect(x, areaTop + topMargin, keyWidth, pianoH, blackKeyBgPaint);
+            }
+        }
+        
+        // 绘制八度分隔线
+        using var gridPaint = new SKPaint { Color = new SKColor(40, 40, 40), StrokeWidth = 1 * s, IsAntialias = false };
+        for (int oct = 0; oct <= 8; oct++)
+        {
+            int note = oct * 12;
+            if (note >= minNote && note <= maxNote)
+            {
+                float x = areaLeft + leftMargin + (note - minNote) * keyWidth;
+                _frameCanvas.DrawLine(x, areaTop + topMargin, x, areaTop + topMargin + pianoH, gridPaint);
+            }
+        }
+        
+        // 获取历史记录
+        var history = _currentVgmVisualizer.GetMultiPcmHistory();
+        
+        // 统计每个音高上同时有多少音符（用于处理重叠）
+        var noteSlotCount = new int[maxNote];
+        var noteSlotIndex = new Dictionary<int, int>();  // channel -> slot index
+        
+        // 先统计活跃音符的槽位
+        var channels = chipState.Channels;
+        for (int ch = 0; ch < channels.Length; ch++)
+        {
+            var channel = channels[ch];
+            if (channel.KeyOn && channel.Note >= minNote && channel.Note < maxNote && channel.Volume > 0)
+            {
+                noteSlotIndex[ch] = noteSlotCount[channel.Note];
+                noteSlotCount[channel.Note]++;
+            }
+        }
+        
+        // 绘制历史音符（顶部=现在，底部=历史）
+        using var historyPaint = new SKPaint { IsAntialias = false };
+        foreach (var entry in history)
+        {
+            if (entry.Note < minNote || entry.Note >= maxNote) continue;
+            
+            // 计算时间位置
+            double noteEndTime = entry.Duration > 0 ? entry.StartTime + entry.Duration : currentTimeMs;
+            double ageStart = currentTimeMs - noteEndTime;   // 音符结束距离现在多久
+            double ageEnd = currentTimeMs - entry.StartTime; // 音符开始距离现在多久
+            
+            if (ageStart > historyWindowMs) continue;  // 已经滚出窗口
+            if (ageEnd < 0) continue;  // 还没开始
+            
+            // 限制在窗口内
+            ageStart = Math.Max(0, ageStart);
+            ageEnd = Math.Min(historyWindowMs, ageEnd);
+            
+            float y1 = areaTop + topMargin + (float)(ageStart / historyWindowMs) * pianoH;
+            float y2 = areaTop + topMargin + (float)(ageEnd / historyWindowMs) * pianoH;
+            
+            float noteX = areaLeft + leftMargin + (entry.Note - minNote) * keyWidth;
+            float noteW = keyWidth - 1 * s;
+            float noteH = Math.Max(2 * s, y2 - y1);
+            
+            // 活跃音符更亮，历史音符根据时间衰减
+            bool isActive = entry.Duration == 0;
+            float brightness;
+            if (isActive)
+            {
+                brightness = 180 + (entry.Volume / 127f) * 75;  // 活跃: 180-255
+            }
+            else
+            {
+                // 历史: 根据结束时间衰减
+                float fade = 1f - (float)(ageStart / historyWindowMs);
+                brightness = 40 + fade * 80;  // 40-120
+            }
+            
+            historyPaint.Color = new SKColor((byte)brightness, (byte)brightness, (byte)brightness);
+            _frameCanvas.DrawRect(noteX, y1, noteW, noteH, historyPaint);
+        }
+        
+        // 当前时间线
+        using var timeLinePaint = new SKPaint { Color = new SKColor(80, 80, 80), StrokeWidth = 1 * s, IsAntialias = false };
+        _frameCanvas.DrawLine(areaLeft + leftMargin, areaTop + topMargin, 
+                             areaLeft + leftMargin + pianoW, areaTop + topMargin, timeLinePaint);
+        
+        // 收集活跃音符信息用于标签显示
+        string[] noteNames = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+        var activeNotes = new List<(float x, int note, int detune, int vol, int slotIdx, int slotTotal)>();
+        int activeCount = 0;
+        
+        for (int ch = 0; ch < channels.Length; ch++)
+        {
+            var channel = channels[ch];
+            if (!channel.KeyOn || channel.Note < minNote || channel.Note >= maxNote || channel.Volume <= 0)
+                continue;
+            
+            activeCount++;
+            float noteX = areaLeft + leftMargin + (channel.Note - minNote) * keyWidth;
+            int slotIdx = noteSlotIndex.TryGetValue(ch, out var idx) ? idx : 0;
+            int slotTotal = noteSlotCount[channel.Note];
+            activeNotes.Add((noteX, channel.Note, channel.Detune, channel.Volume, slotIdx, slotTotal));
+        }
+        
+        // 按 X 位置排序，检测重叠
+        activeNotes.Sort((a, b) => a.x.CompareTo(b.x));
+        
+        using var textPaint = new SKPaint { IsAntialias = true };
+        float minLabelSpacing = 35 * s;  // 标签最小间距
+        float lastLabelX = float.MinValue;
+        
+        foreach (var (noteX, note, detune, vol, slotIdx, slotTotal) in activeNotes)
+        {
+            float centerX = noteX + keyWidth / 2;
+            
+            // 同音高多个采样时，横向偏移标签
+            if (slotTotal > 1)
+            {
+                float offsetRange = keyWidth * 0.6f;
+                float offset = (slotIdx - (slotTotal - 1) / 2f) * (offsetRange / Math.Max(1, slotTotal - 1));
+                centerX += offset;
+            }
+            
+            // 检测与上一个标签是否重叠
+            if (centerX - lastLabelX < minLabelSpacing)
+                continue;  // 跳过重叠的标签
+            
+            lastLabelX = centerX;
+            
+            string noteName = noteNames[note % 12];
+            int octave = note / 12;
+            
+            // 第1行: 音符名
+            textPaint.Color = SKColors.White;
+            textPaint.TextSize = 9 * s;
+            textPaint.TextAlign = SKTextAlign.Center;
+            _frameCanvas.DrawText($"{noteName}{octave}", centerX, areaTop + topMargin - 32 * s, textPaint);
+            
+            // 第2行: D:值
+            string detuneStr = detune >= 0 ? $"D:+{detune}" : $"D:{detune}";
+            textPaint.Color = new SKColor(170, 170, 170);
+            _frameCanvas.DrawText(detuneStr, centerX, areaTop + topMargin - 21 * s, textPaint);
+            
+            // 第3行: 音量
+            textPaint.Color = new SKColor(136, 136, 136);
+            _frameCanvas.DrawText($"V:{vol}", centerX, areaTop + topMargin - 10 * s, textPaint);
+        }
+        
+        // 底部八度标签（在钢琴区下方）
+        float octaveLabelY = areaTop + topMargin + pianoH + 12 * s;
+        textPaint.Color = new SKColor(100, 100, 100);
+        textPaint.TextSize = 10 * s;
+        textPaint.TextAlign = SKTextAlign.Left;
+        for (int oct = 0; oct <= 8; oct++)
+        {
+            int note = oct * 12;
+            if (note >= minNote && note < maxNote)
+            {
+                float x = areaLeft + leftMargin + (note - minNote) * keyWidth;
+                _frameCanvas.DrawText($"o{oct}", x + 2 * s, octaveLabelY, textPaint);
+            }
+        }
+        
+        // 底部通道池状态条（在八度标签下方）
+        float poolY = areaTop + topMargin + pianoH + 22 * s;
+        float poolBarX = areaLeft + leftMargin;
+        float cellSize = 8 * s;  // 固定方块大小
+        float cellGap = 2 * s;   // 方块间距
+        float totalPoolW = 28 * (cellSize + cellGap) - cellGap;
+        
+        // 活跃通道数显示
+        textPaint.TextSize = 9 * s;
+        textPaint.Color = new SKColor(120, 120, 120);
+        textPaint.TextAlign = SKTextAlign.Left;
+        _frameCanvas.DrawText($"CH: {activeCount}/28", poolBarX + totalPoolW + 10 * s, poolY + cellSize - 1 * s, textPaint);
+        
+        using var poolPaint = new SKPaint { IsAntialias = false };
+        for (int i = 0; i < 28 && i < channels.Length; i++)
+        {
+            float x = poolBarX + i * (cellSize + cellGap);
+            var ch = channels[i];
+            
+            if (ch.KeyOn && ch.Volume > 0)
+            {
+                byte brightness = (byte)(150 + (ch.Volume / 127f) * 105);
+                poolPaint.Color = new SKColor(brightness, brightness, brightness);
+            }
+            else
+            {
+                poolPaint.Color = new SKColor(35, 35, 35);
+            }
+            _frameCanvas.DrawRect(x, poolY, cellSize, cellSize, poolPaint);
+        }
+        
+        // 芯片名称
+        textPaint.Color = SKColors.White;
+        textPaint.TextSize = 12 * s;
+        textPaint.TextAlign = SKTextAlign.Left;
+        _frameCanvas.DrawText("MultiPCM (YMW258-F)", areaLeft, areaTop + 12 * s, textPaint);
     }
     
     // VGM 可视化静态颜色（避免每帧创建 SKColor 对象）

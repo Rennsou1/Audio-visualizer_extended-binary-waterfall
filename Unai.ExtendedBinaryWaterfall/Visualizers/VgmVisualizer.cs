@@ -42,6 +42,22 @@ public class VgmVisualizer : IDisposable
         public ChannelState[] Channels;
         public byte[] Registers;
     }
+    
+    // 音符历史记录（用于 Piano Roll 视图）
+    public class NoteHistoryEntry
+    {
+        public int Note;       // 音符 (0-127)
+        public int Volume;     // 音量 (0-127)
+        public int Detune;     // Detune 值
+        public int Channel;    // 通道号
+        public double StartTime; // 开始时间 (ms)
+        public double Duration;  // 持续时间 (ms)，0 表示仍在播放
+    }
+    
+    // MultiPCM 专用历史记录
+    private readonly List<NoteHistoryEntry> _multiPcmHistory = new();
+    private const int MAX_HISTORY_ENTRIES = 500;  // 最大历史记录数
+    private const double HISTORY_WINDOW_MS = 5000; // 历史窗口时长 (ms)
 
     private readonly List<ChipState> _chipStates = new();
     private readonly Dictionary<byte, VgmChipTracker> _trackers = new();
@@ -358,6 +374,84 @@ public class VgmVisualizer : IDisposable
                 tracker.UpdateVisualizerState(state);
             }
             UpdatePanDisplay(state, deltaMs);
+            
+            // MultiPCM 专用：更新音符历史记录
+            if (state.Info.Name == "MultiPCM")
+            {
+                UpdateMultiPcmHistory(state, timeMs);
+            }
+        }
+    }
+    
+    // 获取 MultiPCM 音符历史记录（用于 Piano Roll 渲染）
+    public IReadOnlyList<NoteHistoryEntry> GetMultiPcmHistory() => _multiPcmHistory;
+    
+    // 更新 MultiPCM 音符历史记录
+    private void UpdateMultiPcmHistory(ChipState state, double currentTimeMs)
+    {
+        // 清理过期的历史记录
+        double cutoffTime = currentTimeMs - HISTORY_WINDOW_MS;
+        _multiPcmHistory.RemoveAll(e => e.StartTime + e.Duration < cutoffTime && e.Duration > 0);
+        
+        // 限制历史记录数量
+        while (_multiPcmHistory.Count > MAX_HISTORY_ENTRIES)
+        {
+            _multiPcmHistory.RemoveAt(0);
+        }
+        
+        // 检查每个通道的状态变化
+        for (int ch = 0; ch < state.Channels.Length; ch++)
+        {
+            var channel = state.Channels[ch];
+            
+            // 查找该通道是否有活跃的历史记录（Duration=0 表示仍在播放）
+            var activeEntry = _multiPcmHistory.Find(e => e.Channel == ch && e.Duration == 0);
+            
+            if (channel.KeyOn && channel.Note >= 0 && channel.Volume > 0)
+            {
+                // 通道活跃
+                if (activeEntry == null)
+                {
+                    // 新音符开始
+                    _multiPcmHistory.Add(new NoteHistoryEntry
+                    {
+                        Note = channel.Note,
+                        Volume = channel.Volume,
+                        Detune = channel.Detune,
+                        Channel = ch,
+                        StartTime = currentTimeMs,
+                        Duration = 0  // 0 表示仍在播放
+                    });
+                }
+                else if (activeEntry.Note != channel.Note)
+                {
+                    // 音符改变，结束旧的，开始新的
+                    activeEntry.Duration = currentTimeMs - activeEntry.StartTime;
+                    _multiPcmHistory.Add(new NoteHistoryEntry
+                    {
+                        Note = channel.Note,
+                        Volume = channel.Volume,
+                        Detune = channel.Detune,
+                        Channel = ch,
+                        StartTime = currentTimeMs,
+                        Duration = 0
+                    });
+                }
+                else
+                {
+                    // 同一音符，更新 Volume 和 Detune
+                    activeEntry.Volume = channel.Volume;
+                    activeEntry.Detune = channel.Detune;
+                }
+            }
+            else
+            {
+                // 通道不活跃，结束当前音符
+                if (activeEntry != null)
+                {
+                    activeEntry.Duration = currentTimeMs - activeEntry.StartTime;
+                }
+            }
         }
     }
     

@@ -19,5 +19,6 @@ libvgm-build
 libvgm-wrapper
 .windsurf
 .vscode
-.vgm
-.vgz
+*.vgm
+*.vgz
+docs

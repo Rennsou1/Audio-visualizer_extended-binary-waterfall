@@ -35,6 +35,13 @@ public sealed unsafe class VgmAudioSource : ISampleSource
     public bool FadeOutEnabled { get; set; } = true;
     public double FadeOutDuration { get; set; } = 5.0;
     
+    // 音量标准化设置
+    // 启用后会自动检测峰值并调整音量，防止失真
+    public bool NormalizeVolume { get; set; } = true;
+    public bool NormalizeBoostQuiet { get; set; } = true;     // 是否增益过小音量（归一化模式）
+    public float NormalizeTargetDb { get; set; } = -1.0f;     // 目标峰值 dB（-1dB 留有余量）
+    public float NormalizeGain { get; private set; } = 1.0f;  // 实际应用的增益
+    
     // 播放结束标记（用于 MultiFileAudioSource EOF 检测）
     public bool IsEof => _playbackEnded || _disposed || _preRenderedPosition >= _preRenderedLength;
     
@@ -259,10 +266,17 @@ public sealed unsafe class VgmAudioSource : ISampleSource
             _isPreRendered = true;
             _preRenderedPosition = 0;
             
+            // 音量标准化：扫描峰值并调整增益
+            if (NormalizeVolume && _preRenderedLength > 0)
+            {
+                NormalizeAudio();
+            }
+            
             string loopInfo = HasLoop 
                 ? (LoopCount == 1 ? "1次（不循环）" : $"{LoopCount}次（循环{LoopCount - 1}次）")
                 : "无循环";
-            Logger.Info($"[VGM] 预渲染完成: {_preRenderedLength / _channels / (float)_sampleRate:F2}s, 循环: {loopInfo}");
+            string gainInfo = NormalizeVolume ? $", 增益: {NormalizeGain:F3}x ({20 * Math.Log10(NormalizeGain):F1}dB)" : "";
+            Logger.Info($"[VGM] 预渲染完成: {_preRenderedLength / _channels / (float)_sampleRate:F2}s, 循环: {loopInfo}{gainInfo}");
             
             return true;
         }
@@ -328,6 +342,66 @@ public sealed unsafe class VgmAudioSource : ISampleSource
         return toRead;
     }
 
+    // 音量标准化：扫描峰值并调整增益，防止失真
+    private void NormalizeAudio()
+    {
+        if (_preRenderedBuffer == null || _preRenderedLength <= 0)
+        {
+            NormalizeGain = 1.0f;
+            return;
+        }
+        
+        // 第一遍：找到最大峰值（绝对值）
+        float maxPeak = 0f;
+        for (int i = 0; i < _preRenderedLength; i++)
+        {
+            float abs = Math.Abs(_preRenderedBuffer[i]);
+            if (abs > maxPeak) maxPeak = abs;
+        }
+        
+        if (maxPeak <= 0f)
+        {
+            NormalizeGain = 1.0f;
+            return;
+        }
+        
+        // 计算目标峰值（dB转线性）
+        // NormalizeTargetDb = -1.0dB 对应约 0.891 线性值
+        float targetPeak = (float)Math.Pow(10.0, NormalizeTargetDb / 20.0);
+        
+        // 计算增益
+        float gain = targetPeak / maxPeak;
+        
+        // 如果音量已经低于目标，根据设置决定是否增益
+        if (gain > 1.0f)
+        {
+            if (!NormalizeBoostQuiet)
+            {
+                // 不增益过小音量，保持原样
+                NormalizeGain = 1.0f;
+                Logger.Debug($"[VGM] 音量正常，峰值: {maxPeak:F4} ({20 * Math.Log10(maxPeak):F1}dB)");
+                return;
+            }
+            // 归一化模式：限制最大增益为 12dB（约4倍），避免过度放大噪音
+            float maxBoostGain = (float)Math.Pow(10.0, 12.0 / 20.0);  // 12dB
+            if (gain > maxBoostGain)
+            {
+                gain = maxBoostGain;
+                Logger.Debug($"[VGM] 音量过小，限制增益为 {maxBoostGain:F2}x (+12dB)");
+            }
+        }
+        
+        NormalizeGain = gain;
+        
+        // 第二遍：应用增益
+        for (int i = 0; i < _preRenderedLength; i++)
+        {
+            _preRenderedBuffer[i] *= gain;
+        }
+        
+        Logger.Debug($"[VGM] 音量标准化: 峰值 {maxPeak:F4} -> {maxPeak * gain:F4}, 增益: {gain:F4}x ({20 * Math.Log10(gain):F1}dB)");
+    }
+    
     // 跳转到指定时间（秒）
     public void Seek(double seconds)
     {

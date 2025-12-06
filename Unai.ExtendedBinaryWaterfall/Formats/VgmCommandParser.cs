@@ -258,56 +258,99 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // AY-3-8910 写入
+                // AY-3-8910 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xA0:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_AY8910, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_AY8910, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // NES APU 写入
+                // NES APU 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xB4:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_NESAPU, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_NESAPU, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // Game Boy DMG 写入
+                // Game Boy DMG 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xB3:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_GBDMG, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_GBDMG, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // HuC6280 写入
+                // HuC6280 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xB9:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_HUC6280, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_HUC6280, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // K051649 (SCC) 写入
+                // K051649 (SCC) 写入 (pp aa dd, pp的bit7选择第二芯片)
                 case 0xD2:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_K051649, Port = _data[pos], Register = _data[pos + 1], Value = _data[pos + 2] });
+                        byte pp = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_K051649, 
+                            ChipIndex = (byte)((pp >> 7) & 0x01),
+                            Port = (byte)(pp & 0x7F), 
+                            Register = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // POKEY 写入
+                // POKEY 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xBB:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_POKEY, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_POKEY, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
@@ -322,21 +365,35 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // SAA1099 写入
+                // SAA1099 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xBD:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_SAA1099, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_SAA1099, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // SegaPCM 写入 (16位地址)
+                // SegaPCM 写入 (llhh dd, hh的bit7选择第二芯片)
                 case 0xC0:
                     if (pos + 2 < _data.Length)
                     {
-                        // Port=高字节, Register=低字节
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_SEGAPCM, Port = _data[pos + 1], Register = _data[pos], Value = _data[pos + 2] });
+                        byte hh = _data[pos + 1];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_SEGAPCM, 
+                            ChipIndex = (byte)((hh >> 7) & 0x01),
+                            Port = (byte)(hh & 0x7F), 
+                            Register = _data[pos], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
@@ -400,47 +457,82 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // MultiPCM 写入
+                // MultiPCM 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xB5:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_MULTIPCM, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_MULTIPCM, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // K053260 写入
+                // K053260 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xBA:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_K053260, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_K053260, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // WonderSwan 写入
+                // WonderSwan 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xBC:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_WSWAN, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_WSWAN, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // ES5506 8-bit 写入
+                // ES5506 8-bit 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xBE:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_ES5506, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_ES5506, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
                 
-                // GA20 写入
+                // GA20 写入 (aa dd, aa的bit7选择第二芯片)
                 case 0xBF:
                     if (pos + 1 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_GA20, Register = _data[pos], Value = _data[pos + 1] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_GA20, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1] 
+                        });
                         pos += 2;
                     }
                     break;
@@ -469,12 +561,19 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // SCSP 写入
+                // SCSP 写入 (mmll dd, mm的bit7选择第二芯片)
                 case 0xC5:
                     if (pos + 2 < _data.Length)
                     {
-                        // mmll dd : mm=高位，ll=低位
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_SCSP, Register = _data[pos], Port = _data[pos + 1], Value = _data[pos + 2] });
+                        byte mm = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_SCSP, 
+                            ChipIndex = (byte)((mm >> 7) & 0x01),
+                            Register = (byte)(mm & 0x7F), 
+                            Port = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
@@ -487,85 +586,155 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // VSU 写入
+                // VSU 写入 (aa bb dd, aa的bit7选择第二芯片)
                 case 0xC7:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_VSU, Register = _data[pos], Value = _data[pos + 2] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_VSU, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // X1-010 写入
+                // X1-010 写入 (mmll dd, mm的bit7选择第二芯片)
                 case 0xC8:
                     if (pos + 2 < _data.Length)
                     {
-                        // mmll dd : mm=高位，ll=低位
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_X1010, Register = _data[pos], Port = _data[pos + 1], Value = _data[pos + 2] });
+                        byte mm = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_X1010, 
+                            ChipIndex = (byte)((mm >> 7) & 0x01),
+                            Register = (byte)(mm & 0x7F), 
+                            Port = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // YMF278B 写入
+                // YMF278B 写入 (pp aa dd, pp的bit7选择第二芯片)
                 case 0xD0:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YMF278B, Port = _data[pos], Register = _data[pos + 1], Value = _data[pos + 2] });
+                        byte pp = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_YMF278B, 
+                            ChipIndex = (byte)((pp >> 7) & 0x01),
+                            Port = (byte)(pp & 0x7F), 
+                            Register = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // YMF271 写入
+                // YMF271 写入 (pp aa dd, pp的bit7选择第二芯片)
                 case 0xD1:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_YMF271, Port = _data[pos], Register = _data[pos + 1], Value = _data[pos + 2] });
+                        byte pp = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_YMF271, 
+                            ChipIndex = (byte)((pp >> 7) & 0x01),
+                            Port = (byte)(pp & 0x7F), 
+                            Register = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // K054539 写入
+                // K054539 写入 (pp aa dd, pp的bit7选择第二芯片)
                 case 0xD3:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_K054539, Port = _data[pos], Register = _data[pos + 1], Value = _data[pos + 2] });
+                        byte pp = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_K054539, 
+                            ChipIndex = (byte)((pp >> 7) & 0x01),
+                            Port = (byte)(pp & 0x7F), 
+                            Register = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // C140 写入
+                // C140 写入 (pp aa dd, pp的bit7选择第二芯片)
                 case 0xD4:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_C140, Port = _data[pos], Register = _data[pos + 1], Value = _data[pos + 2] });
+                        byte pp = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_C140, 
+                            ChipIndex = (byte)((pp >> 7) & 0x01),
+                            Port = (byte)(pp & 0x7F), 
+                            Register = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // ES5503 写入
+                // ES5503 写入 (pp aa dd, pp的bit7选择第二芯片)
                 case 0xD5:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_ES5503, Port = _data[pos], Register = _data[pos + 1], Value = _data[pos + 2] });
+                        byte pp = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_ES5503, 
+                            ChipIndex = (byte)((pp >> 7) & 0x01),
+                            Port = (byte)(pp & 0x7F), 
+                            Register = _data[pos + 1], 
+                            Value = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // ES5506 16-bit 写入: aa ddee
+                // ES5506 16-bit 写入 (aa ddee, aa的bit7选择第二芯片)
                 case 0xD6:
                     if (pos + 2 < _data.Length)
                     {
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_ES5506, Register = _data[pos], Value = _data[pos + 1], Value2 = _data[pos + 2] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_ES5506, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Value = _data[pos + 1], 
+                            Value2 = _data[pos + 2] 
+                        });
                         pos += 3;
                     }
                     break;
                 
-                // C352 写入: aabb ddee (aa=地址MSB, bb=地址LSB, dd=数据MSB, ee=数据LSB)
+                // C352 写入 (aabb ddee, aa的bit7选择第二芯片)
                 case 0xE1:
                     if (pos + 3 < _data.Length)
                     {
-                        // Register=aa, Port=bb, Value=dd, Value2=ee
-                        _events.Add(new VgmEvent { Tick = tick, ChipType = CHIP_C352, Register = _data[pos], Port = _data[pos + 1], Value = _data[pos + 2], Value2 = _data[pos + 3] });
+                        byte aa = _data[pos];
+                        _events.Add(new VgmEvent { 
+                            Tick = tick, 
+                            ChipType = CHIP_C352, 
+                            ChipIndex = (byte)((aa >> 7) & 0x01),
+                            Register = (byte)(aa & 0x7F), 
+                            Port = _data[pos + 1], 
+                            Value = _data[pos + 2], 
+                            Value2 = _data[pos + 3] 
+                        });
                         pos += 4;
                     }
                     break;
@@ -673,6 +842,9 @@ public class VgmCommandParser
                     if (pos + 9 < _data.Length)
                     {
                         byte streamId = _data[pos];
+                        // 数据偏移 (4字节)
+                        uint dacOffset = (uint)(_data[pos + 1] | (_data[pos + 2] << 8) | 
+                                                (_data[pos + 3] << 16) | (_data[pos + 4] << 24));
                         byte lengthMode = _data[pos + 5];
                         // 为对应芯片生成 Key On 事件 (Register=0xFE表示DAC流开始)
                         if (streamId < 16 && _streamChipType[streamId] != 0)
@@ -685,6 +857,7 @@ public class VgmCommandParser
                                 ChipType = MapDacChipType(chipType),
                                 ChipIndex = chipIndex,
                                 Register = 0xFE,  // 特殊: DAC 流开始
+                                Port = (byte)(dacOffset & 0xFF),  // 数据偏移低8位用于音高映射
                                 Value = streamId,
                                 Value2 = lengthMode
                             });
@@ -737,6 +910,8 @@ public class VgmCommandParser
                     if (pos + 3 < _data.Length)
                     {
                         byte streamId = _data[pos];
+                        // 块ID (2字节)
+                        ushort blockId = (ushort)(_data[pos + 1] | (_data[pos + 2] << 8));
                         byte flags = _data[pos + 3];
                         // 为对应芯片生成 Key On 事件
                         if (streamId < 16 && _streamChipType[streamId] != 0)
@@ -749,6 +924,7 @@ public class VgmCommandParser
                                 ChipType = MapDacChipType(chipType),
                                 ChipIndex = chipIndex,
                                 Register = 0xFE,  // 特殊: DAC 流开始
+                                Port = (byte)(blockId & 0xFF),  // 块ID低8位用于音高映射
                                 Value = streamId,
                                 Value2 = flags
                             });

@@ -31,6 +31,8 @@ public class VgmVisualizer : IDisposable
         public float PeakRearRight;   // 峰值保持后右
         public bool HasQuadChannel;   // 是否是四声道 (C352)
         public bool KeyOn;            // 是否按下
+        public bool PrevKeyOn;        // 上一帧的 KeyOn 状态（用于检测触发）
+        public float AttackFlash;     // 打击闪光强度 (0-1)，触发时为1，快速衰减
         public string Label;          // 通道标签
         public int Detune;            // Detune 音高偏移值 (有符号)
     }
@@ -85,6 +87,174 @@ public class VgmVisualizer : IDisposable
     
     // 芯片类型查找表（避免每帧调用 GetChipTypeForName）
     private byte[] _chipTypeLookup;
+    
+    // 钢琴键盘自适应偏移和缩放
+    private float _pianoOffset;           // 当前偏移量（八度数）
+    private float _pianoOffsetTarget;     // 目标偏移量
+    private float _pianoDisplayOctaves;   // 当前显示的八度数（用于缩放）
+    private float _pianoDisplayOctavesTarget; // 目标显示八度数
+    private const float PIANO_SLIDE_SPEED = 6f;   // 滑动速度（较慢，约500ms完成）
+    private const float PIANO_ZOOM_SPEED = 4f;    // 缩放速度（更慢，约750ms完成）
+    
+    // 滑动稳定性控制
+    private float _lastSlideTime;         // 上次触发滑动的时间累计
+    private int _stableMinNote = -1;      // 稳定的最小音符（用于滞后）
+    private int _stableMaxNote = -1;      // 稳定的最大音符
+    private float _noteStableTimer;       // 音符稳定计时器
+    private const float NOTE_STABLE_DELAY = 0.15f; // 音符变化后稳定延迟（秒）
+    private const float SLIDE_COOLDOWN = 0.3f;     // 滑动冷却时间（秒）
+    
+    // 钢琴偏移和缩放属性
+    public float PianoOffset => _pianoOffset;
+    public float PianoDisplayOctaves => _pianoDisplayOctaves;
+    
+    // 更新钢琴偏移和缩放（根据活跃音符范围自适应）
+    // baseDisplayOctaves: 基础显示八度数
+    // totalOctaves: 总八度数（默认11个，o0-o10）
+    // defaultOffsetOctave: 默认起始八度
+    public void UpdatePianoOffset(int minActiveNote, int maxActiveNote, int baseDisplayOctaves, float deltaTime, int totalOctaves = 11, int defaultOffsetOctave = 1)
+    {
+        // 初始化显示八度数和默认偏移
+        if (_pianoDisplayOctaves == 0)
+        {
+            _pianoDisplayOctaves = baseDisplayOctaves;
+            _pianoDisplayOctavesTarget = baseDisplayOctaves;
+            _pianoOffset = defaultOffsetOctave;
+            _pianoOffsetTarget = defaultOffsetOctave;
+        }
+        
+        // 累计滑动冷却时间
+        _lastSlideTime += deltaTime;
+        _noteStableTimer += deltaTime;
+        
+        // 当前显示范围（半音）
+        float displayMin = _pianoOffset * 12;
+        float displayMax = displayMin + _pianoDisplayOctaves * 12;
+        
+        // 边距定义
+        int hardEdge = 3;     // 硬边缘（超出必须立即滑动）
+        int softEdge = 12;    // 软边缘（超出时触发居中，但有滞后）
+        int centerMargin = 18; // 居中后的安全边距
+        
+        if (minActiveNote >= 0 && maxActiveNote >= 0)
+        {
+            // 检测音符范围是否有显著变化（添加滞后避免抖动）
+            if (_stableMinNote < 0 || _stableMaxNote < 0)
+            {
+                _stableMinNote = minActiveNote;
+                _stableMaxNote = maxActiveNote;
+                _noteStableTimer = 0;
+            }
+            else
+            {
+                // 只有超出当前稳定范围时才更新
+                if (minActiveNote < _stableMinNote || maxActiveNote > _stableMaxNote)
+                {
+                    _stableMinNote = Math.Min(_stableMinNote, minActiveNote);
+                    _stableMaxNote = Math.Max(_stableMaxNote, maxActiveNote);
+                    _noteStableTimer = 0;
+                }
+                // 音符范围收缩时，延迟更新（避免快速变化）
+                else if (_noteStableTimer > NOTE_STABLE_DELAY * 3)
+                {
+                    // 缓慢收缩稳定范围
+                    if (minActiveNote > _stableMinNote) _stableMinNote++;
+                    if (maxActiveNote < _stableMaxNote) _stableMaxNote--;
+                }
+            }
+            
+            int noteRange = _stableMaxNote - _stableMinNote;
+            int requiredRange = noteRange + centerMargin * 2;
+            int requiredOctaves = (int)Math.Ceiling(requiredRange / 12f);
+            
+            // 扩展：立即响应
+            if (requiredOctaves > _pianoDisplayOctavesTarget)
+            {
+                _pianoDisplayOctavesTarget = Math.Clamp(requiredOctaves, baseDisplayOctaves, totalOctaves);
+            }
+            // 收缩：需要较大差距且稳定后才收缩
+            else if (requiredOctaves < _pianoDisplayOctavesTarget - 2 && _noteStableTimer > NOTE_STABLE_DELAY * 5)
+            {
+                _pianoDisplayOctavesTarget = Math.Clamp(requiredOctaves + 2, baseDisplayOctaves, totalOctaves);
+            }
+            
+            // 检测是否需要滑动
+            bool needsSlide = false;
+            
+            // 硬边缘检测：超出必须滑动
+            if (_stableMinNote < displayMin + hardEdge || _stableMaxNote > displayMax - hardEdge)
+            {
+                needsSlide = true;
+            }
+            // 软边缘检测：超出且冷却时间已过
+            else if (_lastSlideTime > SLIDE_COOLDOWN)
+            {
+                if (_stableMinNote < displayMin + softEdge || _stableMaxNote > displayMax - softEdge)
+                {
+                    needsSlide = true;
+                }
+            }
+            
+            if (needsSlide)
+            {
+                // 计算目标偏移（使活跃音符居中）
+                int centerNote = (_stableMinNote + _stableMaxNote) / 2;
+                float displayRange = _pianoDisplayOctavesTarget * 12;
+                float targetOffset = (centerNote - displayRange / 2) / 12f;
+                
+                // 限制偏移范围
+                float maxOffset = Math.Max(0f, totalOctaves - _pianoDisplayOctavesTarget);
+                float newTarget = Math.Clamp(targetOffset, 0f, maxOffset);
+                
+                // 只有目标变化足够大时才更新（避免微小抖动）
+                if (Math.Abs(newTarget - _pianoOffsetTarget) > 0.3f)
+                {
+                    _pianoOffsetTarget = newTarget;
+                    _lastSlideTime = 0; // 重置冷却
+                }
+            }
+        }
+        else
+        {
+            // 无活跃音符时，延迟恢复默认
+            if (_noteStableTimer > NOTE_STABLE_DELAY * 10)
+            {
+                _pianoDisplayOctavesTarget = baseDisplayOctaves;
+                _stableMinNote = -1;
+                _stableMaxNote = -1;
+            }
+        }
+        
+        // 平滑过渡偏移（使用非线性插值，避免抖动）
+        float offsetDiff = _pianoOffsetTarget - _pianoOffset;
+        if (Math.Abs(offsetDiff) > 0.005f)
+        {
+            // 差距大时快速移动，差距小时慢速（指数衰减）
+            float speed = PIANO_SLIDE_SPEED * (0.3f + Math.Abs(offsetDiff) * 0.7f);
+            _pianoOffset += offsetDiff * Math.Min(1f, speed * deltaTime);
+        }
+        else
+        {
+            _pianoOffset = _pianoOffsetTarget;
+        }
+        
+        // 平滑过渡缩放（更慢的速度）
+        float scaleDiff = _pianoDisplayOctavesTarget - _pianoDisplayOctaves;
+        if (Math.Abs(scaleDiff) > 0.005f)
+        {
+            float speed = PIANO_ZOOM_SPEED * (0.2f + Math.Abs(scaleDiff) * 0.3f);
+            _pianoDisplayOctaves += scaleDiff * Math.Min(1f, speed * deltaTime);
+        }
+        else
+        {
+            _pianoDisplayOctaves = _pianoDisplayOctavesTarget;
+        }
+        
+        // 限制范围
+        float currentMaxOffset = Math.Max(0f, totalOctaves - _pianoDisplayOctaves);
+        _pianoOffset = Math.Clamp(_pianoOffset, 0f, currentMaxOffset);
+        _pianoDisplayOctaves = Math.Clamp(_pianoDisplayOctaves, baseDisplayOctaves, totalOctaves);
+    }
     
     // 缓存的芯片列表字符串（避免每帧创建新字符串）
     private string _cachedChipsString;
@@ -185,16 +355,28 @@ public class VgmVisualizer : IDisposable
         }
         
         // 构建芯片类型查找表（避免每帧调用 GetChipTypeForName）
+        // 支持双芯片：第二个芯片的类型 = 基础类型 + 0x80
         _chipTypeLookup = new byte[_chipStates.Count];
         for (int i = 0; i < _chipStates.Count; i++)
         {
-            _chipTypeLookup[i] = GetChipTypeForName(_chipStates[i].Info.Name);
+            string name = _chipStates[i].Info.Name ?? "";
+            bool isSecondChip = name.Length > 3 && name.EndsWith(" #2");
+            if (isSecondChip)
+                name = name.Substring(0, name.Length - 3); // 移除 " #2" 后缀
+            byte baseType = GetChipTypeForName(name);
+            _chipTypeLookup[i] = isSecondChip ? (byte)(baseType | 0x80) : baseType;
         }
         
-        // 创建对应的追踪器
+        // 创建对应的追踪器（支持双芯片）
         foreach (var chip in _chipList)
         {
-            VgmChipTracker tracker = chip.Name switch
+            // 处理双芯片：移除 " #2" 后缀获取基础芯片名
+            string baseName = chip.Name ?? "";
+            bool isSecondChip = baseName.Length > 3 && baseName.EndsWith(" #2");
+            if (isSecondChip)
+                baseName = baseName.Substring(0, baseName.Length - 3);
+            
+            VgmChipTracker tracker = baseName switch
             {
                 "YM2612" => new YM2612Tracker(),
                 "SN76489" => new SN76489Tracker(),
@@ -230,7 +412,7 @@ public class VgmVisualizer : IDisposable
                 "PWM" => new GenericPcmTracker(),
                 "VSU" => new GenericPcmTracker(),
                 "YMF278B" => new OplTracker(),  // OPL4 兼容 OPL3
-                "YMF271" => new GenericFmTracker(),
+                "YMF271" => new YMF271Tracker(),
                 "ES5503" => new GenericPcmTracker(),
                 "ES5506" => new GenericPcmTracker(),
                 _ => null
@@ -240,12 +422,14 @@ public class VgmVisualizer : IDisposable
             {
                 // 设置芯片时钟频率（从 VGM 头读取）
                 tracker.Clock = chip.Clock;
-                byte chipType = GetChipTypeForName(chip.Name);
+                byte baseType = GetChipTypeForName(baseName);
+                // 第二个芯片使用 baseType | 0x80 作为键
+                byte chipType = isSecondChip ? (byte)(baseType | 0x80) : baseType;
                 _trackers[chipType] = tracker;
                 
                 // RF5C68/RF5C164 特殊处理：某些 VGM 文件头部声明 RF5C164 但命令使用 RF5C68
                 // 为兼容性，同时注册两个芯片类型到同一个追踪器
-                if (chip.Name == "RF5C68" || chip.Name == "RF5C164")
+                if (baseName == "RF5C68" || baseName == "RF5C164")
                 {
                     _trackers[VgmCommandParser.CHIP_RF5C68] = tracker;
                     _trackers[VgmCommandParser.CHIP_RF5C164] = tracker;
@@ -356,7 +540,36 @@ public class VgmVisualizer : IDisposable
         for (int i = _lastEventIndex + 1; i <= targetIndex && i < events.Count; i++)
         {
             var evt = events[i];
-            if (_trackers.TryGetValue(evt.ChipType, out var tracker))
+            byte chipType = evt.ChipType;
+            
+            // 双芯片判断：
+            // 1. ChipIndex = 1 表示第二芯片 (YM系列使用0xAn命令)
+            // 2. Port的bit7表示第二芯片 (其他芯片使用bit7标志)
+            bool isSecondChip = evt.ChipIndex == 1 || (evt.Port & 0x80) != 0;
+            
+            if (isSecondChip)
+            {
+                // 尝试使用第二个芯片的Tracker
+                byte secondChipType = (byte)(chipType | 0x80);
+                if (_trackers.TryGetValue(secondChipType, out var tracker2))
+                {
+                    // 创建修正后的事件（清除Port的bit7，因为Tracker不需要双芯片标志）
+                    var fixedEvt = new VgmEvent
+                    {
+                        Tick = evt.Tick,
+                        ChipType = evt.ChipType,
+                        ChipIndex = 0, // 对于Tracker来说是第一个（也是唯一）
+                        Port = (byte)(evt.Port & 0x7F),
+                        Register = evt.Register,
+                        Value = evt.Value,
+                        Value2 = evt.Value2
+                    };
+                    tracker2.ProcessEvent(fixedEvt);
+                    continue;
+                }
+            }
+            // 使用第一个芯片的Tracker
+            if (_trackers.TryGetValue(chipType, out var tracker))
             {
                 tracker.ProcessEvent(evt);
             }
@@ -477,10 +690,30 @@ public class VgmVisualizer : IDisposable
         // 输入平滑因子（低通滤波器系数）
         float inputSmoothFactor = MathF.Min(1f, deltaMs / INPUT_SMOOTH_MS);
         
+        // 打击闪光衰减速度（毫秒）
+        const float ATTACK_FLASH_DECAY_MS = 80f;
+        float flashDecay = deltaMs / ATTACK_FLASH_DECAY_MS;
+        
         var channels = state.Channels;
         for (int i = 0; i < channels.Length; i++)
         {
             var ch = channels[i];
+            
+            // 检测 KeyOn 触发（从 false 变为 true）
+            // 滑音（音符变化但 KeyOn 保持为 true）不触发闪光
+            if (ch.KeyOn && !ch.PrevKeyOn && ch.Note >= 0 && ch.Volume > 0)
+            {
+                ch.AttackFlash = 1f;  // 触发闪光
+            }
+            
+            // 更新前一帧状态
+            ch.PrevKeyOn = ch.KeyOn;
+            
+            // 闪光衰减
+            if (ch.AttackFlash > 0)
+            {
+                ch.AttackFlash = MathF.Max(0, ch.AttackFlash - flashDecay);
+            }
             
             // 第一层：输入值平滑（低通滤波）
             // 从追踪器获取原始输入值
@@ -645,17 +878,48 @@ public class VgmVisualizer : IDisposable
     {
         return chipName switch
         {
-            "YM2612" => channelIndex < 6 ? $"FM{channelIndex + 1}" : "DAC",
+            // YM2612: 新布局 - FM1-3, OP2-4(Extended), FM4-5, DAC
+            "YM2612" => channelIndex switch
+            {
+                0 => "FM1",
+                1 => "FM2",
+                2 => "FM3",
+                3 => "OP2",  // FM3 Extended OP2
+                4 => "OP3",  // FM3 Extended OP3
+                5 => "OP4",  // FM3 Extended OP4
+                6 => "FM4",
+                7 => "FM5",
+                8 => "DAC",
+                _ => $"CH{channelIndex + 1}"
+            },
             "YM2151" => $"FM{channelIndex + 1}",
-            "YM2608" => channelIndex < 6 ? $"FM{channelIndex + 1}" 
-                      : channelIndex < 9 ? $"SSG{channelIndex - 5}" 
-                      : channelIndex == 9 ? "ADPCM" : $"RHY{channelIndex - 9}",
-            // YM2610/YM2610B统一使用16通道布局，支持动态检测
-            "YM2610" or "YM2610B" => channelIndex < 6 ? $"FM{channelIndex + 1}"
-                       : channelIndex < 9 ? $"SSG{channelIndex - 5}"
-                       : channelIndex < 15 ? $"PCMA{channelIndex - 8}"
-                       : "PCMB",
-            "YM2203" => channelIndex < 3 ? $"FM{channelIndex + 1}" : $"SSG{channelIndex - 2}",
+            // YM2608: 新布局 - FM1-3, OP2-4, FM4-6, SSG1-3, ADPCM, RHY1-6
+            "YM2608" => channelIndex switch
+            {
+                < 3 => $"FM{channelIndex + 1}",
+                < 6 => $"OP{channelIndex - 1}",     // OP2-4
+                < 9 => $"FM{channelIndex - 2}",     // FM4-6 (索引6-8 → FM4-6)
+                < 12 => $"SSG{channelIndex - 8}",   // SSG1-3 (索引9-11)
+                12 => "ADPCM",
+                _ => $"RHY{channelIndex - 12}"      // RHY1-6 (索引13-18)
+            },
+            // YM2610/YM2610B: 新布局 - FM1-3, OP2-4, FM4-6, SSG1-3, PCMA1-6, PCMB
+            "YM2610" or "YM2610B" => channelIndex switch
+            {
+                < 3 => $"FM{channelIndex + 1}",
+                < 6 => $"OP{channelIndex - 1}",     // OP2-4
+                < 9 => $"FM{channelIndex - 2}",     // FM4-6 (索引6-8)
+                < 12 => $"SSG{channelIndex - 8}",   // SSG1-3 (索引9-11)
+                < 18 => $"PCMA{channelIndex - 11}", // PCMA1-6 (索引12-17)
+                _ => "PCMB"                         // PCMB (索引18)
+            },
+            // YM2203: 新布局 - FM1-3, OP2-4(Extended), SSG1-3
+            "YM2203" => channelIndex switch
+            {
+                < 3 => $"FM{channelIndex + 1}",
+                < 6 => $"OP{channelIndex - 1}",  // OP2-4
+                _ => $"SSG{channelIndex - 5}"    // SSG1-3 (索引6-8)
+            },
             "SN76489" => channelIndex < 3 ? $"T{channelIndex + 1}" : "NOI",
             "AY-3-8910" => $"CH{(char)('A' + channelIndex)}",
             "NES APU" => channelIndex switch

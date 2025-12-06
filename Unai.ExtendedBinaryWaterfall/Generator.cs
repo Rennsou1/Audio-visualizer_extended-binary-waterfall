@@ -801,6 +801,13 @@ public class Generator
 
     #endregion
 
+    #region Audio Processing
+
+    [CliParameter("Enable audio normalization", "audio-normalize")]
+    public bool AudioNormalizeEnabled { get; set; } = true;  // 音频归一化（自动调整音量）
+
+    #endregion
+
     #region Debug Flags
 
     public bool LogAllSubfiles { get; set; } = false;
@@ -1018,6 +1025,8 @@ public class Generator
                     _currentVgmAudioSource.LoopCount = VgmLoopCount;
                     _currentVgmAudioSource.FadeOutEnabled = VgmFadeOutEnabled;
                     _currentVgmAudioSource.FadeOutDuration = VgmFadeOutDuration;
+                    _currentVgmAudioSource.NormalizeVolume = AudioNormalizeEnabled;
+                    _currentVgmAudioSource.NormalizeBoostQuiet = AudioNormalizeEnabled;  // 归一化模式：增益过小音量
                     if (_currentVgmAudioSource.LoadFile(InputFilePath))
                     {
                         _audioSampleSource = _currentVgmAudioSource;
@@ -4600,26 +4609,31 @@ public class Generator
         float areaWidth = region.Width - padding * 2;
         float areaHeight = region.Height - padding * 2;
         
-        // 统计总通道数（包含芯片标题行和空行）
-        int totalRows = 0;
-        foreach (var chip in chipStates)
-        {
-            totalRows += 1;  // 芯片标题行
-            totalRows += chip.Channels?.Length ?? 0;  // 通道行
-        }
-        totalRows += chipStates.Count - 1;  // 芯片之间的空行
-        
-        // 芯片标题行高度（八度标记现在与芯片名同行）
-        float chipTitleHeight = 18 * s;
-        // 空行高度
-        float emptyRowHeight = 8 * s;
-        // 通道行高度（动态计算）
-        float availableHeight = areaHeight - chipStates.Count * chipTitleHeight - (chipStates.Count - 1) * emptyRowHeight;
+        // 统计总通道数
         int totalChannels = 0;
         foreach (var chip in chipStates)
             totalChannels += chip.Channels?.Length ?? 0;
-        float rowHeight = Math.Min(16 * s, availableHeight / Math.Max(totalChannels, 1));
-        rowHeight = Math.Max(rowHeight, 10 * s);
+        
+        // 计算固定高度部分
+        float chipTitleBaseHeight = 18 * s;   // 芯片标题基础高度
+        float emptyRowBaseHeight = 8 * s;     // 空行基础高度
+        float rowBaseHeight = 14 * s;         // 通道行基础高度
+        
+        // 计算理想总高度
+        float idealTotalHeight = chipStates.Count * chipTitleBaseHeight 
+                               + (chipStates.Count - 1) * emptyRowBaseHeight 
+                               + totalChannels * rowBaseHeight;
+        
+        // 计算缩放比例，使内容完全填充可用区域
+        float scaleFactor = areaHeight / Math.Max(idealTotalHeight, 1);
+        
+        // 限制缩放范围：最小0.6倍，最大1.5倍
+        scaleFactor = Math.Clamp(scaleFactor, 0.6f, 1.5f);
+        
+        // 应用缩放
+        float chipTitleHeight = chipTitleBaseHeight * scaleFactor;
+        float emptyRowHeight = emptyRowBaseHeight * scaleFactor;
+        float rowHeight = rowBaseHeight * scaleFactor;
         
         // 列宽定义
         float labelWidth = 32 * s;       // 缩短通道标签宽度
@@ -4632,9 +4646,38 @@ public class Generator
         float pianoWidth = areaWidth - labelWidth - noteNameWidth - infoWidth - volumeBarWidth - gapWidth * 4;
         pianoWidth = Math.Max(pianoWidth, 100 * s);
         
-        // 钢琴参数（9个八度，108个半音，o0-o8）
-        int totalOctaves = 9;
-        int totalKeys = totalOctaves * 12;
+        // 钢琴参数（基础8个八度 o1-o8，最多11个八度可缩放）
+        int baseDisplayOctaves = 8;  // 基础显示八度数
+        int totalOctaves = 11;       // 总八度数 (o0-o10, MIDI 0-131)
+        int defaultOffsetOctave = 1; // 默认起始八度 (o1)
+        
+        // 收集所有活跃音符范围，用于自适应滑动和缩放
+        int minActiveNote = int.MaxValue;
+        int maxActiveNote = int.MinValue;
+        foreach (var chip in chipStates)
+        {
+            if (chip.Channels == null) continue;
+            foreach (var ch in chip.Channels)
+            {
+                if (ch.KeyOn && ch.Volume > 0 && ch.Note >= 0)
+                {
+                    minActiveNote = Math.Min(minActiveNote, ch.Note);
+                    maxActiveNote = Math.Max(maxActiveNote, ch.Note);
+                }
+            }
+        }
+        if (minActiveNote == int.MaxValue) minActiveNote = -1;
+        if (maxActiveNote == int.MinValue) maxActiveNote = -1;
+        
+        // 更新钢琴偏移和缩放
+        float deltaTime = 1f / 60f;  // 假设60fps
+        _currentVgmVisualizer.UpdatePianoOffset(minActiveNote, maxActiveNote, baseDisplayOctaves, deltaTime, totalOctaves, defaultOffsetOctave);
+        float noteOffset = _currentVgmVisualizer.PianoOffset * 12;  // 转换为半音偏移
+        
+        // 获取当前显示的八度数（动态缩放）
+        float displayOctaves = _currentVgmVisualizer.PianoDisplayOctaves;
+        if (displayOctaves == 0) displayOctaves = baseDisplayOctaves;
+        int totalKeys = (int)(displayOctaves * 12);
         float keyWidth = pianoWidth / totalKeys;
         
         // 钢琴 X 坐标
@@ -4658,20 +4701,59 @@ public class Generator
             
             // 芯片名称标题
             if (rowY + chipTitleHeight > region.Bottom - padding) break;
+            // 测量芯片名宽度，用于避免八度标签重叠
+            float chipNameWidth = MeasureTextWidth(chip.Info.Name, _fontSize16 * 0.7f);
+            float chipNameRight = areaLeft + chipNameWidth + 10 * s; // 芯片名右边界（加边距）
+            
             DrawText(areaLeft, rowY + chipTitleHeight / 2, _fontSize16 * 0.7f,
                      chip.Info.Name, _chipNameColor, VerticalAlign.Center);
             
-            // 在第一个芯片名所在行绘制八度标记（对齐到每个八度的C音符位置）
-            // 从o1开始
+            // 在第一个芯片名所在行绘制八度标记（对齐到每个八度的C音符位置，跟随钢琴滑动）
             if (!octaveLabelsDrawn)
             {
-                for (int oct = 1; oct < totalOctaves; oct++)
+                int offsetNotes = (int)noteOffset;
+                float fractionalOffset = noteOffset - offsetNotes;
+                float pixelOffset = fractionalOffset * keyWidth;
+                
+                // 使用裁剪区域，确保八度标签只在钢琴区域内显示
+                _frameCanvas.Save();
+                _frameCanvas.ClipRect(new SKRect(pianoX, rowY, pianoX + pianoWidth, rowY + chipTitleHeight));
+                
+                for (int oct = 0; oct <= totalOctaves; oct++)
                 {
-                    // 八度标记对齐到该八度的起始位置（C音符）
-                    float octX = pianoX + oct * 12 * keyWidth;
-                    DrawText(octX, rowY + chipTitleHeight / 2, _fontSize16 * 0.5f,
-                             $"o{oct}", _octaveLabelColor, VerticalAlign.Center, HorizontalAlign.Left);
+                    int octNote = oct * 12;
+                    int displayIndex = octNote - offsetNotes;
+                    
+                    // 只绘制在显示范围内的八度标签
+                    if (displayIndex >= -12 && displayIndex < totalKeys + 12)
+                    {
+                        float octX = pianoX + displayIndex * keyWidth - pixelOffset;
+                        // 标签在钢琴区域内才绘制，并且不能与芯片名重叠
+                        if (octX >= pianoX && octX <= pianoX + pianoWidth - 15 * s)
+                        {
+                            // 计算标签的透明度：接近芯片名时淡出
+                            float fadeStart = chipNameRight + 20 * s;  // 开始淡出的位置
+                            float fadeEnd = chipNameRight;             // 完全透明的位置
+                            byte alpha = 255;
+                            if (octX < fadeStart)
+                            {
+                                if (octX < fadeEnd)
+                                    alpha = 0; // 完全透明
+                                else
+                                    alpha = (byte)(255 * (octX - fadeEnd) / (fadeStart - fadeEnd));
+                            }
+                            
+                            if (alpha > 0)
+                            {
+                                var labelColor = new SKColor(_octaveLabelColor.Red, _octaveLabelColor.Green, _octaveLabelColor.Blue, alpha);
+                                DrawText(octX + 2 * s, rowY + chipTitleHeight / 2, _fontSize16 * 0.5f,
+                                         $"o{oct}", labelColor, VerticalAlign.Center, HorizontalAlign.Left);
+                            }
+                        }
+                    }
                 }
+                
+                _frameCanvas.Restore();
                 octaveLabelsDrawn = true;
             }
             rowY += chipTitleHeight;
@@ -4689,9 +4771,9 @@ public class Generator
                          channel.Label ?? "CH", isOn ? _channelLabelOnColor : _channelLabelOffColor, VerticalAlign.Center);
                 colX = pianoX;
                 
-                // 钢琴方块键盘
+                // 钢琴方块键盘（使用自适应偏移和缩放，传递float类型八度数）
                 DrawPianoBlocks(colX, rowY + 1 * s, pianoWidth, rowHeight - 2 * s, 
-                               channel.Note, isOn, totalOctaves);
+                               channel.Note, isOn, displayOctaves, noteOffset);
                 colX += pianoWidth + gapWidth;
                 
                 // 音符名称
@@ -4716,18 +4798,20 @@ public class Generator
                          
                 colX += infoWidth + gapWidth;
                 
-                // L/R音量条（双柱显示，C352等四声道芯片显示4条）
+                // L/R音量条（双柱显示，C352等四声道芯片显示4条，带打击闪光）
                 float barH = rowHeight - 4 * s;
                 if (channel.HasQuadChannel)
                 {
                     DrawQuadVolumeBar(colX, rowY + 2 * s, volumeBarWidth, barH,
                                      channel.DisplayRearLeft, channel.DisplayRearRight,
-                                     channel.DisplayPanLeft, channel.DisplayPanRight);
+                                     channel.DisplayPanLeft, channel.DisplayPanRight,
+                                     channel.AttackFlash);
                 }
                 else
                 {
                     DrawStereoVolumeBar(colX, rowY + 2 * s, volumeBarWidth, barH,
-                                       channel.DisplayPanLeft, channel.DisplayPanRight);
+                                       channel.DisplayPanLeft, channel.DisplayPanRight,
+                                       channel.AttackFlash);
                 }
                 
                 rowY += rowHeight;
@@ -4985,28 +5069,45 @@ public class Generator
     private static readonly SKColor _volumeInfoColor = new(255, 255, 255);  // V: 音量数值颜色（纯白）
     private static readonly SKColor _pitchDeltaColor = new(255, 255, 255);  // D: Detune 数值颜色（纯白）
     
-    // 绘制方块式钢琴键盘
-    private void DrawPianoBlocks(float x, float y, float width, float height, int note, bool isOn, int octaves)
+    // 绘制方块式钢琴键盘（带偏移支持）
+    // noteOffset: 音符偏移量（半音数），用于滑动显示
+    // displayOctaves: 显示的八度数（支持小数以实现平滑缩放）
+    private void DrawPianoBlocks(float x, float y, float width, float height, int note, bool isOn, float displayOctaves, float noteOffset = 0)
     {
         float s = ResolutionScale;
-        int totalKeys = octaves * 12;
-        float keyWidth = width / totalKeys;
+        // 使用float计算总键数，确保与八度标签同步缩放
+        float totalKeysFloat = displayOctaves * 12;
+        int totalKeys = (int)Math.Ceiling(totalKeysFloat);
+        float keyWidth = width / totalKeysFloat;
         float keyGap = 1 * s;
         float keyDrawWidth = keyWidth - keyGap;
+        
+        // 计算偏移后的显示范围
+        int offsetNotes = (int)noteOffset;
+        float fractionalOffset = noteOffset - offsetNotes;
+        float pixelOffset = fractionalOffset * keyWidth;
         
         // 使用两个 SKPath 分别收集白键和黑键
         using var whiteKeyPath = new SKPath();
         using var blackKeyPath = new SKPath();
         
+        // 绘制的实际键范围（从 offsetNotes 开始）
         for (int i = 0; i < totalKeys; i++)
         {
-            // 跳过活跃键（稍后单独绘制）
-            if (isOn && note == i) continue;
+            int actualNote = i + offsetNotes;
+            if (actualNote < 0 || actualNote >= 132) continue;  // 超出范围跳过 (11个八度)
             
-            int semitone = i % 12;
+            // 跳过活跃键（稍后单独绘制）
+            if (isOn && note == actualNote) continue;
+            
+            int semitone = actualNote % 12;
             bool isBlackKey = semitone == 1 || semitone == 3 || semitone == 6 || semitone == 8 || semitone == 10;
-            float keyX = x + i * keyWidth;
-            var keyRect = new SKRect(keyX, y, keyX + keyDrawWidth, y + height);
+            float keyX = x + i * keyWidth - pixelOffset;
+            
+            // 裁剪到可见区域
+            if (keyX + keyDrawWidth < x || keyX > x + width) continue;
+            
+            var keyRect = new SKRect(Math.Max(x, keyX), y, Math.Min(x + width, keyX + keyDrawWidth), y + height);
             
             if (isBlackKey)
                 blackKeyPath.AddRect(keyRect);
@@ -5022,42 +5123,62 @@ public class Generator
         _fillPaint.Color = _pianoBlackKeyColor;
         _frameCanvas.DrawPath(blackKeyPath, _fillPaint);
         
-        // 绘制活跃键
-        if (isOn && note >= 0 && note < totalKeys)
+        // 绘制活跃键（考虑偏移）
+        if (isOn && note >= 0)
         {
-            float keyX = x + note * keyWidth;
-            int semitone = note % 12;
-            bool isBlackKey = semitone == 1 || semitone == 3 || semitone == 6 || semitone == 8 || semitone == 10;
-            
-            if (isBlackKey)
+            int displayIndex = note - offsetNotes;
+            if (displayIndex >= 0 && displayIndex < totalKeys)
             {
-                // 黑键触发：上80%白色 + 下20%黑灰色
-                float whiteHeight = height * 0.8f;
-                float blackHeight = height * 0.2f;
+                float keyX = x + displayIndex * keyWidth - pixelOffset;
                 
-                var whiteRect = new SKRect(keyX, y, keyX + keyDrawWidth, y + whiteHeight);
-                _fillPaint.Color = _pianoKeyOnColor;
-                _frameCanvas.DrawRect(whiteRect, _fillPaint);
-                
-                var blackRect = new SKRect(keyX, y + whiteHeight, keyX + keyDrawWidth, y + height);
-                _fillPaint.Color = _pianoBlackKeyColor;
-                _frameCanvas.DrawRect(blackRect, _fillPaint);
-            }
-            else
-            {
-                // 白键触发：整块白色
-                var keyRect = new SKRect(keyX, y, keyX + keyDrawWidth, y + height);
-                _fillPaint.Color = _pianoKeyOnColor;
-                _frameCanvas.DrawRect(keyRect, _fillPaint);
+                // 检查是否在可见区域
+                if (keyX + keyDrawWidth >= x && keyX <= x + width)
+                {
+                    int semitone = note % 12;
+                    bool isBlackKey = semitone == 1 || semitone == 3 || semitone == 6 || semitone == 8 || semitone == 10;
+                    
+                    // 裁剪到可见区域
+                    float clippedX = Math.Max(x, keyX);
+                    float clippedWidth = Math.Min(x + width, keyX + keyDrawWidth) - clippedX;
+                    
+                    if (clippedWidth > 0)
+                    {
+                        if (isBlackKey)
+                        {
+                            // 黑键触发：上80%白色 + 下20%黑灰色
+                            float whiteHeight = height * 0.8f;
+                            
+                            var whiteRect = new SKRect(clippedX, y, clippedX + clippedWidth, y + whiteHeight);
+                            _fillPaint.Color = _pianoKeyOnColor;
+                            _frameCanvas.DrawRect(whiteRect, _fillPaint);
+                            
+                            var blackRect = new SKRect(clippedX, y + whiteHeight, clippedX + clippedWidth, y + height);
+                            _fillPaint.Color = _pianoBlackKeyColor;
+                            _frameCanvas.DrawRect(blackRect, _fillPaint);
+                        }
+                        else
+                        {
+                            // 白键触发：整块白色
+                            var keyRect = new SKRect(clippedX, y, clippedX + clippedWidth, y + height);
+                            _fillPaint.Color = _pianoKeyOnColor;
+                            _frameCanvas.DrawRect(keyRect, _fillPaint);
+                        }
+                    }
+                }
             }
         }
     }
     
-    // 绘制立体声音量条（L/R双柱横向显示）
-    private void DrawStereoVolumeBar(float x, float y, float width, float height, float leftLevel, float rightLevel)
+    // 绘制立体声音量条（L/R双柱横向显示，支持打击闪光）
+    private void DrawStereoVolumeBar(float x, float y, float width, float height, float leftLevel, float rightLevel, float attackFlash = 0)
     {
         float s = ResolutionScale;
         float barHeight = (height - 2 * s) / 2;
+        
+        // 计算闪光增强的颜色
+        byte baseGray = 180;
+        byte flashGray = (byte)(baseGray + (255 - baseGray) * attackFlash);
+        var barColor = new SKColor(flashGray, flashGray, flashGray);
         
         // L 声道（上）
         var lBgRect = new SKRect(x, y, x + width, y + barHeight);
@@ -5068,7 +5189,7 @@ public class Generator
         if (lWidth > 0)
         {
             var lBarRect = new SKRect(x, y, x + lWidth, y + barHeight);
-            _fillPaint.Color = _volumeBarFgColor;
+            _fillPaint.Color = barColor;
             _frameCanvas.DrawRect(lBarRect, _fillPaint);
         }
         
@@ -5082,20 +5203,25 @@ public class Generator
         if (rWidth > 0)
         {
             var rBarRect = new SKRect(x, rY, x + rWidth, rY + barHeight);
-            _fillPaint.Color = _volumeBarFgColor;
+            _fillPaint.Color = barColor;
             _frameCanvas.DrawRect(rBarRect, _fillPaint);
         }
     }
     
-    // 绘制四声道音量条（C352 ）
+    // 绘制四声道音量条（C352，支持打击闪光）
     private void DrawQuadVolumeBar(float x, float y, float width, float height,
-                                   float rearLeft, float rearRight, float frontLeft, float frontRight)
+                                   float rearLeft, float rearRight, float frontLeft, float frontRight, float attackFlash = 0)
     {
         float s = ResolutionScale;
         // 4条音量条 + 3个间隙
         float gap = 1 * s;
         float barHeight = (height - 3 * gap) / 4;
         float halfWidth = (width - 2 * s) / 2;  // 每组"="的宽度
+        
+        // 计算闪光增强的颜色
+        byte baseGray = 180;
+        byte flashGray = (byte)(baseGray + (255 - baseGray) * attackFlash);
+        var barColor = new SKColor(flashGray, flashGray, flashGray);
         
         // 第一组 "=" : 后声道 (左半边)
         // 后左（上）
@@ -5107,7 +5233,7 @@ public class Generator
         if (rlWidth > 0)
         {
             var rlBarRect = new SKRect(x, rlY, x + rlWidth, rlY + barHeight);
-            _fillPaint.Color = _volumeBarFgColor;
+            _fillPaint.Color = barColor;
             _frameCanvas.DrawRect(rlBarRect, _fillPaint);
         }
         
@@ -5120,7 +5246,7 @@ public class Generator
         if (rrWidth > 0)
         {
             var rrBarRect = new SKRect(x, rrY, x + rrWidth, rrY + barHeight);
-            _fillPaint.Color = _volumeBarFgColor;
+            _fillPaint.Color = barColor;
             _frameCanvas.DrawRect(rrBarRect, _fillPaint);
         }
         
@@ -5136,7 +5262,7 @@ public class Generator
         if (flWidth > 0)
         {
             var flBarRect = new SKRect(frontX, flY, frontX + flWidth, flY + barHeight);
-            _fillPaint.Color = _volumeBarFgColor;
+            _fillPaint.Color = barColor;
             _frameCanvas.DrawRect(flBarRect, _fillPaint);
         }
         
@@ -5149,7 +5275,7 @@ public class Generator
         if (frWidth > 0)
         {
             var frBarRect = new SKRect(frontX, frY, frontX + frWidth, frY + barHeight);
-            _fillPaint.Color = _volumeBarFgColor;
+            _fillPaint.Color = barColor;
             _frameCanvas.DrawRect(frBarRect, _fillPaint);
         }
     }

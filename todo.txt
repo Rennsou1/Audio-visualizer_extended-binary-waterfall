@@ -29,7 +29,7 @@ http://dmpsoft.s17.xrea.com/hoot/index.html
 
 
 BUG:
-1."RF5C" 无法正常渲染音频 （已修复）：需要对libvgm进行修改
+1."RF5C" 无法正常渲染音频：已修复，但需要对libvgm源码进行修改后编译（https://github.com/Rennsou1/libvgm）
     在 libvgm-src/player/vgmplayer_cmdhandler.cpp中存在边界检查条件 bug
 
     原来：
@@ -44,8 +44,14 @@ BUG:
     由于条件完全反了，所有 PCM RAM Write 命令都被忽略，导致 RF5C164 芯片的 RAM 中没有任何采样数据，音频无法播放
     这个 bug 影响所有使用 0x68 命令（PCM RAM Write）的 VGM 文件
 
-
-
-2.MIDI 在音符过多的情况下会闪烁
-3.VGM音量条抖动
-4.D值不正确
+2. MIDI 在音符过多的情况下会闪烁：未修复
+3. VGM音量条抖动：未修复
+4. D值不正确：部分修复
+5. 大部分芯片VGM VIEW不正常（无数值，错误显示）：修复中
+    以下是问题菜单：
+    GBA
+    K051649
+    K053260
+    K055556
+    K05556
+    GA20

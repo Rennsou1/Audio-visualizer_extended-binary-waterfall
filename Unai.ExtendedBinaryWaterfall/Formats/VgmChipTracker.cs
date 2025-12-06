@@ -27,14 +27,18 @@ public class YM2612Tracker : VgmChipTracker
     private int _dacData;                         // DAC 数据 (0x2A)
     private bool _dacActive;                      // DAC 是否有数据输出
     private bool _dacStreamActive;                // DAC 流是否活动 (从0x93/0x95命令)
-    private uint _dacSampleRate;                  // DAC 采样率 (从 VGM DAC Stream 命令获取)
+    private uint _dacSampleRate;                  // DAC 采样率 (从 VGM DAC Stream 命令 0x92 获取)
+    private uint _dacBlockId;                     // DAC 块ID/数据偏移 (从 0x93/0x95 命令获取，用于音高映射)
     
-    // DAC 采样率估算 (从0x2A写入间隔计算)
-    private uint _lastDacTick;                    // 上一次0x2A写入的tick
-    private uint _dacEstimatedRate;               // 估算的采样率
-    private readonly uint[] _dacIntervals = new uint[8];  // 最近8次间隔的滑动窗口
-    private int _dacIntervalIndex;                // 滑动窗口索引
-    private int _dacIntervalCount;                // 有效间隔计数
+    // CH3 Extended/Special 模式 (0x27 bit6-7)
+    private bool _ch3ExtendedMode;                // CH3 是否处于 Extended 模式
+    private readonly int[] _ch3OpFnum = new int[4];   // CH3 各算子独立频率 (OP1-OP4)
+    private readonly int[] _ch3OpBlock = new int[4];  // CH3 各算子独立 Block
+    private readonly bool[] _ch3OpKeyOn = new bool[4]; // CH3 各算子独立 Key On
+    
+    // Extended 模式下的通道数: 6 + 3 (FM3的OP2/OP3/OP4可各自播放不同音符)
+    public const int EXTENDED_CHANNEL_COUNT = 9;
+    public bool Ch3ExtendedMode => _ch3ExtendedMode;
     
     // 算法对应的载波算子掩码 (S1=bit0, S2=bit1, S3=bit2, S4=bit3)
     // 算法 0-3: 只有 S4 是载波
@@ -107,32 +111,6 @@ public class YM2612Tracker : VgmChipTracker
             if (_dacEnable)
             {
                 _dacActive = true;
-                
-                // 估算采样率：计算0x2A写入间隔 (VGM基于44100Hz)
-                uint tick = evt.Tick;
-                if (_lastDacTick > 0 && tick > _lastDacTick)
-                {
-                    uint interval = tick - _lastDacTick;
-                    // 过滤异常间隔 (1-100 ticks对应约441Hz-44100Hz)
-                    if (interval >= 1 && interval <= 100)
-                    {
-                        // 滑动窗口存储最近8次间隔
-                        _dacIntervals[_dacIntervalIndex] = interval;
-                        _dacIntervalIndex = (_dacIntervalIndex + 1) % 8;
-                        if (_dacIntervalCount < 8) _dacIntervalCount++;
-                        
-                        // 计算平均间隔
-                        uint sum = 0;
-                        for (int i = 0; i < _dacIntervalCount; i++)
-                            sum += _dacIntervals[i];
-                        uint avgInterval = sum / (uint)_dacIntervalCount;
-                        
-                        // 转换为采样率
-                        if (avgInterval > 0)
-                            _dacEstimatedRate = 44100 / avgInterval;
-                    }
-                }
-                _lastDacTick = tick;
             }
         }
         // DAC 使能 (0x2B)
@@ -141,6 +119,38 @@ public class YM2612Tracker : VgmChipTracker
             _dacEnable = (val & 0x80) != 0;
             // DAC 关闭时，清除活动状态
             if (!_dacEnable) _dacActive = false;
+        }
+        // CH3 模式控制 (0x27 bit6-7): 0=Normal, 1=Special/Extended
+        else if (reg == 0x27)
+        {
+            _ch3ExtendedMode = ((val >> 6) & 0x03) == 1;
+        }
+        // CH3 Extended模式下的算子频率 (仅port 0有效)
+        // OP1: 0xA2/0xA6, OP2: 0xA8/0xAC, OP3: 0xA9/0xAD, OP4: 0xAA/0xAE
+        else if (port == 0 && reg >= 0xA8 && reg <= 0xAE)
+        {
+            // 只在port 0处理CH3 Extended频率
+            if (reg == 0xA8)      // OP2 频率 LSB
+                _ch3OpFnum[1] = (_ch3OpFnum[1] & 0x700) | val;
+            else if (reg == 0xAC) // OP2 频率 MSB + Block
+            {
+                _ch3OpFnum[1] = (_ch3OpFnum[1] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[1] = (val >> 3) & 0x07;
+            }
+            else if (reg == 0xA9) // OP3 频率 LSB
+                _ch3OpFnum[2] = (_ch3OpFnum[2] & 0x700) | val;
+            else if (reg == 0xAD) // OP3 频率 MSB + Block
+            {
+                _ch3OpFnum[2] = (_ch3OpFnum[2] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[2] = (val >> 3) & 0x07;
+            }
+            else if (reg == 0xAA) // OP4 频率 LSB
+                _ch3OpFnum[3] = (_ch3OpFnum[3] & 0x700) | val;
+            else if (reg == 0xAE) // OP4 频率 MSB + Block
+            {
+                _ch3OpFnum[3] = (_ch3OpFnum[3] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[3] = (val >> 3) & 0x07;
+            }
         }
         // L/R 输出选择 (0xB4-0xB6)
         else if (reg >= 0xB4 && reg <= 0xB6)
@@ -155,10 +165,13 @@ public class YM2612Tracker : VgmChipTracker
             _dacSampleRate = (uint)((evt.Port << 16) | (val << 8) | evt.Value2);
         }
         // 特殊: DAC 流开始 (从 VGM DAC Stream 命令 0x93/0x95 获取)
+        // Value = streamId, Value2 = flags/lengthMode, Port = blockId低8位
         else if (reg == 0xFE)
         {
             _dacStreamActive = true;
             _dacEnable = true;  // DAC流命令隐含启用DAC
+            // 保存块ID或数据偏移用于音高映射
+            _dacBlockId = evt.Port;  // 从0x95命令传递
         }
         // 特殊: DAC 流停止 (从 VGM DAC Stream 命令 0x94 获取)
         else if (reg == 0xFD)
@@ -180,72 +193,135 @@ public class YM2612Tracker : VgmChipTracker
         _dacActive = false;
         _dacStreamActive = false;
         _dacSampleRate = 0;
-        // 重置采样率估算
-        _lastDacTick = 0;
-        _dacEstimatedRate = 0;
-        Array.Clear(_dacIntervals);
-        _dacIntervalIndex = 0;
-        _dacIntervalCount = 0;
+        _dacBlockId = 0;
+        // Extended模式相关
+        _ch3ExtendedMode = false;
+        Array.Clear(_ch3OpFnum);
+        Array.Clear(_ch3OpBlock);
+        Array.Clear(_ch3OpKeyOn);
     }
+    
+    // 新显示布局: FM1-3, OP2-4(Extended), FM4-5, DAC
+    // 显示索引 → 内部FM索引映射: 0→0, 1→1, 2→2, 3→OP2, 4→OP3, 5→OP4, 6→3, 7→4, 8→5(DAC)
+    private static readonly int[] DisplayToFmIndex = { 0, 1, 2, -1, -1, -1, 3, 4, 5 };
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        // FM 通道 1-5 (索引 0-4)
-        for (int ch = 0; ch < 5; ch++)
+        // FM 通道 1-3 (显示索引 0-2)
+        for (int i = 0; i < 3; i++)
         {
-            if (ch >= state.Channels.Length) break;
-            UpdateFmChannel(state, ch);
+            if (i >= state.Channels.Length) break;
+            if (i == 2 && _ch3ExtendedMode)
+            {
+                // Extended模式: FM3使用OP1频率
+                UpdateFmChannelWithExtended(state, 2, _fnum[2], _block[2]);
+            }
+            else
+            {
+                UpdateFmChannelToDisplay(state, i, i);
+            }
         }
         
-        // 通道 6 (索引 5): DAC 启用时显示 PCM，否则显示 FM
-        if (state.Channels.Length > 5)
+        // Extended模式下的FM3 OP2/OP3/OP4 (显示索引 3-5)
+        if (_ch3ExtendedMode && state.Channels.Length > 5)
+        {
+            UpdateCh3ExtendedOp(state, 3, 1);  // OP2 → 显示索引3
+            UpdateCh3ExtendedOp(state, 4, 2);  // OP3 → 显示索引4
+            UpdateCh3ExtendedOp(state, 5, 3);  // OP4 → 显示索引5
+        }
+        else if (state.Channels.Length > 5)
+        {
+            // 非Extended模式：OP2-4通道静默
+            for (int i = 3; i <= 5; i++)
+            {
+                state.Channels[i].KeyOn = false;
+                state.Channels[i].Volume = 0;
+                state.Channels[i].Note = -1;
+            }
+        }
+        
+        // FM 通道 4-5 (显示索引 6-7, 内部FM索引 3-4)
+        if (state.Channels.Length > 6)
+            UpdateFmChannelToDisplay(state, 6, 3);  // FM4
+        if (state.Channels.Length > 7)
+            UpdateFmChannelToDisplay(state, 7, 4);  // FM5
+        
+        // DAC/FM6 通道 (显示索引 8, 内部FM索引 5)
+        if (state.Channels.Length > 8)
         {
             if (_dacEnable)
             {
-                // DAC/PCM 模式: 通道 6 被 DAC 占用
-                // DAC活动状态：直接写入0x2A或DAC流命令
+                // DAC/PCM 模式
                 bool dacPlaying = _dacActive || _dacStreamActive;
-                state.Channels[5].KeyOn = dacPlaying;
-                state.Channels[5].Volume = dacPlaying ? 127 : 0;
-                state.Channels[5].PanLeft = dacPlaying ? 127 : 0;
-                state.Channels[5].PanRight = dacPlaying ? 127 : 0;
+                state.Channels[8].KeyOn = dacPlaying;
+                state.Channels[8].Volume = dacPlaying ? 127 : 0;
+                state.Channels[8].PanLeft = dacPlaying ? 127 : 0;
+                state.Channels[8].PanRight = dacPlaying ? 127 : 0;
                 
                 if (dacPlaying)
                 {
-                    // Detune始终显示当前DAC数据值
-                    state.Channels[5].Detune = _dacData;
-                    
-                    // 优先使用DAC流命令的采样率，其次使用估算采样率
-                    uint effectiveRate = _dacSampleRate > 0 ? _dacSampleRate : _dacEstimatedRate;
-                    
-                    if (effectiveRate > 0)
+                    if (_dacSampleRate > 0)
                     {
-                        // 采样率比例转音高: ratio = sampleRate / 22050
-                        // 每翻倍采样率，音高上升 12 个半音 (以22050Hz为基准 = C4)
-                        double ratio = effectiveRate / 22050.0;
-                        state.Channels[5].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);  // C4 = 60
+                        double ratio = _dacSampleRate / 8000.0;
+                        int note = (int)(Math.Log2(ratio) * 12 + 48);
+                        note = Math.Clamp(note, 24, 96);
+                        state.Channels[8].Note = note;
+                        state.Channels[8].Detune = 0;
                     }
                     else
                     {
-                        // 没有采样率信息时，使用固定音符 C4
-                        state.Channels[5].Note = 60;  // C4
+                        int note = 48 + (int)(_dacBlockId % 16);
+                        state.Channels[8].Note = note;
+                        state.Channels[8].Detune = 0;
                     }
                 }
                 else
                 {
-                    state.Channels[5].Note = -1;
-                    state.Channels[5].Detune = 0;
+                    state.Channels[8].Note = -1;
+                    state.Channels[8].Detune = 0;
                 }
             }
             else
             {
-                // FM 模式
-                UpdateFmChannel(state, 5);
+                // FM6 模式
+                UpdateFmChannelToDisplay(state, 8, 5);
             }
         }
         
-        // DAC 活动状态在下一帧重置（需要持续写入才保持活动）
+        // DAC 活动状态在下一帧重置
         _dacActive = false;
+    }
+    
+    // 更新FM通道到指定的显示索引 (displayIdx=显示位置, fmIdx=内部FM通道号)
+    private void UpdateFmChannelToDisplay(VgmVisualizer.ChipState state, int displayIdx, int fmIdx)
+    {
+        state.Channels[displayIdx].KeyOn = _keyOn[fmIdx];
+        
+        int mask = CarrierMask[_algo[fmIdx]];
+        int minTl = 127;
+        for (int op = 0; op < 4; op++)
+        {
+            if ((mask & (1 << op)) != 0)
+                minTl = Math.Min(minTl, _tl[fmIdx, op]);
+        }
+        int vol = Math.Max(0, 127 - minTl);
+        state.Channels[displayIdx].Volume = vol;
+        
+        int lr = _lr[fmIdx];
+        state.Channels[displayIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+        state.Channels[displayIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+        
+        if (_keyOn[fmIdx] && _fnum[fmIdx] > 0)
+        {
+            var (note, cent) = FnumToNoteAndCent(_fnum[fmIdx], _block[fmIdx]);
+            state.Channels[displayIdx].Note = note;
+            state.Channels[displayIdx].Detune = cent;
+        }
+        else
+        {
+            state.Channels[displayIdx].Note = -1;
+            state.Channels[displayIdx].Detune = 0;
+        }
     }
     
     // 更新单个 FM 通道状态
@@ -280,6 +356,70 @@ public class YM2612Tracker : VgmChipTracker
         {
             state.Channels[ch].Note = -1;
             state.Channels[ch].Detune = 0;
+        }
+    }
+    
+    // Extended模式下更新FM3通道 (使用指定的频率)
+    private void UpdateFmChannelWithExtended(VgmVisualizer.ChipState state, int stateIdx, int fnum, int block)
+    {
+        // KeyOn取决于OP1的状态 (通道整体KeyOn)
+        state.Channels[stateIdx].KeyOn = _keyOn[2];
+        
+        // 根据算法计算载波算子的最小 TL（最大音量）
+        int mask = CarrierMask[_algo[2]];
+        int minTl = 127;
+        for (int op = 0; op < 4; op++)
+        {
+            if ((mask & (1 << op)) != 0)
+                minTl = Math.Min(minTl, _tl[2, op]);
+        }
+        int vol = Math.Max(0, 127 - minTl);
+        state.Channels[stateIdx].Volume = vol;
+        
+        // 设置左右声道
+        int lr = _lr[2];
+        state.Channels[stateIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+        state.Channels[stateIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+        
+        if (_keyOn[2] && fnum > 0)
+        {
+            var (note, cent) = FnumToNoteAndCent(fnum, block);
+            state.Channels[stateIdx].Note = note;
+            state.Channels[stateIdx].Detune = cent;
+        }
+        else
+        {
+            state.Channels[stateIdx].Note = -1;
+            state.Channels[stateIdx].Detune = 0;
+        }
+    }
+    
+    // 更新CH3 Extended模式下的单个算子通道 (OP2/OP3/OP4)
+    private void UpdateCh3ExtendedOp(VgmVisualizer.ChipState state, int stateIdx, int opIdx)
+    {
+        // KeyOn取决于通道整体KeyOn
+        bool keyOn = _keyOn[2];
+        state.Channels[stateIdx].KeyOn = keyOn;
+        
+        // 算子音量使用该算子的TL
+        int vol = Math.Max(0, 127 - _tl[2, opIdx]);
+        state.Channels[stateIdx].Volume = vol;
+        
+        // 继承FM3的声道设置
+        int lr = _lr[2];
+        state.Channels[stateIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+        state.Channels[stateIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+        
+        if (keyOn && _ch3OpFnum[opIdx] > 0)
+        {
+            var (note, cent) = FnumToNoteAndCent(_ch3OpFnum[opIdx], _ch3OpBlock[opIdx]);
+            state.Channels[stateIdx].Note = note;
+            state.Channels[stateIdx].Detune = cent;
+        }
+        else
+        {
+            state.Channels[stateIdx].Note = -1;
+            state.Channels[stateIdx].Detune = 0;
         }
     }
     
@@ -688,7 +828,7 @@ public class YM2413Tracker : VgmChipTracker
     }
 }
 
-// YM2203 (OPN) 状态追踪器 - 3 FM + 3 SSG
+// YM2203 (OPN) 状态追踪器 - 3 FM + 3 SSG (支持CH3 Extended模式)
 public class YM2203Tracker : VgmChipTracker
 {
     private readonly int[] _fmFnum = new int[3];
@@ -699,6 +839,11 @@ public class YM2203Tracker : VgmChipTracker
     private readonly int[] _ssgPeriod = new int[3];
     private readonly int[] _ssgVolume = new int[3];
     private readonly bool[] _ssgEnable = new bool[3];
+    
+    // CH3 Extended模式
+    private bool _ch3ExtendedMode;
+    private readonly int[] _ch3OpFnum = new int[4];   // OP1-OP4独立频率
+    private readonly int[] _ch3OpBlock = new int[4];
     
     // OPN 系列与 YM2612 使用相同的 8 种算法
     private static readonly int[] CarrierMask = { 0x08, 0x08, 0x08, 0x08, 0x0A, 0x0E, 0x0E, 0x0F };
@@ -761,6 +906,36 @@ public class YM2203Tracker : VgmChipTracker
                 _fmTl[ch, slot] = val & 0x7F;
             }
         }
+        // CH3 模式控制 (0x27 bit6-7): 0=Normal, 1=Special/Extended
+        else if (reg == 0x27)
+        {
+            _ch3ExtendedMode = ((val >> 6) & 0x03) == 1;
+        }
+        // CH3 Extended模式下的算子频率: OP2=0xA8/0xAC, OP3=0xA9/0xAD, OP4=0xAA/0xAE
+        else if (reg >= 0xA8 && reg <= 0xAE)
+        {
+            if (reg == 0xA8)
+                _ch3OpFnum[1] = (_ch3OpFnum[1] & 0x700) | val;
+            else if (reg == 0xAC)
+            {
+                _ch3OpFnum[1] = (_ch3OpFnum[1] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[1] = (val >> 3) & 0x07;
+            }
+            else if (reg == 0xA9)
+                _ch3OpFnum[2] = (_ch3OpFnum[2] & 0x700) | val;
+            else if (reg == 0xAD)
+            {
+                _ch3OpFnum[2] = (_ch3OpFnum[2] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[2] = (val >> 3) & 0x07;
+            }
+            else if (reg == 0xAA)
+                _ch3OpFnum[3] = (_ch3OpFnum[3] & 0x700) | val;
+            else if (reg == 0xAE)
+            {
+                _ch3OpFnum[3] = (_ch3OpFnum[3] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[3] = (val >> 3) & 0x07;
+            }
+        }
     }
     
     public override void Reset()
@@ -773,70 +948,114 @@ public class YM2203Tracker : VgmChipTracker
         Array.Clear(_ssgPeriod);
         Array.Clear(_ssgVolume);
         Array.Clear(_ssgEnable);
+        _ch3ExtendedMode = false;
+        Array.Clear(_ch3OpFnum);
+        Array.Clear(_ch3OpBlock);
     }
     
+    // 新显示布局: FM1-3(0-2), OP2-4(3-5), SSG1-3(6-8)
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        // FM 通道 (0-2)
+        // FM 通道 1-3 (显示索引 0-2)
         for (int ch = 0; ch < 3 && ch < state.Channels.Length; ch++)
         {
-            state.Channels[ch].KeyOn = _fmKeyOn[ch];
-            
-            // 根据算法计算载波算子的最小 TL
-            int mask = CarrierMask[_fmAlgo[ch]];
-            int minTl = 127;
-            for (int op = 0; op < 4; op++)
+            UpdateFmChannel(state, ch, ch);
+        }
+        
+        // Extended模式下的FM3 OP2/OP3/OP4 (显示索引 3-5)
+        if (_ch3ExtendedMode && state.Channels.Length > 5)
+        {
+            for (int op = 1; op <= 3; op++)
             {
-                if ((mask & (1 << op)) != 0)
-                    minTl = Math.Min(minTl, _fmTl[ch, op]);
+                int displayIdx = 2 + op;  // 3, 4, 5
+                bool keyOn = _fmKeyOn[2];
+                int vol = Math.Max(0, 127 - _fmTl[2, op]);
+                state.Channels[displayIdx].KeyOn = keyOn;
+                state.Channels[displayIdx].Volume = vol;
+                state.Channels[displayIdx].PanLeft = vol;
+                state.Channels[displayIdx].PanRight = vol;
+                
+                if (keyOn && _ch3OpFnum[op] > 0)
+                {
+                    double clock = Clock > 0 ? Clock : 4000000.0;
+                    double freq = _ch3OpFnum[op] * clock / (72.0 * Math.Pow(2, 21 - _ch3OpBlock[op]));
+                    var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                    state.Channels[displayIdx].Note = note;
+                    state.Channels[displayIdx].Detune = cent;
+                }
+                else
+                {
+                    state.Channels[displayIdx].Note = -1;
+                    state.Channels[displayIdx].Detune = 0;
+                }
             }
-            int vol = Math.Max(0, 127 - minTl);
-            state.Channels[ch].Volume = vol;
-            // YM2203 FM 是单声道
-            state.Channels[ch].PanLeft = vol;
-            state.Channels[ch].PanRight = vol;
-            
-            if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
+        }
+        else if (state.Channels.Length > 5)
+        {
+            // 非Extended模式：OP通道静默
+            for (int i = 3; i <= 5; i++)
             {
-                // YM2203 (OPN): freq = fnum * clock / (72 * 2^(21-block))
-                double clock = Clock > 0 ? Clock : 4000000.0;
-                double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
-                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
-                state.Channels[ch].Note = note;
-                state.Channels[ch].Detune = cent;
-            }
-            else
-            {
-                state.Channels[ch].Note = -1;
-                state.Channels[ch].Detune = 0;
+                state.Channels[i].KeyOn = false;
+                state.Channels[i].Volume = 0;
+                state.Channels[i].Note = -1;
             }
         }
         
-        // SSG 通道 (3-5)
-        for (int ch = 0; ch < 3 && ch + 3 < state.Channels.Length; ch++)
+        // SSG 通道 (显示索引 6-8)
+        for (int ch = 0; ch < 3 && ch + 6 < state.Channels.Length; ch++)
         {
             bool active = _ssgEnable[ch] && _ssgVolume[ch] > 0 && _ssgPeriod[ch] > 0;
             int vol = _ssgVolume[ch] * 127 / 15;
-            state.Channels[ch + 3].KeyOn = active;
-            state.Channels[ch + 3].Volume = vol;
-            state.Channels[ch + 3].PanLeft = vol;
-            state.Channels[ch + 3].PanRight = vol;
+            state.Channels[ch + 6].KeyOn = active;
+            state.Channels[ch + 6].Volume = vol;
+            state.Channels[ch + 6].PanLeft = vol;
+            state.Channels[ch + 6].PanRight = vol;
             
             if (active)
             {
-                // YM2203 SSG: freq = clock / (16 * period)
-                // SSG 时钟为 FM 时钟的 1/2
                 double clock = Clock > 0 ? Clock / 2.0 : 2000000.0;
                 double freq = clock / (16.0 * _ssgPeriod[ch]);
                 var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
-                state.Channels[ch + 3].Note = note;
-                state.Channels[ch + 3].Detune = cent;
+                state.Channels[ch + 6].Note = note;
+                state.Channels[ch + 6].Detune = cent;
             }
             else
             {
-                state.Channels[ch + 3].Note = -1;
-                state.Channels[ch + 3].Detune = 0;
+                state.Channels[ch + 6].Note = -1;
+                state.Channels[ch + 6].Detune = 0;
             }
+        }
+    }
+    
+    // 更新单个FM通道
+    private void UpdateFmChannel(VgmVisualizer.ChipState state, int displayIdx, int fmIdx)
+    {
+        state.Channels[displayIdx].KeyOn = _fmKeyOn[fmIdx];
+        
+        int mask = CarrierMask[_fmAlgo[fmIdx]];
+        int minTl = 127;
+        for (int op = 0; op < 4; op++)
+        {
+            if ((mask & (1 << op)) != 0)
+                minTl = Math.Min(minTl, _fmTl[fmIdx, op]);
+        }
+        int vol = Math.Max(0, 127 - minTl);
+        state.Channels[displayIdx].Volume = vol;
+        state.Channels[displayIdx].PanLeft = vol;
+        state.Channels[displayIdx].PanRight = vol;
+        
+        if (_fmKeyOn[fmIdx] && _fmFnum[fmIdx] > 0)
+        {
+            double clock = Clock > 0 ? Clock : 4000000.0;
+            double freq = _fmFnum[fmIdx] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[fmIdx]));
+            var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+            state.Channels[displayIdx].Note = note;
+            state.Channels[displayIdx].Detune = cent;
+        }
+        else
+        {
+            state.Channels[displayIdx].Note = -1;
+            state.Channels[displayIdx].Detune = 0;
         }
     }
 }
@@ -2010,41 +2229,78 @@ public class K053260Tracker : VgmChipTracker
 }
 
 // K054539 状态追踪器（Konami PCM）
+// 寄存器映射 (来自libvgm):
+// 0x00-0xFF: 每通道32字节(0x20)，8个通道
+//   00-02: pitch (24位 lsb/mid/msb)
+//   03: volume (0=max, 0x40=-36dB)
+//   04: reverb volume
+//   05: pan (1-f右, 10中, 11-1f左)
+// 0x200-0x20F: 每通道2字节
+// 0x214: Key On (bit0-7 = ch0-7)
+// 0x215: Key Off
+// 0x22c: Channel active
+// VGM 0xD3格式: pp aa dd (pp bit7=芯片选择, 地址 = ((pp & 0x7F) << 8) | aa)
 public class K054539Tracker : VgmChipTracker
 {
     private readonly int[] _volume = new int[8];
     private readonly int[] _pitch = new int[8];  // 24位pitch
-    private readonly int[] _panL = new int[8];
-    private readonly int[] _panR = new int[8];
+    private readonly int[] _pan = new int[8];    // pan值
     private readonly bool[] _keyOn = new bool[8];
+    private readonly bool[] _channelActive = new bool[8]; // 0x22c寄存器
     
     public override void ProcessEvent(VgmEvent evt)
     {
-        int reg = (evt.Port << 8) | evt.Register;
+        // VGM 0xD3: pp aa dd, 地址 = ((pp & 0x7F) << 8) | aa
+        // pp bit7 是芯片选择位，不是地址的一部分
+        int reg = ((evt.Port & 0x7F) << 8) | evt.Register;
         byte val = evt.Value;
         
-        // 通道寄存器 0x00-0xFF (每通道32字节)
+        // 通道寄存器 0x00-0xFF (每通道32字节 = 0x20)
         if (reg < 0x100)
         {
-            int ch = reg >> 5;
-            int type = reg & 0x1F;
+            int ch = reg >> 5;     // 0x20 bytes per channel
+            int offset = reg & 0x1F;
             if (ch < 8)
             {
-                switch (type)
+                switch (offset)
                 {
-                    case 0x00: _pitch[ch] = (_pitch[ch] & 0xFFFF00) | val; break;  // pitch低8位
-                    case 0x01: _pitch[ch] = (_pitch[ch] & 0xFF00FF) | (val << 8); break;  // pitch中8位
-                    case 0x02: _pitch[ch] = (_pitch[ch] & 0x00FFFF) | (val << 16); break;  // pitch高8位
-                    case 0x03: _volume[ch] = val; break;  // 音量
-                    case 0x04: _panL[ch] = val; break;  // 左声道
-                    case 0x05: _panR[ch] = val; break;  // 右声道
+                    case 0x00: _pitch[ch] = (_pitch[ch] & 0xFFFF00) | val; break;        // pitch低8位
+                    case 0x01: _pitch[ch] = (_pitch[ch] & 0xFF00FF) | (val << 8); break; // pitch中8位
+                    case 0x02: _pitch[ch] = (_pitch[ch] & 0x00FFFF) | (val << 16); break;// pitch高8位
+                    case 0x03: _volume[ch] = val; break;  // 音量 (0=max, 0x40=-36dB)
+                    case 0x05: _pan[ch] = val; break;     // pan
                 }
             }
         }
-        else if (reg == 0x214)  // Key On/Off
+        else if (reg == 0x214)  // Key On
         {
             for (int i = 0; i < 8; i++)
-                _keyOn[i] = (val & (1 << i)) != 0;
+            {
+                if ((val & (1 << i)) != 0)
+                {
+                    _keyOn[i] = true;
+                    _channelActive[i] = true;
+                }
+            }
+        }
+        else if (reg == 0x215)  // Key Off
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if ((val & (1 << i)) != 0)
+                {
+                    _keyOn[i] = false;
+                }
+            }
+        }
+        else if (reg == 0x22c)  // Channel Active
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                _channelActive[i] = (val & (1 << i)) != 0;
+                if (!_channelActive[i])
+                    _keyOn[i] = false;
+            }
         }
     }
     
@@ -2052,28 +2308,48 @@ public class K054539Tracker : VgmChipTracker
     {
         Array.Clear(_volume);
         Array.Clear(_pitch);
-        Array.Clear(_panL);
-        Array.Clear(_panR);
+        Array.Clear(_pan);
         Array.Clear(_keyOn);
+        Array.Clear(_channelActive);
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
         for (int ch = 0; ch < 8 && ch < state.Channels.Length; ch++)
         {
-            state.Channels[ch].KeyOn = _keyOn[ch];
-            state.Channels[ch].Volume = _volume[ch] / 2;
-            state.Channels[ch].PanLeft = _panL[ch];
-            state.Channels[ch].PanRight = _panR[ch];
+            bool isActive = _keyOn[ch] || _channelActive[ch];
+            state.Channels[ch].KeyOn = isActive;
             
-            // K054539: 24位pitch，pitch=0x10000 为原始音高
-            if (_keyOn[ch] && _pitch[ch] > 0)
+            // 音量: 0=max (127), 0x40=-36dB (约0), 反转映射
+            int vol = Math.Max(0, 127 - _volume[ch] * 2);
+            state.Channels[ch].Volume = isActive ? vol : 0;
+            
+            // Pan: 1-f右, 10中, 11-1f左
+            // DJ Main风格: 81-87右, 88中, 89-8f左
+            int pan = _pan[ch];
+            int panL, panR;
+            if (pan >= 0x81 && pan <= 0x8f)
+                pan -= 0x81;
+            else if (pan >= 0x11 && pan <= 0x1f)
+                pan -= 0x11;
+            else if (pan < 0x01 || pan > 0x0f)
+                pan = 7;    // 默认中间 (0x01-0x0f范围内直接使用)
+            
+            // pan 0-14: 0=最右, 7=中, 14=最左
+            panR = Math.Max(0, (14 - pan) * 127 / 14);
+            panL = Math.Max(0, pan * 127 / 14);
+            state.Channels[ch].PanLeft = panL;
+            state.Channels[ch].PanRight = panR;
+            
+            // K054539: 24位pitch，0x10000 = 原始音高
+            if (isActive && _pitch[ch] > 0)
             {
+                // pitch值直接对应播放速率倍率
                 double ratio = _pitch[ch] / 65536.0;
-                double freq = 440.0 * ratio;
-                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                // 假设原始采样是C4 (60)
+                int note = VgmVisualizer.PcmRatioToNote(ratio, 60);
                 state.Channels[ch].Note = note;
-                state.Channels[ch].Detune = cent;
+                state.Channels[ch].Detune = 0;
             }
             else
             {
@@ -2763,7 +3039,7 @@ public class GA20Tracker : VgmChipTracker
     }
 }
 
-// YM2608 (OPNA) 状态追踪器 - 6 FM + 3 SSG + 6 Rhythm + 1 ADPCM
+// YM2608 (OPNA) 状态追踪器 - 6 FM + 3 SSG + 6 Rhythm + 1 ADPCM (支持CH3 Extended)
 public class YM2608Tracker : VgmChipTracker
 {
     // FM 部分 (6通道)
@@ -2774,15 +3050,23 @@ public class YM2608Tracker : VgmChipTracker
     private readonly int[] _fmLr = new int[6];
     private readonly bool[] _fmKeyOn = new bool[6];
     
+    // CH3 Extended模式
+    private bool _ch3ExtendedMode;
+    private readonly int[] _ch3OpFnum = new int[4];
+    private readonly int[] _ch3OpBlock = new int[4];
+    
     // SSG 部分 (3通道)
     private readonly int[] _ssgPeriod = new int[3];
     private readonly int[] _ssgVolume = new int[3];
     private readonly bool[] _ssgEnable = new bool[3];
     
     // Rhythm 部分 (6通道) - BD/SD/TOP/HH/TOM/RIM
-    private readonly int[] _rhythmVol = new int[6];
-    private bool _rhythmEnable;
-    private int _rhythmKeyOn;
+    // 0x10: bit7=DM(0=KeyOn,1=KeyOff), bit5-0=通道选择
+    // 0x11: 总音量TL
+    // 0x18-0x1D: 各通道音量IL和Pan
+    private readonly int[] _rhythmVol = new int[6];       // 各通道音量 (0x18-0x1D)
+    private readonly bool[] _rhythmKeyOn = new bool[6];   // 各通道Key On状态
+    private int _rhythmTL;                                // 总音量 (0x11)
     
     // ADPCM-B (1通道)
     private int _adpcmDelta;
@@ -2875,12 +3159,53 @@ public class YM2608Tracker : VgmChipTracker
                 }
             }
         }
+        // CH3 模式控制 (0x27 bit6-7)
+        else if (reg == 0x27 && port == 0)
+        {
+            _ch3ExtendedMode = ((val >> 6) & 0x03) == 1;
+        }
+        // CH3 Extended模式算子频率 (port 0): OP2=0xA8/0xAC, OP3=0xA9/0xAD, OP4=0xAA/0xAE
+        else if (port == 0 && reg >= 0xA8 && reg <= 0xAE)
+        {
+            if (reg == 0xA8)
+                _ch3OpFnum[1] = (_ch3OpFnum[1] & 0x700) | val;
+            else if (reg == 0xAC)
+            {
+                _ch3OpFnum[1] = (_ch3OpFnum[1] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[1] = (val >> 3) & 0x07;
+            }
+            else if (reg == 0xA9)
+                _ch3OpFnum[2] = (_ch3OpFnum[2] & 0x700) | val;
+            else if (reg == 0xAD)
+            {
+                _ch3OpFnum[2] = (_ch3OpFnum[2] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[2] = (val >> 3) & 0x07;
+            }
+            else if (reg == 0xAA)
+                _ch3OpFnum[3] = (_ch3OpFnum[3] & 0x700) | val;
+            else if (reg == 0xAE)
+            {
+                _ch3OpFnum[3] = (_ch3OpFnum[3] & 0xFF) | ((val & 0x07) << 8);
+                _ch3OpBlock[3] = (val >> 3) & 0x07;
+            }
+        }
         // Rhythm (Port 0, 0x10-0x1D)
+        // 0x10: bit7=DM(Dump Mode: 0=KeyOn, 1=KeyOff), bit5-0=通道选择
         else if (port == 0 && reg == 0x10)
         {
-            _rhythmEnable = (val & 0x80) != 0;
-            _rhythmKeyOn = val & 0x3F;
+            bool isKeyOff = (val & 0x80) != 0;  // DM=1 表示 Key Off
+            for (int ch = 0; ch < 6; ch++)
+            {
+                if (((val >> ch) & 1) != 0)
+                    _rhythmKeyOn[ch] = !isKeyOff;
+            }
         }
+        // 0x11: 总音量 TL
+        else if (port == 0 && reg == 0x11)
+        {
+            _rhythmTL = val & 0x3F;
+        }
+        // 0x18-0x1D: 各通道音量 IL
         else if (port == 0 && reg >= 0x18 && reg <= 0x1D)
         {
             _rhythmVol[reg - 0x18] = val & 0x1F;
@@ -2908,110 +3233,157 @@ public class YM2608Tracker : VgmChipTracker
         Array.Clear(_ssgVolume);
         Array.Clear(_ssgEnable);
         Array.Clear(_rhythmVol);
-        _rhythmEnable = false;
-        _rhythmKeyOn = 0;
+        Array.Clear(_rhythmKeyOn);
+        _rhythmTL = 0;
         _adpcmDelta = 0;
         _adpcmVolume = 0;
         _adpcmKeyOn = false;
         _adpcmPan = 0;
+        _ch3ExtendedMode = false;
+        Array.Clear(_ch3OpFnum);
+        Array.Clear(_ch3OpBlock);
     }
     
+    // 新显示布局: FM1-3(0-2), OP2-4(3-5), FM4-6(6-8), SSG(9-11), ADPCM(12), RHY(13-18)
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        // FM 通道 (0-5)
-        for (int ch = 0; ch < 6 && ch < state.Channels.Length; ch++)
+        double clock = Clock > 0 ? Clock : 7987200.0;
+        
+        // FM 通道 1-3 (显示索引 0-2)
+        for (int ch = 0; ch < 3 && ch < state.Channels.Length; ch++)
+            UpdateFmChannel(state, ch, ch, clock);
+        
+        // Extended模式下的FM3 OP2/OP3/OP4 (显示索引 3-5)
+        if (_ch3ExtendedMode && state.Channels.Length > 5)
         {
-            state.Channels[ch].KeyOn = _fmKeyOn[ch];
-            
-            int mask = CarrierMask[_fmAlgo[ch]];
-            int minTl = 127;
-            for (int op = 0; op < 4; op++)
+            for (int op = 1; op <= 3; op++)
             {
-                if ((mask & (1 << op)) != 0)
-                    minTl = Math.Min(minTl, _fmTl[ch, op]);
+                int displayIdx = 2 + op;
+                bool keyOn = _fmKeyOn[2];
+                int vol = Math.Max(0, 127 - _fmTl[2, op]);
+                int lr = _fmLr[2];
+                state.Channels[displayIdx].KeyOn = keyOn;
+                state.Channels[displayIdx].Volume = vol;
+                state.Channels[displayIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+                state.Channels[displayIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+                
+                if (keyOn && _ch3OpFnum[op] > 0)
+                {
+                    double freq = _ch3OpFnum[op] * clock / (72.0 * Math.Pow(2, 21 - _ch3OpBlock[op]));
+                    var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                    state.Channels[displayIdx].Note = note;
+                    state.Channels[displayIdx].Detune = cent;
+                }
+                else
+                {
+                    state.Channels[displayIdx].Note = -1;
+                    state.Channels[displayIdx].Detune = 0;
+                }
             }
-            int vol = Math.Max(0, 127 - minTl);
-            state.Channels[ch].Volume = vol;
-            
-            int lr = _fmLr[ch];
-            state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
-            state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
-            
-            if (_fmKeyOn[ch] && _fmFnum[ch] > 0)
+        }
+        else if (state.Channels.Length > 5)
+        {
+            for (int i = 3; i <= 5; i++)
             {
-                // YM2608 (OPNA): freq = fnum * clock / (72 * 2^(21-block))
-                double clock = Clock > 0 ? Clock : 7987200.0;
-                double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
-                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
-                state.Channels[ch].Note = note;
-                state.Channels[ch].Detune = cent;
-            }
-            else
-            {
-                state.Channels[ch].Note = -1;
-                state.Channels[ch].Detune = 0;
+                state.Channels[i].KeyOn = false;
+                state.Channels[i].Volume = 0;
+                state.Channels[i].Note = -1;
             }
         }
         
-        // SSG 通道 (6-8)
-        for (int ch = 0; ch < 3 && ch + 6 < state.Channels.Length; ch++)
+        // FM 通道 4-6 (显示索引 6-8, 内部FM索引 3-5)
+        for (int i = 0; i < 3 && i + 6 < state.Channels.Length; i++)
+            UpdateFmChannel(state, i + 6, i + 3, clock);
+        
+        // SSG 通道 (显示索引 9-11)
+        for (int ch = 0; ch < 3 && ch + 9 < state.Channels.Length; ch++)
         {
             bool active = _ssgEnable[ch] && _ssgVolume[ch] > 0 && _ssgPeriod[ch] > 0;
             int vol = _ssgVolume[ch] * 127 / 15;
-            state.Channels[ch + 6].KeyOn = active;
-            state.Channels[ch + 6].Volume = vol;
-            state.Channels[ch + 6].PanLeft = vol;
-            state.Channels[ch + 6].PanRight = vol;
-            
-            if (active)
-            {
-                // YM2608 SSG: freq = clock / (16 * period)
-                // SSG 时钟为 FM 时钟的 1/4
-                double clock = Clock > 0 ? Clock / 4.0 : 1996800.0;
-                double freq = clock / (16.0 * _ssgPeriod[ch]);
-                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
-                state.Channels[ch + 6].Note = note;
-                state.Channels[ch + 6].Detune = cent;
-            }
-            else
-            {
-                state.Channels[ch + 6].Note = -1;
-                state.Channels[ch + 6].Detune = 0;
-            }
-        }
-        
-        // Rhythm 通道 (9-14): BD/SD/TOP/HH/TOM/RIM
-        for (int ch = 0; ch < 6 && ch + 9 < state.Channels.Length; ch++)
-        {
-            bool active = _rhythmEnable && ((_rhythmKeyOn >> ch) & 1) != 0;
-            int vol = _rhythmVol[ch] * 127 / 31;
             state.Channels[ch + 9].KeyOn = active;
             state.Channels[ch + 9].Volume = vol;
             state.Channels[ch + 9].PanLeft = vol;
             state.Channels[ch + 9].PanRight = vol;
-            state.Channels[ch + 9].Note = -1;  // Rhythm 无音高
-        }
-        
-        // ADPCM-B 通道 (15)
-        if (state.Channels.Length > 15)
-        {
-            int vol = _adpcmVolume / 2;
-            state.Channels[15].KeyOn = _adpcmKeyOn;
-            state.Channels[15].Volume = vol;
-            state.Channels[15].PanLeft = (_adpcmPan & 0x02) != 0 ? vol : 0;
-            state.Channels[15].PanRight = (_adpcmPan & 0x01) != 0 ? vol : 0;
             
-            // ADPCM-B: delta=0x49BA 约等于 8kHz 采样率
-            state.Channels[15].Detune = _adpcmDelta - 0x49BA;
-            if (_adpcmKeyOn && _adpcmDelta > 0)
+            if (active)
             {
-                double ratio = _adpcmDelta / 18874.0;  // 0x49BA = 18874
-                state.Channels[15].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                double ssgClock = clock / 4.0;
+                double freq = ssgClock / (16.0 * _ssgPeriod[ch]);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch + 9].Note = note;
+                state.Channels[ch + 9].Detune = cent;
             }
             else
             {
-                state.Channels[15].Note = -1;
+                state.Channels[ch + 9].Note = -1;
+                state.Channels[ch + 9].Detune = 0;
             }
+        }
+        
+        // ADPCM-B 通道 (显示索引 12)
+        if (state.Channels.Length > 12)
+        {
+            int vol = _adpcmVolume / 2;
+            state.Channels[12].KeyOn = _adpcmKeyOn;
+            state.Channels[12].Volume = vol;
+            state.Channels[12].PanLeft = (_adpcmPan & 0x02) != 0 ? vol : 0;
+            state.Channels[12].PanRight = (_adpcmPan & 0x01) != 0 ? vol : 0;
+            state.Channels[12].Detune = _adpcmDelta - 0x49BA;
+            if (_adpcmKeyOn && _adpcmDelta > 0)
+            {
+                double ratio = _adpcmDelta / 18874.0;
+                state.Channels[12].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+            }
+            else
+            {
+                state.Channels[12].Note = -1;
+            }
+        }
+        
+        // Rhythm 通道 (显示索引 13-18)
+        for (int ch = 0; ch < 6 && ch + 13 < state.Channels.Length; ch++)
+        {
+            bool active = _rhythmKeyOn[ch];
+            // 音量 = TL + IL, TL范围0-63, IL范围0-31
+            int totalVol = _rhythmTL + _rhythmVol[ch];
+            int vol = Math.Min(127, totalVol * 127 / 63);
+            state.Channels[ch + 13].KeyOn = active;
+            state.Channels[ch + 13].Volume = active ? vol : 0;
+            state.Channels[ch + 13].PanLeft = vol;
+            state.Channels[ch + 13].PanRight = vol;
+            state.Channels[ch + 13].Note = -1;
+        }
+    }
+    
+    private void UpdateFmChannel(VgmVisualizer.ChipState state, int displayIdx, int fmIdx, double clock)
+    {
+        state.Channels[displayIdx].KeyOn = _fmKeyOn[fmIdx];
+        
+        int mask = CarrierMask[_fmAlgo[fmIdx]];
+        int minTl = 127;
+        for (int op = 0; op < 4; op++)
+        {
+            if ((mask & (1 << op)) != 0)
+                minTl = Math.Min(minTl, _fmTl[fmIdx, op]);
+        }
+        int vol = Math.Max(0, 127 - minTl);
+        state.Channels[displayIdx].Volume = vol;
+        
+        int lr = _fmLr[fmIdx];
+        state.Channels[displayIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+        state.Channels[displayIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+        
+        if (_fmKeyOn[fmIdx] && _fmFnum[fmIdx] > 0)
+        {
+            double freq = _fmFnum[fmIdx] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[fmIdx]));
+            var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+            state.Channels[displayIdx].Note = note;
+            state.Channels[displayIdx].Detune = cent;
+        }
+        else
+        {
+            state.Channels[displayIdx].Note = -1;
+            state.Channels[displayIdx].Detune = 0;
         }
     }
 }
@@ -3033,6 +3405,11 @@ public class YM2610Tracker : VgmChipTracker
     private readonly int[] _fmLr = new int[6];
     private readonly int[] _fmKeyOnMask = new int[6];  // FM KeyOn operator mask (bit4-7)
     private bool _isYm2610B;  // 是否为YM2610B模式 (6 FM通道)
+    
+    // CH3 Extended模式
+    private bool _ch3ExtendedMode;
+    private readonly int[] _ch3OpFnum = new int[4];
+    private readonly int[] _ch3OpBlock = new int[4];
     
     // SSG 部分 (3通道)
     private readonly int[] _ssgPeriod = new int[3];
@@ -3151,6 +3528,36 @@ public class YM2610Tracker : VgmChipTracker
             else if (reg == 0x1B)
             {
                 _adpcmBVolume = val;
+            }
+            // CH3 模式控制 (0x27 bit6-7)
+            else if (reg == 0x27)
+            {
+                _ch3ExtendedMode = ((val >> 6) & 0x03) == 1;
+            }
+            // CH3 Extended模式算子频率: OP2=0xA8/0xAC, OP3=0xA9/0xAD, OP4=0xAA/0xAE
+            else if (reg >= 0xA8 && reg <= 0xAE)
+            {
+                if (reg == 0xA8)
+                    _ch3OpFnum[1] = (_ch3OpFnum[1] & 0x700) | val;
+                else if (reg == 0xAC)
+                {
+                    _ch3OpFnum[1] = (_ch3OpFnum[1] & 0xFF) | ((val & 0x07) << 8);
+                    _ch3OpBlock[1] = (val >> 3) & 0x07;
+                }
+                else if (reg == 0xA9)
+                    _ch3OpFnum[2] = (_ch3OpFnum[2] & 0x700) | val;
+                else if (reg == 0xAD)
+                {
+                    _ch3OpFnum[2] = (_ch3OpFnum[2] & 0xFF) | ((val & 0x07) << 8);
+                    _ch3OpBlock[2] = (val >> 3) & 0x07;
+                }
+                else if (reg == 0xAA)
+                    _ch3OpFnum[3] = (_ch3OpFnum[3] & 0x700) | val;
+                else if (reg == 0xAE)
+                {
+                    _ch3OpFnum[3] = (_ch3OpFnum[3] & 0xFF) | ((val & 0x07) << 8);
+                    _ch3OpBlock[3] = (val >> 3) & 0x07;
+                }
             }
             // FM Key On (0x28) - 在 Port 0
             else if (reg == 0x28)
@@ -3360,151 +3767,167 @@ public class YM2610Tracker : VgmChipTracker
         _adpcmBPan = 0;
         _adpcmBStartAddr = 0;
         _adpcmBEndAddr = 0;
+        _ch3ExtendedMode = false;
+        Array.Clear(_ch3OpFnum);
+        Array.Clear(_ch3OpBlock);
     }
     
+    // 新显示布局: FM1-3(0-2), OP2-4(3-5), FM4-6(6-8), SSG(9-11), PCMA(12-17), PCMB(18)
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        // 通道布局:
-        // YM2610: 4 FM (0-3) + 3 SSG (4-6) + 6 ADPCM-A (7-12) + 1 ADPCM-B (13) = 14通道
-        // YM2610B: 6 FM (0-5) + 3 SSG (6-8) + 6 ADPCM-A (9-14) + 1 ADPCM-B (15) = 16通道
-        int fmCount = FmChannelCount;
-        int ssgBase = fmCount;            // SSG起始索引: YM2610=4, YM2610B=6
-        int adpcmABase = ssgBase + 3;     // ADPCM-A起始索引: YM2610=7, YM2610B=9
-        int adpcmBIdx = adpcmABase + 6;   // ADPCM-B索引: YM2610=13, YM2610B=15
+        double clock = Clock > 0 ? Clock : 8000000.0;
         
-        // FM 通道
-        for (int ch = 0; ch < fmCount && ch < state.Channels.Length; ch++)
+        // FM 通道 1-3 (显示索引 0-2)
+        for (int ch = 0; ch < 3 && ch < state.Channels.Length; ch++)
+            UpdateFmChannel(state, ch, ch, clock);
+        
+        // Extended模式下的FM3 OP2/OP3/OP4 (显示索引 3-5)
+        if (_ch3ExtendedMode && state.Channels.Length > 5)
         {
-            // 检查是否有任何operator开启
-            bool keyOn = _fmKeyOnMask[ch] != 0;
-            state.Channels[ch].KeyOn = keyOn;
-            
-            // 根据algorithm计算carrier的TL（最小值 = 最大音量）
-            int algoMask = CarrierMask[_fmAlgo[ch]];
-            int minTl = 127;
-            for (int op = 0; op < 4; op++)
+            for (int op = 1; op <= 3; op++)
             {
-                // 只计算carrier的TL
-                if ((algoMask & (1 << op)) != 0)
-                    minTl = Math.Min(minTl, _fmTl[ch, op]);
+                int displayIdx = 2 + op;
+                bool keyOn = _fmKeyOnMask[2] != 0;
+                int vol = Math.Max(0, 127 - _fmTl[2, op]);
+                int lr = _fmLr[2];
+                if (lr == 0) lr = 3;
+                state.Channels[displayIdx].KeyOn = keyOn;
+                state.Channels[displayIdx].Volume = vol;
+                state.Channels[displayIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+                state.Channels[displayIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+                
+                if (keyOn && _ch3OpFnum[op] > 0)
+                {
+                    double freq = _ch3OpFnum[op] * clock / (72.0 * Math.Pow(2, 21 - _ch3OpBlock[op]));
+                    var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                    state.Channels[displayIdx].Note = note;
+                    state.Channels[displayIdx].Detune = cent;
+                }
+                else
+                {
+                    state.Channels[displayIdx].Note = -1;
+                    state.Channels[displayIdx].Detune = 0;
+                }
             }
-            int vol = Math.Max(0, 127 - minTl);
-            state.Channels[ch].Volume = keyOn ? vol : 0;
-            
-            // Pan处理：如果LR=0则默认输出到两边
-            int lr = _fmLr[ch];
-            if (lr == 0) lr = 3;  // 默认立体声
-            state.Channels[ch].PanLeft = (lr & 0x02) != 0 ? vol : 0;
-            state.Channels[ch].PanRight = (lr & 0x01) != 0 ? vol : 0;
-            
-            if (keyOn && _fmFnum[ch] > 0)
+        }
+        else if (state.Channels.Length > 5)
+        {
+            for (int i = 3; i <= 5; i++)
             {
-                // YM2610/B: freq = fnum * clock / (72 * 2^(21-block))
-                double clock = Clock > 0 ? Clock : 8000000.0;
-                double freq = _fmFnum[ch] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[ch]));
-                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
-                state.Channels[ch].Note = note;
-                state.Channels[ch].Detune = cent;
-            }
-            else
-            {
-                state.Channels[ch].Note = -1;
-                state.Channels[ch].Detune = 0;
+                state.Channels[i].KeyOn = false;
+                state.Channels[i].Volume = 0;
+                state.Channels[i].Note = -1;
             }
         }
         
-        // SSG 通道
-        for (int ch = 0; ch < 3 && ssgBase + ch < state.Channels.Length; ch++)
+        // FM 通道 4-6 (显示索引 6-8, 内部FM索引 3-5)
+        for (int i = 0; i < 3 && i + 6 < state.Channels.Length; i++)
+            UpdateFmChannel(state, i + 6, i + 3, clock);
+        
+        // SSG 通道 (显示索引 9-11)
+        for (int ch = 0; ch < 3 && ch + 9 < state.Channels.Length; ch++)
         {
-            int idx = ssgBase + ch;
             bool active = _ssgEnable[ch] && _ssgVolume[ch] > 0 && _ssgPeriod[ch] > 0;
             int vol = _ssgVolume[ch] * 127 / 15;
-            state.Channels[idx].KeyOn = active;
-            state.Channels[idx].Volume = vol;
-            state.Channels[idx].PanLeft = vol;
-            state.Channels[idx].PanRight = vol;
+            state.Channels[ch + 9].KeyOn = active;
+            state.Channels[ch + 9].Volume = vol;
+            state.Channels[ch + 9].PanLeft = vol;
+            state.Channels[ch + 9].PanRight = vol;
             
             if (active)
             {
-                // SSG: freq = clock / (16 * period), SSG时钟为FM时钟的1/4
-                double clock = Clock > 0 ? Clock / 4.0 : 2000000.0;
-                double freq = clock / (16.0 * _ssgPeriod[ch]);
+                double ssgClock = clock / 4.0;
+                double freq = ssgClock / (16.0 * _ssgPeriod[ch]);
                 var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
-                state.Channels[idx].Note = note;
-                state.Channels[idx].Detune = cent;
+                state.Channels[ch + 9].Note = note;
+                state.Channels[ch + 9].Detune = cent;
             }
             else
             {
-                state.Channels[idx].Note = -1;
-                state.Channels[idx].Detune = 0;
+                state.Channels[ch + 9].Note = -1;
+                state.Channels[ch + 9].Detune = 0;
             }
         }
         
-        // ADPCM-A 通道 - 固定采样率 18.5kHz
-        for (int ch = 0; ch < 6 && adpcmABase + ch < state.Channels.Length; ch++)
+        // ADPCM-A 通道 (显示索引 12-17)
+        for (int ch = 0; ch < 6 && ch + 12 < state.Channels.Length; ch++)
         {
-            int idx = adpcmABase + ch;
             bool active = _adpcmAKeyOn[ch];
-            
-            // 音量计算: 使用反转后的TL和IL值
-            // TL和IL都已经反转: 0=静音, 最大值=最大音量
-            // 总音量 = TL + IL, 限制在0-63范围内
             int totalVol = _adpcmATL + _adpcmAIL[ch];
-            // 映射到0-127范围
             int vol = Math.Min(127, totalVol * 127 / 63);
-            
-            state.Channels[idx].KeyOn = active;
-            state.Channels[idx].Volume = active ? vol : 0;
-            
-            // Pan: bit 1=L, bit 0=R (如果pan=0则默认输出到两边)
+            state.Channels[ch + 12].KeyOn = active;
+            state.Channels[ch + 12].Volume = active ? vol : 0;
             int pan = _adpcmAPan[ch];
-            if (pan == 0) pan = 3;  // 默认立体声输出
-            state.Channels[idx].PanLeft = (pan & 0x02) != 0 ? vol : 0;
-            state.Channels[idx].PanRight = (pan & 0x01) != 0 ? vol : 0;
+            if (pan == 0) pan = 3;
+            state.Channels[ch + 12].PanLeft = (pan & 0x02) != 0 ? vol : 0;
+            state.Channels[ch + 12].PanRight = (pan & 0x01) != 0 ? vol : 0;
             
-            // 采样地址映射到音高显示
-            // ADPCM-A使用起始地址区分不同采样
-            // 地址格式: (高字节 << 8) | 低字节，以256字节为单位
             if (active && _adpcmAStartAddr[ch] > 0)
             {
-                // 使用完整16位地址作为采样标识
                 int sampleAddr = _adpcmAStartAddr[ch] & 0xFFFF;
-                // 使用简单的哈希确保不同地址映射到不同音符
-                // 高字节决定主要音高区域，低字节微调
-                int highByte = (sampleAddr >> 8) & 0xFF;
-                int lowByte = sampleAddr & 0xFF;
-                // 使用高字节和低字节的组合，确保唯一性
-                int noteOffset = (highByte * 7 + lowByte) % 96;  // 使用质数7减少冲突
-                state.Channels[idx].Note = 24 + noteOffset;  // C1-B8范围
-                state.Channels[idx].Detune = sampleAddr;  // 显示完整地址
+                int noteOffset = ((sampleAddr >> 8) * 7 + (sampleAddr & 0xFF)) % 96;
+                state.Channels[ch + 12].Note = 24 + noteOffset;
+                state.Channels[ch + 12].Detune = sampleAddr;
             }
             else
             {
-                state.Channels[idx].Note = -1;
-                state.Channels[idx].Detune = 0;
+                state.Channels[ch + 12].Note = -1;
+                state.Channels[ch + 12].Detune = 0;
             }
         }
         
-        // ADPCM-B 通道 - 可变采样率
-        if (adpcmBIdx < state.Channels.Length)
+        // ADPCM-B 通道 (显示索引 18)
+        if (state.Channels.Length > 18)
         {
             int vol = _adpcmBVolume / 2;
-            state.Channels[adpcmBIdx].KeyOn = _adpcmBKeyOn;
-            state.Channels[adpcmBIdx].Volume = vol;
-            state.Channels[adpcmBIdx].PanLeft = (_adpcmBPan & 0x02) != 0 ? vol : 0;
-            state.Channels[adpcmBIdx].PanRight = (_adpcmBPan & 0x01) != 0 ? vol : 0;
-            state.Channels[adpcmBIdx].Detune = _adpcmBDelta - 0x49BA;
-            
+            state.Channels[18].KeyOn = _adpcmBKeyOn;
+            state.Channels[18].Volume = vol;
+            state.Channels[18].PanLeft = (_adpcmBPan & 0x02) != 0 ? vol : 0;
+            state.Channels[18].PanRight = (_adpcmBPan & 0x01) != 0 ? vol : 0;
+            state.Channels[18].Detune = _adpcmBDelta - 0x49BA;
             if (_adpcmBKeyOn && _adpcmBDelta > 0)
             {
-                // ADPCM-B: delta=0x49BA (18874) 约等于 8kHz
                 double ratio = _adpcmBDelta / 18874.0;
-                state.Channels[adpcmBIdx].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
+                state.Channels[18].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
             }
             else
             {
-                state.Channels[adpcmBIdx].Note = -1;
+                state.Channels[18].Note = -1;
             }
+        }
+    }
+    
+    private void UpdateFmChannel(VgmVisualizer.ChipState state, int displayIdx, int fmIdx, double clock)
+    {
+        bool keyOn = _fmKeyOnMask[fmIdx] != 0;
+        state.Channels[displayIdx].KeyOn = keyOn;
+        
+        int algoMask = CarrierMask[_fmAlgo[fmIdx]];
+        int minTl = 127;
+        for (int op = 0; op < 4; op++)
+        {
+            if ((algoMask & (1 << op)) != 0)
+                minTl = Math.Min(minTl, _fmTl[fmIdx, op]);
+        }
+        int vol = Math.Max(0, 127 - minTl);
+        state.Channels[displayIdx].Volume = keyOn ? vol : 0;
+        
+        int lr = _fmLr[fmIdx];
+        if (lr == 0) lr = 3;
+        state.Channels[displayIdx].PanLeft = (lr & 0x02) != 0 ? vol : 0;
+        state.Channels[displayIdx].PanRight = (lr & 0x01) != 0 ? vol : 0;
+        
+        if (keyOn && _fmFnum[fmIdx] > 0)
+        {
+            double freq = _fmFnum[fmIdx] * clock / (72.0 * Math.Pow(2, 21 - _fmBlock[fmIdx]));
+            var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+            state.Channels[displayIdx].Note = note;
+            state.Channels[displayIdx].Detune = cent;
+        }
+        else
+        {
+            state.Channels[displayIdx].Note = -1;
+            state.Channels[displayIdx].Detune = 0;
         }
     }
 }
@@ -3566,7 +3989,7 @@ public class GenericPcmTracker : VgmChipTracker
     }
 }
 
-// 通用 FM 追踪器（用于 YMF271 等）
+// 通用 FM 追踪器（用于未实现专用追踪器的FM芯片）
 public class GenericFmTracker : VgmChipTracker
 {
     private readonly bool[] _keyOn = new bool[12];
@@ -3607,6 +4030,371 @@ public class GenericFmTracker : VgmChipTracker
             state.Channels[i].PanRight = _volume[i] / 2;
             state.Channels[i].Note = -1;
         }
+    }
+}
+
+// YMF271 (OPX) 追踪器
+// 12组FM通道，每组最多4个slot用于FM算法
+// VGM命令0xD1格式: pp aa dd (Port, Address, Data)
+// Port 0x01/0x03/0x05/0x07 = FM bank 0/1/2/3
+// Port 0x09 = PCM设置
+// Address低4位通过fm_tab映射到group号(0-11)，高4位是寄存器号(0-14)
+public class YMF271Tracker : VgmChipTracker
+{
+    // 地址到组号的映射表 (来自libvgm)
+    private static readonly int[] FmTab = { 0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1 };
+    
+    // PCM slot映射表 (来自libvgm): 地址到slot号的映射
+    // 每4个slot共用一个PCM地址，映射到12个PCM通道
+    private static readonly int[] PcmTab = { 0, 4, 8, -1, 12, 16, 20, -1, 24, 28, 32, -1, 36, 40, 44, -1 };
+    
+    // 每组的Slot状态 (4个bank x 12组 = 48个slot)
+    private readonly SlotState[] _slots = new SlotState[48];
+    
+    // 每组的同步模式
+    private readonly int[] _groupSync = new int[12];
+    
+    private struct SlotState
+    {
+        public bool Active;      // 是否正在发声
+        public int TotalLevel;   // 音量 (0=最大, 127=最小)
+        public int Fns;          // 频率号低8位
+        public int FnsHi;        // 频率号高4位 + Block
+        public int Block;        // 八度
+        public int Ch0Level;     // 左前声像 (0-15)
+        public int Ch1Level;     // 右前声像 (0-15)
+        public int Ch2Level;     // 左后声像 (0-15)
+        public int Ch3Level;     // 右后声像 (0-15)
+        public int Algorithm;    // FM算法
+        public int Waveform;     // 波形类型 (0-6=FM, 7=PCM)
+        public bool IsPcm;       // 是否为PCM模式
+    }
+    
+    public YMF271Tracker()
+    {
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            _slots[i] = new SlotState();
+        }
+    }
+    
+    public override void ProcessEvent(VgmEvent evt)
+    {
+        // Port决定写入类型
+        int port = evt.Port;
+        int address = evt.Register;
+        int data = evt.Value;
+        
+        // 根据Port处理不同类型的写入
+        switch (port)
+        {
+            case 0x01: // FM Bank 0
+                ProcessFmWrite(0, address, data);
+                break;
+            case 0x03: // FM Bank 1
+                ProcessFmWrite(1, address, data);
+                break;
+            case 0x05: // FM Bank 2
+                ProcessFmWrite(2, address, data);
+                break;
+            case 0x07: // FM Bank 3
+                ProcessFmWrite(3, address, data);
+                break;
+            case 0x09: // PCM设置
+                ProcessPcmWrite(address, data);
+                break;
+            case 0x0D: // Timer/Group设置
+                ProcessTimerWrite(address, data);
+                break;
+        }
+    }
+    
+    // 处理PCM寄存器写入
+    private void ProcessPcmWrite(int address, int data)
+    {
+        // 通过pcm_tab将地址低4位映射到slot号
+        int slotNum = PcmTab[address & 0x0F];
+        if (slotNum == -1 || slotNum >= _slots.Length) return;
+        
+        ref SlotState slot = ref _slots[slotNum];
+        
+        // 高4位是寄存器号
+        int reg = (address >> 4) & 0x0F;
+        
+        // PCM模式的slot，waveform设置为7
+        slot.IsPcm = true;
+        slot.Waveform = 7;
+        
+        // PCM寄存器大部分是地址设置，对可视化不重要
+        // 但寄存器0x09包含采样率信息
+        if (reg == 0x09)
+        {
+            // fs = data & 0x3 (采样率分频)
+            // bits = (data & 0x4) ? 12 : 8 (位深)
+            // 这些信息对可视化不重要，但可以用于调试
+        }
+    }
+    
+    // 处理FM寄存器写入
+    private void ProcessFmWrite(int bank, int address, int data)
+    {
+        // 通过fm_tab将地址低4位映射到组号
+        int groupNum = FmTab[address & 0x0F];
+        if (groupNum == -1) return;
+        
+        // 高4位是寄存器号
+        int reg = (address >> 4) & 0x0F;
+        
+        // 计算slot索引 (bank * 12 + groupNum)
+        int slotIdx = bank * 12 + groupNum;
+        if (slotIdx >= _slots.Length) return;
+        
+        ref SlotState slot = ref _slots[slotIdx];
+        
+        // 检查是否需要同步写入（根据group的sync模式）
+        int syncMode = _groupSync[groupNum];
+        bool isSyncReg = reg == 0 || reg == 9 || reg == 10 || reg == 12 || reg == 13 || reg == 14;
+        
+        if (isSyncReg && IsSyncSlot(bank, syncMode))
+        {
+            // 同步写入所有相关slot
+            WriteSyncedSlots(groupNum, bank, syncMode, reg, data);
+        }
+        else
+        {
+            // 普通写入单个slot
+            WriteSlotRegister(ref slot, reg, data);
+        }
+    }
+    
+    // 检查当前bank是否是同步触发slot
+    private bool IsSyncSlot(int bank, int syncMode)
+    {
+        return syncMode switch
+        {
+            0 => bank == 0,              // 4-slot模式: bank 0触发
+            1 => bank == 0 || bank == 1, // 2x2-slot模式: bank 0或1触发
+            2 => bank == 0,              // 3+1-slot模式: bank 0触发
+            _ => false
+        };
+    }
+    
+    // 同步写入所有相关slot
+    private void WriteSyncedSlots(int groupNum, int bank, int syncMode, int reg, int data)
+    {
+        switch (syncMode)
+        {
+            case 0: // 4-slot模式: 写入所有4个slot
+                for (int b = 0; b < 4; b++)
+                {
+                    int idx = b * 12 + groupNum;
+                    WriteSlotRegister(ref _slots[idx], reg, data);
+                }
+                break;
+                
+            case 1: // 2x2-slot模式
+                if (bank == 0)
+                {
+                    // Bank 0触发: slot 0和2
+                    WriteSlotRegister(ref _slots[0 * 12 + groupNum], reg, data);
+                    WriteSlotRegister(ref _slots[2 * 12 + groupNum], reg, data);
+                }
+                else
+                {
+                    // Bank 1触发: slot 1和3
+                    WriteSlotRegister(ref _slots[1 * 12 + groupNum], reg, data);
+                    WriteSlotRegister(ref _slots[3 * 12 + groupNum], reg, data);
+                }
+                break;
+                
+            case 2: // 3+1-slot模式: 写入slot 0,1,2
+                for (int b = 0; b < 3; b++)
+                {
+                    int idx = b * 12 + groupNum;
+                    WriteSlotRegister(ref _slots[idx], reg, data);
+                }
+                break;
+        }
+    }
+    
+    // 写入单个slot的寄存器
+    private void WriteSlotRegister(ref SlotState slot, int reg, int data)
+    {
+        switch (reg)
+        {
+            case 0x00: // Key On/Off (bit 0)
+                if ((data & 0x01) != 0)
+                {
+                    // Key On
+                    slot.Active = true;
+                }
+                else
+                {
+                    // Key Off (进入Release状态)
+                    slot.Active = false;
+                }
+                break;
+                
+            case 0x04: // Total Level (0=最大, 127=静音)
+                slot.TotalLevel = data & 0x7F;
+                break;
+                
+            case 0x09: // 频率号低8位 + Block
+                slot.Fns = (slot.FnsHi << 8 & 0x0F00) | data;
+                slot.Block = (slot.FnsHi >> 4) & 0x0F;
+                break;
+                
+            case 0x0A: // 频率号高4位
+                slot.FnsHi = data;
+                break;
+                
+            case 0x0B: // Waveform + Feedback + AccOn
+                slot.Waveform = data & 0x07;
+                break;
+                
+            case 0x0C: // Algorithm
+                slot.Algorithm = data & 0x0F;
+                break;
+                
+            case 0x0D: // 左前/右前声像 (ch0/ch1)
+                slot.Ch0Level = (data >> 4) & 0x0F;
+                slot.Ch1Level = data & 0x0F;
+                break;
+                
+            case 0x0E: // 左后/右后声像 (ch2/ch3)
+                slot.Ch2Level = (data >> 4) & 0x0F;
+                slot.Ch3Level = data & 0x0F;
+                break;
+        }
+    }
+    
+    // 处理Timer/Group设置写入
+    private void ProcessTimerWrite(int address, int data)
+    {
+        // 地址0x00-0x0F用于设置组的sync模式
+        if ((address & 0xF0) == 0)
+        {
+            int groupNum = FmTab[address & 0x0F];
+            if (groupNum != -1 && groupNum < _groupSync.Length)
+            {
+                _groupSync[groupNum] = data & 0x03;
+            }
+        }
+    }
+    
+    public override void Reset()
+    {
+        for (int i = 0; i < _slots.Length; i++)
+        {
+            _slots[i] = new SlotState();
+        }
+        Array.Clear(_groupSync);
+    }
+    
+    public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
+    {
+        // YMF271显示12个组通道
+        // 每个组合并4个slot的状态，标签根据模式显示：
+        // - FM模式：标签"FM X"
+        // - PCM模式（任意slot的waveform==7）：标签"PCM X"
+        
+        for (int group = 0; group < 12 && group < state.Channels.Length; group++)
+        {
+            ref var ch = ref state.Channels[group];
+            
+            // 检查该组是否有任意slot使用PCM模式
+            bool hasPcm = false;
+            bool anyActive = false;
+            int maxVol = 0;
+            int bestFns = 0;
+            int bestBlock = 0;
+            int ch0 = 0, ch1 = 0;
+            int activeSlotCount = 0;
+            
+            for (int bank = 0; bank < 4; bank++)
+            {
+                int slotIdx = bank * 12 + group;
+                ref readonly SlotState slot = ref _slots[slotIdx];
+                
+                // 检测PCM模式
+                if (slot.Waveform == 7 || slot.IsPcm)
+                {
+                    hasPcm = true;
+                }
+                
+                // 统计活跃状态
+                if (slot.Active)
+                {
+                    anyActive = true;
+                    activeSlotCount++;
+                    int vol = 127 - slot.TotalLevel;
+                    if (vol > maxVol)
+                    {
+                        maxVol = vol;
+                        bestFns = slot.Fns;
+                        bestBlock = slot.Block;
+                        ch0 = slot.Ch0Level;
+                        ch1 = slot.Ch1Level;
+                    }
+                }
+            }
+            
+            // 设置通道标签：PCM模式显示"PCM X"，FM模式显示"FM X"
+            // 如果有多个活跃slot，在标签后显示数量
+            if (hasPcm)
+            {
+                ch.Label = activeSlotCount > 1 ? $"PCM{group + 1}×{activeSlotCount}" : $"PCM{group + 1}";
+            }
+            else
+            {
+                ch.Label = $"FM{group + 1}";
+            }
+            
+            ch.KeyOn = anyActive;
+            ch.Volume = maxVol;
+            
+            // 声像: 0-15映射到0-127
+            int panL = ch0 * 127 / 15;
+            int panR = ch1 * 127 / 15;
+            if (ch0 == 0 && ch1 == 0 && anyActive)
+            {
+                panL = panR = maxVol / 2;
+            }
+            ch.PanLeft = panL;
+            ch.PanRight = panR;
+            
+            // 计算音符
+            if (anyActive && bestFns > 0)
+            {
+                ch.Note = CalculateNote(bestFns, bestBlock);
+            }
+            else
+            {
+                ch.Note = -1;
+            }
+        }
+    }
+    
+    // 根据FNS和Block计算MIDI音符号
+    private int CalculateNote(int fns, int block)
+    {
+        // YMF271频率公式: F = (FNS * 2^block) * Fs / 2^21
+        // 其中Fs是芯片采样率
+        // 这里简化为相对音高计算
+        if (fns <= 0) return -1;
+        
+        // FNS范围大约对应一个八度内的音符
+        // Block范围0-15表示不同八度
+        // 基础八度设为4 (中央C所在八度)
+        int octave = block;
+        
+        // FNS到音符的近似映射 (12平均律)
+        // FNS范围约0-2047，对应一个八度12个半音
+        double semitone = Math.Log2((double)(fns | 2048) / 1024.0) * 12.0;
+        int note = (int)(octave * 12 + semitone + 0.5);
+        
+        // 限制在有效MIDI范围
+        return Math.Clamp(note, 0, 127);
     }
 }
 

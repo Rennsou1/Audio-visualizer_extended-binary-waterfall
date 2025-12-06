@@ -281,22 +281,43 @@ public static class VgmFormat
         }
 
         // === VGM 1.71+ 字段 (0xC0-0xEF): WonderSwan, VSU, SAA1099 等 ===
+        // 注意：如果 VGM 数据偏移 < 0x100，重叠的 header 字段应视为 0
+        // 绝对数据偏移 = 0x34 + DataOffset
+        uint absDataOffset = 0x34 + header.DataOffset;
+        
+        // 辅助函数：检查字段是否在数据偏移之前（有效）
+        bool IsFieldValid(uint fieldEndOffset) => absDataOffset > fieldEndOffset;
+        
         if (header.Version >= 0x171 && CanReadAt(0xC0, 0x28))
         {
             ms.Position = 0xC0;
-            header.Wswan_Clock = br.ReadUInt32();   // 0xC0
-            header.Vsu_Clock = br.ReadUInt32();     // 0xC4
-            header.Saa1099Clock = br.ReadUInt32();  // 0xC8
-            header.Es5503Clock = br.ReadUInt32();   // 0xCC
-            header.Es5506Clock = br.ReadUInt32();   // 0xD0
+            header.Wswan_Clock = br.ReadUInt32();   // 0xC0-0xC3
+            header.Vsu_Clock = br.ReadUInt32();     // 0xC4-0xC7
+            header.Saa1099Clock = br.ReadUInt32();  // 0xC8-0xCB
+            header.Es5503Clock = br.ReadUInt32();   // 0xCC-0xCF
+            header.Es5506Clock = br.ReadUInt32();   // 0xD0-0xD3
             header.Es5503Channels = br.ReadByte();  // 0xD4
             header.Es5506Channels = br.ReadByte();  // 0xD5
             header.C352ClockDiv = br.ReadByte();    // 0xD6
             header.Reserved3 = br.ReadByte();       // 0xD7
-            header.X1_010Clock = br.ReadUInt32();   // 0xD8
-            header.C352Clock = br.ReadUInt32();     // 0xDC
-            header.Ga20Clock = br.ReadUInt32();     // 0xE0
-            header.Mikey_Clock = br.ReadUInt32();   // 0xE4 (VGM 1.72 中添加，为兼容性保留)
+            header.X1_010Clock = br.ReadUInt32();   // 0xD8-0xDB
+            header.C352Clock = br.ReadUInt32();     // 0xDC-0xDF
+            header.Ga20Clock = br.ReadUInt32();     // 0xE0-0xE3
+            header.Mikey_Clock = br.ReadUInt32();   // 0xE4-0xE7
+            
+            // 清除被 VGM 数据覆盖的无效字段
+            if (!IsFieldValid(0xC3)) header.Wswan_Clock = 0;
+            if (!IsFieldValid(0xC7)) header.Vsu_Clock = 0;
+            if (!IsFieldValid(0xCB)) header.Saa1099Clock = 0;
+            if (!IsFieldValid(0xCF)) header.Es5503Clock = 0;
+            if (!IsFieldValid(0xD3)) header.Es5506Clock = 0;
+            if (!IsFieldValid(0xD4)) header.Es5503Channels = 0;
+            if (!IsFieldValid(0xD5)) header.Es5506Channels = 0;
+            if (!IsFieldValid(0xD6)) header.C352ClockDiv = 0;
+            if (!IsFieldValid(0xDB)) header.X1_010Clock = 0;
+            if (!IsFieldValid(0xDF)) header.C352Clock = 0;
+            if (!IsFieldValid(0xE3)) header.Ga20Clock = 0;
+            if (!IsFieldValid(0xE7)) header.Mikey_Clock = 0;
         }
 
         // 修正 DataOffset（版本 < 1.50 固定为 0x40）
@@ -358,27 +379,44 @@ public static class VgmFormat
         {
             if (clock == 0) return;
             bool dual = (clock & 0x40000000) != 0;
+            uint actualClock = clock & 0x3FFFFFFF;
+            
+            // 第一个芯片
             chips.Add(new VgmChipInfo
             {
                 Name = name,
-                Clock = clock & 0x3FFFFFFF,
+                Clock = actualClock,
                 ChannelCount = channels,
                 IsDualChip = dual
             });
+            
+            // 双芯片时添加第二个
+            if (dual)
+            {
+                chips.Add(new VgmChipInfo
+                {
+                    Name = name + " #2",
+                    Clock = actualClock,
+                    ChannelCount = channels,
+                    IsDualChip = true
+                });
+            }
         }
 
         AddChip("SN76489", header.Sn76489Clock, 4);
         AddChip("YM2413", header.Ym2413Clock, 9);
-        AddChip("YM2612", header.Ym2612Clock, 6);
+        // YM2612: 6通道 + 3个Extended模式子通道 (FM3的OP2/OP3/OP4)
+        AddChip("YM2612", header.Ym2612Clock, 9);
         AddChip("YM2151", header.Ym2151Clock, 8);
         AddChip("SegaPCM", header.SegaPcmClock, 16);
         AddChip("RF5C68", header.Rf5c68Clock, 8);
-        AddChip("YM2203", header.Ym2203Clock, 6);
-        AddChip("YM2608", header.Ym2608Clock, 16);
-        // YM2610/YM2610B: bit31=1表示YM2610B (6 FM), bit31=0表示YM2610 (4 FM)
-        // 但有些VGM文件没有正确设置bit31，所以统一使用16通道以支持动态检测
+        // YM2203: 3 FM + 3 Extended子通道 + 3 SSG = 9通道
+        AddChip("YM2203", header.Ym2203Clock, 9);
+        // YM2608: 6 FM + 3 Extended + 3 SSG + 1 ADPCM + 6 RHY = 19通道
+        AddChip("YM2608", header.Ym2608Clock, 19);
+        // YM2610/YM2610B: 6 FM + 3 Extended + 3 SSG + 6 ADPCM-A + 1 ADPCM-B = 19通道
         bool isYm2610B = (header.Ym2610Clock & 0x80000000) != 0;
-        AddChip(isYm2610B ? "YM2610B" : "YM2610", header.Ym2610Clock & 0x7FFFFFFF, 16);
+        AddChip(isYm2610B ? "YM2610B" : "YM2610", header.Ym2610Clock & 0x7FFFFFFF, 19);
         AddChip("YM3812", header.Ym3812Clock, 9);
         AddChip("YM3526", header.Ym3526Clock, 9);
         AddChip("Y8950", header.Y8950Clock, 9);

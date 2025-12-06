@@ -226,6 +226,14 @@ public class VgmVisualizer : IDisposable
                 tracker.Clock = chip.Clock;
                 byte chipType = GetChipTypeForName(chip.Name);
                 _trackers[chipType] = tracker;
+                
+                // RF5C68/RF5C164 特殊处理：某些 VGM 文件头部声明 RF5C164 但命令使用 RF5C68
+                // 为兼容性，同时注册两个芯片类型到同一个追踪器
+                if (chip.Name == "RF5C68" || chip.Name == "RF5C164")
+                {
+                    _trackers[VgmCommandParser.CHIP_RF5C68] = tracker;
+                    _trackers[VgmCommandParser.CHIP_RF5C164] = tracker;
+                }
             }
         }
 

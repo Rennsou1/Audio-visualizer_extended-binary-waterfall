@@ -617,12 +617,13 @@ public class VgmCommandParser
                     }
                     break;
                 
-                // PCM RAM 写入
+                // PCM RAM 写入: 68 66 cc oo oo oo dd dd dd ss ss ss (12 bytes total)
+                // 格式: cc=芯片类型, oo=RAM偏移(3字节), dd=数据块偏移(3字节), ss=大小(3字节)
                 case 0x68:
-                    if (pos + 11 < _data.Length)
+                    if (pos + 10 < _data.Length)
                     {
                         pos++; // 跳过 0x66
-                        pos += 11; // cc + oo*3 + dd*3 + ss*3
+                        pos += 10; // cc(1) + oo(3) + dd(3) + ss(3) = 10 bytes
                     }
                     break;
                 
@@ -794,10 +795,21 @@ public class VgmCommandParser
                     }
                     break;
                     
-                // OKIM6258 写入
+                // OKIM6258 写入: aa dd (aa=寄存器, dd=数据)
                 case 0xB7:
                     if (pos + 1 < _data.Length)
                     {
+                        byte reg = _data[pos];
+                        byte val = _data[pos + 1];
+                        // bit7 of reg = chip index for dual chip
+                        _events.Add(new VgmEvent
+                        {
+                            Tick = tick,
+                            ChipType = CHIP_OKIM6258,
+                            ChipIndex = (byte)((reg >> 7) & 0x01),
+                            Register = (byte)(reg & 0x7F),
+                            Value = val
+                        });
                         pos += 2;
                     }
                     break;

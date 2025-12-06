@@ -29,6 +29,13 @@ public class YM2612Tracker : VgmChipTracker
     private bool _dacStreamActive;                // DAC 流是否活动 (从0x93/0x95命令)
     private uint _dacSampleRate;                  // DAC 采样率 (从 VGM DAC Stream 命令获取)
     
+    // DAC 采样率估算 (从0x2A写入间隔计算)
+    private uint _lastDacTick;                    // 上一次0x2A写入的tick
+    private uint _dacEstimatedRate;               // 估算的采样率
+    private readonly uint[] _dacIntervals = new uint[8];  // 最近8次间隔的滑动窗口
+    private int _dacIntervalIndex;                // 滑动窗口索引
+    private int _dacIntervalCount;                // 有效间隔计数
+    
     // 算法对应的载波算子掩码 (S1=bit0, S2=bit1, S3=bit2, S4=bit3)
     // 算法 0-3: 只有 S4 是载波
     // 算法 4: S2 和 S4 是载波
@@ -97,7 +104,36 @@ public class YM2612Tracker : VgmChipTracker
         {
             _dacData = val;
             // 写入 DAC 数据时，标记 DAC 活动
-            if (_dacEnable) _dacActive = true;
+            if (_dacEnable)
+            {
+                _dacActive = true;
+                
+                // 估算采样率：计算0x2A写入间隔 (VGM基于44100Hz)
+                uint tick = evt.Tick;
+                if (_lastDacTick > 0 && tick > _lastDacTick)
+                {
+                    uint interval = tick - _lastDacTick;
+                    // 过滤异常间隔 (1-100 ticks对应约441Hz-44100Hz)
+                    if (interval >= 1 && interval <= 100)
+                    {
+                        // 滑动窗口存储最近8次间隔
+                        _dacIntervals[_dacIntervalIndex] = interval;
+                        _dacIntervalIndex = (_dacIntervalIndex + 1) % 8;
+                        if (_dacIntervalCount < 8) _dacIntervalCount++;
+                        
+                        // 计算平均间隔
+                        uint sum = 0;
+                        for (int i = 0; i < _dacIntervalCount; i++)
+                            sum += _dacIntervals[i];
+                        uint avgInterval = sum / (uint)_dacIntervalCount;
+                        
+                        // 转换为采样率
+                        if (avgInterval > 0)
+                            _dacEstimatedRate = 44100 / avgInterval;
+                    }
+                }
+                _lastDacTick = tick;
+            }
         }
         // DAC 使能 (0x2B)
         else if (reg == 0x2B)
@@ -144,6 +180,12 @@ public class YM2612Tracker : VgmChipTracker
         _dacActive = false;
         _dacStreamActive = false;
         _dacSampleRate = 0;
+        // 重置采样率估算
+        _lastDacTick = 0;
+        _dacEstimatedRate = 0;
+        Array.Clear(_dacIntervals);
+        _dacIntervalIndex = 0;
+        _dacIntervalCount = 0;
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
@@ -173,11 +215,14 @@ public class YM2612Tracker : VgmChipTracker
                     // Detune始终显示当前DAC数据值
                     state.Channels[5].Detune = _dacData;
                     
-                    if (_dacSampleRate > 0)
+                    // 优先使用DAC流命令的采样率，其次使用估算采样率
+                    uint effectiveRate = _dacSampleRate > 0 ? _dacSampleRate : _dacEstimatedRate;
+                    
+                    if (effectiveRate > 0)
                     {
                         // 采样率比例转音高: ratio = sampleRate / 22050
                         // 每翻倍采样率，音高上升 12 个半音 (以22050Hz为基准 = C4)
-                        double ratio = _dacSampleRate / 22050.0;
+                        double ratio = effectiveRate / 22050.0;
                         state.Channels[5].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);  // C4 = 60
                     }
                     else
@@ -1541,12 +1586,13 @@ public class SAA1099Tracker : VgmChipTracker
 }
 
 // RF5C68/RF5C164 状态追踪器（Sega CD PCM）
+// 参考: VGMPlay rf5c68.c
 public class RF5CTracker : VgmChipTracker
 {
     private readonly int[] _env = new int[8];       // 音量包络
     private readonly int[] _pan = new int[8];       // 声像 (L4:R4)
-    private readonly int[] _fdLow = new int[8];     // 频率增量低位
-    private readonly int[] _fdHigh = new int[8];    // 频率增量高位
+    private readonly int[] _step = new int[8];      // 频率步进 (16位)
+    private readonly int[] _start = new int[8];     // 起始地址
     private readonly bool[] _keyOn = new bool[8];
     private int _currentChannel;
     private bool _chipEnable;
@@ -1556,8 +1602,31 @@ public class RF5CTracker : VgmChipTracker
         byte reg = evt.Register;
         byte val = evt.Value;
         
+        // 通道寄存器 0x00-0x06（需要先选择通道）
+        if (reg <= 0x06)
+        {
+            int ch = _currentChannel;
+            switch (reg)
+            {
+                case 0x00:  // ENV 音量包络
+                    _env[ch] = val;
+                    break;
+                case 0x01:  // PAN 声像 L[7:4] R[3:0]
+                    _pan[ch] = val;
+                    break;
+                case 0x02:  // FDL 频率步进低8位
+                    _step[ch] = (_step[ch] & 0xFF00) | val;
+                    break;
+                case 0x03:  // FDH 频率步进高8位
+                    _step[ch] = (_step[ch] & 0x00FF) | (val << 8);
+                    break;
+                case 0x06:  // ST 起始地址
+                    _start[ch] = val;
+                    break;
+            }
+        }
         // 控制寄存器 0x07
-        if (reg == 0x07)
+        else if (reg == 0x07)
         {
             _chipEnable = (val & 0x80) != 0;
             // 当 CB=1 (bit6=1) 时，低3位是通道选择
@@ -1572,26 +1641,14 @@ public class RF5CTracker : VgmChipTracker
             for (int i = 0; i < 8; i++)
                 _keyOn[i] = (val & (1 << i)) == 0;  // 0=播放, 1=静音
         }
-        // 通道寄存器（需要先选择通道）
-        else if (reg <= 0x06)
-        {
-            int ch = _currentChannel;
-            switch (reg)
-            {
-                case 0x00: _env[ch] = val; break;        // 音量包络
-                case 0x01: _pan[ch] = val; break;        // 声像 L[7:4] R[3:0]
-                case 0x02: _fdLow[ch] = val; break;      // FD低8位
-                case 0x03: _fdHigh[ch] = val & 0x07; break;  // FD高3位
-            }
-        }
     }
     
     public override void Reset()
     {
         Array.Clear(_env);
         Array.Clear(_pan);
-        Array.Clear(_fdLow);
-        Array.Clear(_fdHigh);
+        Array.Clear(_step);
+        Array.Clear(_start);
         Array.Clear(_keyOn);
         _currentChannel = 0;
         _chipEnable = false;
@@ -1606,20 +1663,20 @@ public class RF5CTracker : VgmChipTracker
             state.Channels[ch].KeyOn = active;
             state.Channels[ch].Volume = _env[ch] / 2;
             
-            // 声像: 高4位=L, 低4位=R
-            int panL = (_pan[ch] >> 4) & 0x0F;
-            int panR = _pan[ch] & 0x0F;
+            // 声像: 高4位=R, 低4位=L (参考VGMPlay: lv = (pan & 0x0f), rv = (pan >> 4))
+            int panL = _pan[ch] & 0x0F;
+            int panR = (_pan[ch] >> 4) & 0x0F;
             state.Channels[ch].PanLeft = panL * 8;   // 0-15 -> 0-120
             state.Channels[ch].PanRight = panR * 8;
             
-            // 从频率增量计算音高: FD=0x800 为原始音高
-            int fd = _fdLow[ch] | (_fdHigh[ch] << 8);
-            state.Channels[ch].Detune = fd - 0x800;
+            // 从频率步进计算音高: step=0x800 (2048) 为原始音高
+            int step = _step[ch];
+            state.Channels[ch].Detune = step;
             if (active)
             {
-                if (fd > 0)
+                if (step > 0)
                 {
-                    double ratio = fd / 2048.0;
+                    double ratio = step / 2048.0;
                     state.Channels[ch].Note = VgmVisualizer.PcmRatioToNote(ratio, 60);
                 }
                 else
@@ -3419,34 +3476,46 @@ public class GenericFmTracker : VgmChipTracker
 // 采样率 = clock / divider (divider = 1024, 768, 或 512)
 public class OKIM6258Tracker : VgmChipTracker
 {
+    // 控制命令位定义 (参考VGMPlay源码)
+    private const byte COMMAND_STOP = 0x01;  // bit 0: 停止
+    private const byte COMMAND_PLAY = 0x02;  // bit 1: 播放
+    
     private bool _playing;
-    private int _volume = 127;
-    private int _dataCount;  // 数据写入计数，用于判断活动状态
+    private int _pan = 0x00;       // Pan控制 (bit7=L, bit0=R)
+    private int _dataValue;        // 当前数据值
     
     public override void ProcessEvent(VgmEvent evt)
     {
-        // OKIM6258 命令格式
+        // OKIM6258 端口映射 (参考VGMPlay okim6258_write)
         switch (evt.Register)
         {
-            case 0x00: // 控制寄存器
-                // bit 0: 录音/播放选择
-                // bit 1: 播放启动
-                // bit 2: 录音启动
-                if ((evt.Value & 0x02) != 0)
+            case 0x00: // 控制寄存器 (okim6258_ctrl_w)
+                // 优先检查STOP命令
+                if ((evt.Value & COMMAND_STOP) != 0)
+                {
+                    _playing = false;
+                }
+                else if ((evt.Value & COMMAND_PLAY) != 0)
                 {
                     _playing = true;
-                    _dataCount = 0;
                 }
-                else if ((evt.Value & 0x01) == 0)
+                else
                 {
                     _playing = false;
                 }
                 break;
-            case 0x01: // 数据写入
-                if (_playing && evt.Value != 0)
+                
+            case 0x01: // 数据写入 (okim6258_data_w)
+                _dataValue = evt.Value;
+                // 有数据写入意味着正在播放
+                if (evt.Value != 0x00 && evt.Value != 0x80)
                 {
-                    _dataCount++;
+                    _playing = true;
                 }
+                break;
+                
+            case 0x02: // Pan控制 (okim6258_pan_w)
+                _pan = evt.Value;
                 break;
         }
     }
@@ -3454,8 +3523,8 @@ public class OKIM6258Tracker : VgmChipTracker
     public override void Reset()
     {
         _playing = false;
-        _volume = 127;
-        _dataCount = 0;
+        _pan = 0x00;
+        _dataValue = 0;
     }
     
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
@@ -3463,11 +3532,17 @@ public class OKIM6258Tracker : VgmChipTracker
         if (state.Channels.Length > 0)
         {
             state.Channels[0].KeyOn = _playing;
-            state.Channels[0].Volume = _playing ? _volume : 0;
-            state.Channels[0].PanLeft = _volume / 2;
-            state.Channels[0].PanRight = _volume / 2;
+            state.Channels[0].Volume = _playing ? 127 : 0;
+            
+            // Pan: bit7=L enable, bit0=R enable
+            bool panL = (_pan & 0x80) != 0 || _pan == 0;  // 默认立体声
+            bool panR = (_pan & 0x01) != 0 || _pan == 0;
+            state.Channels[0].PanLeft = panL ? 127 : 0;
+            state.Channels[0].PanRight = panR ? 127 : 0;
+            
             // OKIM6258 是固定采样率的 ADPCM 编解码器，显示固定音高 C4
             state.Channels[0].Note = _playing ? 60 : -1;
+            state.Channels[0].Detune = _dataValue;
         }
     }
 }

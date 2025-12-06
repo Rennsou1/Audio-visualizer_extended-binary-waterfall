@@ -175,6 +175,20 @@ public sealed unsafe class VgmAudioSource : ISampleSource
             // 设置采样率
             LibVgm.VgmPlayer_SetSampleRate(player, (uint)_sampleRate);
             LibVgm.VgmPlayer_Start(player);
+            
+            // 调试：输出libvgm检测到的设备信息
+            uint deviceCount = LibVgm.VgmPlayer_GetDeviceCount(player);
+            Logger.Debug($"[VgmAudioSource] libvgm检测到 {deviceCount} 个设备");
+            for (uint i = 0; i < deviceCount; i++)
+            {
+                if (LibVgm.VgmPlayer_GetDeviceInfo(player, i, out var devInfo) == 0)
+                {
+                    string name = devInfo.Name != IntPtr.Zero 
+                        ? System.Runtime.InteropServices.Marshal.PtrToStringAnsi(devInfo.Name) ?? "Unknown"
+                        : "Unknown";
+                    Logger.Debug($"  设备{i}: {name} (Type=0x{devInfo.Type:X}, Clock={devInfo.Clock})");
+                }
+            }
 
             // 计算需要渲染的总采样数
             long totalSamples = (long)(Duration * _sampleRate);

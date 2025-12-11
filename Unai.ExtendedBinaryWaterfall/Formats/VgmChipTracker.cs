@@ -2359,6 +2359,131 @@ public class K054539Tracker : VgmChipTracker
         }
     }
 }
+public class K054539Tracker2 : VgmChipTracker
+{
+    // 每通道 0x20 字节寄存器块：0x00-0x02 = pitch, 0x03 = volume, 0x04 = extra volume, 0x05 = pan
+    private readonly int[] _pitch = new int[8];
+    private readonly int[] _volBase = new int[8];
+    private readonly int[] _volExtra = new int[8];
+    private readonly int[] _panReg = new int[8];
+    private readonly bool[] _keyOn = new bool[8];
+    private readonly bool[] _forcedActive = new bool[8];
+
+    public override void ProcessEvent(VgmEvent evt)
+    {
+        // VGM 0xD3: pp aa dd -> offset = (pp << 8) | aa  (pp 在解析时已经去掉 bit7)
+        int offset = (evt.Port << 8) | evt.Register;
+        byte data = evt.Value;
+
+        if (offset < 0x100)
+        {
+            int ch = offset >> 5;   // 0x20 bytes per channel
+            int reg = offset & 0x1F;
+            if ((uint)ch >= 8)
+                return;
+
+            switch (reg)
+            {
+                case 0x00: _pitch[ch] = (_pitch[ch] & 0xFFFF00) | data; break;        // pitch low
+                case 0x01: _pitch[ch] = (_pitch[ch] & 0xFF00FF) | (data << 8); break; // pitch mid
+                case 0x02: _pitch[ch] = (_pitch[ch] & 0x00FFFF) | (data << 16); break;// pitch high
+                case 0x03: _volBase[ch] = data; break;
+                case 0x04: _volExtra[ch] = data; break;
+                case 0x05: _panReg[ch] = data; break;
+            }
+        }
+        else if (offset == 0x214) // Key On bits
+        {
+            for (int ch = 0; ch < 8; ch++)
+            {
+                if ((data & (1 << ch)) != 0)
+                {
+                    _keyOn[ch] = true;
+                    _forcedActive[ch] = true;
+                }
+            }
+        }
+        else if (offset == 0x215) // Key Off bits
+        {
+            for (int ch = 0; ch < 8; ch++)
+            {
+                if ((data & (1 << ch)) != 0)
+                {
+                    _keyOn[ch] = false;
+                    // 保留 forcedActive，直到 0x22c 或新的 KeyOn 再调整
+                }
+            }
+        }
+        else if (offset == 0x22c) // Channel active mask
+        {
+            for (int ch = 0; ch < 8; ch++)
+            {
+                bool active = (data & (1 << ch)) != 0;
+                _forcedActive[ch] = active;
+                if (!active)
+                    _keyOn[ch] = false;
+            }
+        }
+    }
+
+    public override void Reset()
+    {
+        Array.Clear(_pitch);
+        Array.Clear(_volBase);
+        Array.Clear(_volExtra);
+        Array.Clear(_panReg);
+        Array.Clear(_keyOn);
+        Array.Clear(_forcedActive);
+    }
+
+    public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
+    {
+        for (int ch = 0; ch < 8 && ch < state.Channels.Length; ch++)
+        {
+            var dst = state.Channels[ch];
+
+            bool isActive = _keyOn[ch] || _forcedActive[ch] || _pitch[ch] != 0;
+            dst.KeyOn = isActive;
+
+            // volume: 0 最大, 255 最小 -> 映射到 0..127
+            int volReg = _volBase[ch] + _volExtra[ch];
+            volReg = Math.Clamp(volReg, 0, 255);
+            int vol = 127 - (volReg * 127 / 255);
+            if (!isActive)
+                vol = 0;
+            dst.Volume = Math.Clamp(vol, 0, 127);
+
+            // pan：支持 0x81-0x8F 和 0x11-0x1F，其它视为居中（参考 libvgm）
+            int panField = _panReg[ch];
+            int panNorm;
+            if (panField >= 0x81 && panField <= 0x8F)
+                panNorm = panField - 0x81;
+            else if (panField >= 0x11 && panField <= 0x1F)
+                panNorm = panField - 0x11;
+            else
+                panNorm = 0x18 - 0x11; // center (7)
+
+            panNorm = Math.Clamp(panNorm, 0, 14);
+            int panLeft = panNorm * 127 / 14;
+            int panRight = (14 - panNorm) * 127 / 14;
+            dst.PanLeft = panLeft;
+            dst.PanRight = panRight;
+
+            // pitch: 24bit step / 65536 ~= 播放倍率，使用公共 PCM 转 MIDI 工具
+            if (isActive && _pitch[ch] > 0)
+            {
+                double ratio = _pitch[ch] / 65536.0;
+                dst.Note = VgmVisualizer.PcmRatioToNote(ratio, 60); // 60 = C4 作为基准
+                dst.Detune = 0;
+            }
+            else
+            {
+                dst.Note = -1;
+                dst.Detune = 0;
+            }
+        }
+    }
+}
 
 // MultiPCM (YMW258-F) 状态追踪器（Sega/Yamaha）
 // VGM 命令 0xB5: offset=0 写数据, offset=1 选通道, offset=2 选寄存器
@@ -4034,58 +4159,61 @@ public class GenericFmTracker : VgmChipTracker
 }
 
 // YMF271 (OPX) 追踪器
-// 12组FM通道，每组最多4个slot用于FM算法
-// VGM命令0xD1格式: pp aa dd (Port, Address, Data)
+// 12 组 × 4 bank = 48 个 slot
+// VGM 命令 0xD1: pp aa dd (Port, Address, Data)
 // Port 0x01/0x03/0x05/0x07 = FM bank 0/1/2/3
-// Port 0x09 = PCM设置
-// Address低4位通过fm_tab映射到group号(0-11)，高4位是寄存器号(0-14)
+// Port 0x09 = PCM 设置
+// Address 低 4 位通过 fm_tab 映射到 group(0-11)，高 4 位是寄存器号(0-14)
 public class YMF271Tracker : VgmChipTracker
 {
-    // 地址到组号的映射表 (来自libvgm)
+    // 地址到组号的映射表（来自 libvgm）
     private static readonly int[] FmTab = { 0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1 };
-    
-    // PCM slot映射表 (来自libvgm): 地址到slot号的映射
-    // 每4个slot共用一个PCM地址，映射到12个PCM通道
+
+    // PCM slot 映射表（来自 libvgm）：地址到 slot 号的映射
+    // 每个 slot 共享一个 PCM 地址，映射到 12 个 PCM 通道
     private static readonly int[] PcmTab = { 0, 4, 8, -1, 12, 16, 20, -1, 24, 28, 32, -1, 36, 40, 44, -1 };
-    
-    // 每组的Slot状态 (4个bank x 12组 = 48个slot)
+
+    // 每组的 Slot 状态 (4 个 bank × 12 组 = 48 个 slot)
     private readonly SlotState[] _slots = new SlotState[48];
-    
-    // 每组的同步模式
+
+    // 每组的同步模式（与 libvgm 的 group->sync 对应）
     private readonly int[] _groupSync = new int[12];
-    
+
     private struct SlotState
     {
         public bool Active;      // 是否正在发声
-        public int TotalLevel;   // 音量 (0=最大, 127=最小)
-        public int Fns;          // 频率号低8位
-        public int FnsHi;        // 频率号高4位 + Block
+        public int TotalLevel;   // 音量 (0=最大, 127=静音)
+        public int Fns;          // 频率号低 8 位
+        public int FnsHi;        // 频率号高 4 位 + Block
         public int Block;        // 八度
         public int Ch0Level;     // 左前声像 (0-15)
         public int Ch1Level;     // 右前声像 (0-15)
         public int Ch2Level;     // 左后声像 (0-15)
         public int Ch3Level;     // 右后声像 (0-15)
-        public int Algorithm;    // FM算法
+        public int Algorithm;    // FM 算法
         public int Waveform;     // 波形类型 (0-6=FM, 7=PCM)
-        public bool IsPcm;       // 是否为PCM模式
+        public bool IsPcm;       // 是否 PCM 模式
+
+        // PCM 属性寄存器 0x9xH 中的值（用于外部 keycode）
+        // Bits 3-4: Src NOTE (2bit) -> SrcNote (0-3)
+        // Bits 5-7: Src B    (3bit) -> SrcBlock(0-7)
+        public int SrcNote;
+        public int SrcBlock;
     }
-    
+
     public YMF271Tracker()
     {
         for (int i = 0; i < _slots.Length; i++)
-        {
             _slots[i] = new SlotState();
-        }
     }
-    
+
     public override void ProcessEvent(VgmEvent evt)
     {
-        // Port决定写入类型
+        // Port 决定写入类型
         int port = evt.Port;
         int address = evt.Register;
         int data = evt.Value;
-        
-        // 根据Port处理不同类型的写入
+
         switch (port)
         {
             case 0x01: // FM Bank 0
@@ -4100,114 +4228,117 @@ public class YMF271Tracker : VgmChipTracker
             case 0x07: // FM Bank 3
                 ProcessFmWrite(3, address, data);
                 break;
-            case 0x09: // PCM设置
+            case 0x09: // PCM 设置
                 ProcessPcmWrite(address, data);
                 break;
-            case 0x0D: // Timer/Group设置
+            case 0x0D: // Timer/Group 设置
                 ProcessTimerWrite(address, data);
                 break;
         }
     }
-    
-    // 处理PCM寄存器写入
+
+    // 处理 PCM 寄存器写入
     private void ProcessPcmWrite(int address, int data)
     {
-        // 通过pcm_tab将地址低4位映射到slot号
+        // 通过 PcmTab 将地址低 4 位映射到 slot 号
         int slotNum = PcmTab[address & 0x0F];
-        if (slotNum == -1 || slotNum >= _slots.Length) return;
-        
+        if (slotNum == -1 || slotNum >= _slots.Length)
+            return;
+
         ref SlotState slot = ref _slots[slotNum];
-        
-        // 高4位是寄存器号
+
+        // 高 4 位是寄存器号
         int reg = (address >> 4) & 0x0F;
-        
-        // PCM模式的slot，waveform设置为7
+
+        // PCM 模式的 slot，waveform 固定为 7
         slot.IsPcm = true;
         slot.Waveform = 7;
-        
-        // PCM寄存器大部分是地址设置，对可视化不重要
-        // 但寄存器0x09包含采样率信息
+
+        // 寄存器 0x9xH: PCM attribute，包含 SrcB / SrcNOTE / FS / Bits
         if (reg == 0x09)
         {
-            // fs = data & 0x3 (采样率分频)
-            // bits = (data & 0x4) ? 12 : 8 (位深)
-            // 这些信息对可视化不重要，但可以用于调试
+            // fs = data & 0x3       (采样率档位，暂时不用)
+            // bits = (data & 0x4)   (8/12 bit，暂时不用)
+            slot.SrcNote  = (data >> 3) & 0x03; // SrcNOTE (2bit)
+            slot.SrcBlock = (data >> 5) & 0x07; // SrcB    (3bit)
         }
     }
-    
-    // 处理FM寄存器写入
+
+    // 处理 FM 寄存器写入
     private void ProcessFmWrite(int bank, int address, int data)
     {
-        // 通过fm_tab将地址低4位映射到组号
+        // 通过 FmTab 将地址低 4 位映射到 group 号
         int groupNum = FmTab[address & 0x0F];
-        if (groupNum == -1) return;
-        
-        // 高4位是寄存器号
+        if (groupNum == -1)
+            return;
+
+        // 高 4 位是寄存器号
         int reg = (address >> 4) & 0x0F;
-        
-        // 计算slot索引 (bank * 12 + groupNum)
+
+        // 计算 slot 索引 (bank * 12 + groupNum)
         int slotIdx = bank * 12 + groupNum;
-        if (slotIdx >= _slots.Length) return;
-        
+        if (slotIdx >= _slots.Length)
+            return;
+
         ref SlotState slot = ref _slots[slotIdx];
-        
-        // 检查是否需要同步写入（根据group的sync模式）
+
+        // 同步模式：部分寄存器在 4/3/2 slot 模式下需要同步写入
         int syncMode = _groupSync[groupNum];
         bool isSyncReg = reg == 0 || reg == 9 || reg == 10 || reg == 12 || reg == 13 || reg == 14;
-        
+
         if (isSyncReg && IsSyncSlot(bank, syncMode))
         {
-            // 同步写入所有相关slot
+            // 同步写入所有相关 slot
             WriteSyncedSlots(groupNum, bank, syncMode, reg, data);
         }
         else
         {
-            // 普通写入单个slot
+            // 普通写入单个 slot
             WriteSlotRegister(ref slot, reg, data);
         }
     }
-    
-    // 检查当前bank是否是同步触发slot
+
+    // 当前 bank 是否为同步触发 slot
     private bool IsSyncSlot(int bank, int syncMode)
     {
         return syncMode switch
         {
-            0 => bank == 0,              // 4-slot模式: bank 0触发
-            1 => bank == 0 || bank == 1, // 2x2-slot模式: bank 0或1触发
-            2 => bank == 0,              // 3+1-slot模式: bank 0触发
+            0 => bank == 0,              // 4-slot 模式: bank0 触发
+            1 => bank == 0 || bank == 1, // 2x2-slot 模式: bank0/1 触发
+            2 => bank == 0,              // 3+1-slot 模式: bank0 触发
             _ => false
         };
     }
-    
-    // 同步写入所有相关slot
+
+    // 同步写入所有相关 slot
     private void WriteSyncedSlots(int groupNum, int bank, int syncMode, int reg, int data)
     {
         switch (syncMode)
         {
-            case 0: // 4-slot模式: 写入所有4个slot
+            case 0: // 4-slot 模式: 写入所有 4 个 slot
                 for (int b = 0; b < 4; b++)
                 {
                     int idx = b * 12 + groupNum;
                     WriteSlotRegister(ref _slots[idx], reg, data);
                 }
                 break;
-                
-            case 1: // 2x2-slot模式
+
+            case 1: // 2x2-slot 模式
                 if (bank == 0)
                 {
-                    // Bank 0触发: slot 0和2
+                    // Bank 0 触发: slot 0 和 2
                     WriteSlotRegister(ref _slots[0 * 12 + groupNum], reg, data);
                     WriteSlotRegister(ref _slots[2 * 12 + groupNum], reg, data);
                 }
                 else
                 {
-                    // Bank 1触发: slot 1和3
+                    // Bank 1 触发: slot 1 和 3
                     WriteSlotRegister(ref _slots[1 * 12 + groupNum], reg, data);
                     WriteSlotRegister(ref _slots[3 * 12 + groupNum], reg, data);
                 }
                 break;
-                
-            case 2: // 3+1-slot模式: 写入slot 0,1,2
+
+            case 2: // 3+1-slot 模式: 写入 slot 0,1,2
                 for (int b = 0; b < 3; b++)
                 {
                     int idx = b * 12 + groupNum;
@@ -4216,93 +4347,174 @@ public class YMF271Tracker : VgmChipTracker
                 break;
         }
     }
-    
-    // 写入单个slot的寄存器
+
+    // 写入单个 slot 的寄存器
     private void WriteSlotRegister(ref SlotState slot, int reg, int data)
     {
         switch (reg)
         {
-            case 0x00: // Key On/Off (bit 0)
+            case 0x00: // Key On (bit 0)
+                // YMF271: 向 0x00 写入 bit0=1 触发 Key On，清零不会显式 Key Off。
+                // 真实芯片由包络结束时自动停止发声，这里只在 bit0=1 时标记为 Active，
+                // 避免把其它写入误判为 Key Off。
                 if ((data & 0x01) != 0)
-                {
-                    // Key On
                     slot.Active = true;
-                }
-                else
-                {
-                    // Key Off (进入Release状态)
-                    slot.Active = false;
-                }
                 break;
-                
+
             case 0x04: // Total Level (0=最大, 127=静音)
                 slot.TotalLevel = data & 0x7F;
                 break;
-                
-            case 0x09: // 频率号低8位 + Block
+
+            case 0x09: // 频率号低 8 位 + Block
                 slot.Fns = (slot.FnsHi << 8 & 0x0F00) | data;
                 slot.Block = (slot.FnsHi >> 4) & 0x0F;
                 break;
-                
-            case 0x0A: // 频率号高4位
+
+            case 0x0A: // 频率号高 4 位
                 slot.FnsHi = data;
                 break;
-                
+
             case 0x0B: // Waveform + Feedback + AccOn
                 slot.Waveform = data & 0x07;
                 break;
-                
+
             case 0x0C: // Algorithm
                 slot.Algorithm = data & 0x0F;
                 break;
-                
+
             case 0x0D: // 左前/右前声像 (ch0/ch1)
                 slot.Ch0Level = (data >> 4) & 0x0F;
                 slot.Ch1Level = data & 0x0F;
                 break;
-                
+
             case 0x0E: // 左后/右后声像 (ch2/ch3)
                 slot.Ch2Level = (data >> 4) & 0x0F;
                 slot.Ch3Level = data & 0x0F;
                 break;
         }
     }
-    
-    // 处理Timer/Group设置写入
+
+    // 处理 Timer/Group 设置写入
     private void ProcessTimerWrite(int address, int data)
     {
-        // 地址0x00-0x0F用于设置组的sync模式
+        // 地址 0x00–0x0F: 设置组的 sync 模式
         if ((address & 0xF0) == 0)
         {
             int groupNum = FmTab[address & 0x0F];
             if (groupNum != -1 && groupNum < _groupSync.Length)
-            {
                 _groupSync[groupNum] = data & 0x03;
-            }
         }
     }
-    
+
     public override void Reset()
     {
         for (int i = 0; i < _slots.Length; i++)
-        {
             _slots[i] = new SlotState();
-        }
         Array.Clear(_groupSync);
     }
-    
+
+    // 计算 PCM 外部 keycode（来自 libvgm 的 get_external_keycode）
+    private int GetExternalKeycode(int block, int fns, int srcBlock, int srcNote)
+    {
+        int n43;
+        if (fns < 0x100)
+            n43 = 0;      // N4=0, N3=0
+        else if (fns < 0x300)
+            n43 = 1;      // N4=0, N3=1
+        else if (fns < 0x500)
+            n43 = 2;      // N4=1, N3=0
+        else
+            n43 = 3;      // N4=1, N3=1
+
+        int srcKeycode   = srcBlock * 4 + srcNote;   // 4 * SrcB + SrcNOTE
+        int blockKeycode = (block & 7) * 4 + n43;    // 4 * Block + N4N3
+
+        int keycode = srcKeycode + blockKeycode;
+        if (keycode > 31) keycode = 31;
+        if (keycode < 0)  keycode = 0;
+        return keycode;
+    }
+
     public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
     {
-        // YMF271显示12个组通道
-        // 每个组合并4个slot的状态，标签根据模式显示：
-        // - FM模式：标签"FM X"
-        // - PCM模式（任意slot的waveform==7）：标签"PCM X"
-        
+        if (state.Channels == null || state.Channels.Length == 0)
+            return;
+
+        // 48 行及以上：使用详细 slot 视图（group × bank 展开）
+        if (state.Channels.Length >= 48)
+        {
+            for (int group = 0; group < 12; group++)
+            {
+                for (int bank = 0; bank < 4; bank++)
+                {
+                    int slotIdx = bank * 12 + group; // 0..47
+                    ref readonly SlotState slot = ref _slots[slotIdx];
+
+                    int chIndex = group * 4 + bank;
+                    if (chIndex >= state.Channels.Length)
+                        continue;
+
+                    ref var ch = ref state.Channels[chIndex];
+
+                    bool isPcm = slot.Waveform == 7 || slot.IsPcm;
+                    char bankLetter = (char)('A' + bank); // A/B/C/D
+
+                    // 标签：FM = F1A/F1B..., PCM = P1A/P1B...
+                    ch.Label = isPcm
+                        ? $"P{group + 1}{bankLetter}"   // PCM slot
+                        : $"F{group + 1}{bankLetter}";  // FM slot
+
+                    bool active = slot.Active;
+                    ch.KeyOn = active;
+
+                    int vol = active ? (127 - slot.TotalLevel) : 0;
+                    if (vol < 0) vol = 0;
+                    ch.Volume = vol;
+
+                    // 声像：0–15 映射到 0–127
+                    int panL = slot.Ch0Level * 127 / 15;
+                    int panR = slot.Ch1Level * 127 / 15;
+                    if (slot.Ch0Level == 0 && slot.Ch1Level == 0 && active)
+                    {
+                        // 未设置声像时，默认居中
+                        panL = panR = vol / 2;
+                    }
+                    ch.PanLeft = panL;
+                    ch.PanRight = panR;
+
+                    // 计算音高：FM 用原来的公式，PCM 用 External keycode 近似
+                    if (active)
+                    {
+                        if (isPcm)
+                        {
+                            int keycode = GetExternalKeycode(slot.Block, slot.Fns & 0x7FF, slot.SrcBlock, slot.SrcNote);
+                            // 简单映射：每个 keycode ~ 一个半音，以 C2 为基准
+                            ch.Note = Math.Clamp(36 + keycode, 0, 127);
+                        }
+                        else if (slot.Fns > 0)
+                        {
+                            ch.Note = CalculateNote(slot.Fns, slot.Block);
+                        }
+                        else
+                        {
+                            ch.Note = -1;
+                        }
+                    }
+                    else
+                    {
+                        ch.Note = -1;
+                    }
+                }
+            }
+
+            return;
+        }
+
+        // 兼容旧布局：通道数还是 12 的情况下，退回原来的“按组聚合 12 行”
         for (int group = 0; group < 12 && group < state.Channels.Length; group++)
         {
             ref var ch = ref state.Channels[group];
-            
-            // 检查该组是否有任意slot使用PCM模式
+
             bool hasPcm = false;
             bool anyActive = false;
             int maxVol = 0;
@@ -4310,19 +4522,15 @@ public class YMF271Tracker : VgmChipTracker
             int bestBlock = 0;
             int ch0 = 0, ch1 = 0;
             int activeSlotCount = 0;
-            
+
             for (int bank = 0; bank < 4; bank++)
             {
                 int slotIdx = bank * 12 + group;
                 ref readonly SlotState slot = ref _slots[slotIdx];
-                
-                // 检测PCM模式
+
                 if (slot.Waveform == 7 || slot.IsPcm)
-                {
                     hasPcm = true;
-                }
-                
-                // 统计活跃状态
+
                 if (slot.Active)
                 {
                     anyActive = true;
@@ -4338,22 +4546,21 @@ public class YMF271Tracker : VgmChipTracker
                     }
                 }
             }
-            
-            // 设置通道标签：PCM模式显示"PCM X"，FM模式显示"FM X"
-            // 如果有多个活跃slot，在标签后显示数量
+
             if (hasPcm)
             {
-                ch.Label = activeSlotCount > 1 ? $"PCM{group + 1}×{activeSlotCount}" : $"PCM{group + 1}";
+                ch.Label = activeSlotCount > 1
+                    ? $"PCM{group + 1}x{activeSlotCount}"
+                    : $"PCM{group + 1}";
             }
             else
             {
                 ch.Label = $"FM{group + 1}";
             }
-            
+
             ch.KeyOn = anyActive;
             ch.Volume = maxVol;
-            
-            // 声像: 0-15映射到0-127
+
             int panL = ch0 * 127 / 15;
             int panR = ch1 * 127 / 15;
             if (ch0 == 0 && ch1 == 0 && anyActive)
@@ -4362,8 +4569,7 @@ public class YMF271Tracker : VgmChipTracker
             }
             ch.PanLeft = panL;
             ch.PanRight = panR;
-            
-            // 计算音符
+
             if (anyActive && bestFns > 0)
             {
                 ch.Note = CalculateNote(bestFns, bestBlock);
@@ -4374,26 +4580,22 @@ public class YMF271Tracker : VgmChipTracker
             }
         }
     }
-    
-    // 根据FNS和Block计算MIDI音符号
+
+    // 根据 FNS 和 Block 计算 FM 模式下的 MIDI 音符号
     private int CalculateNote(int fns, int block)
     {
-        // YMF271频率公式: F = (FNS * 2^block) * Fs / 2^21
-        // 其中Fs是芯片采样率
+        // YMF271 频率公式: F = (FNS * 2^block) * Fs / 2^21
         // 这里简化为相对音高计算
-        if (fns <= 0) return -1;
-        
-        // FNS范围大约对应一个八度内的音符
-        // Block范围0-15表示不同八度
-        // 基础八度设为4 (中央C所在八度)
-        int octave = block;
-        
-        // FNS到音符的近似映射 (12平均律)
-        // FNS范围约0-2047，对应一个八度12个半音
+        if (fns <= 0)
+            return -1;
+
+        int octave = block; // 近似：Block 直接当八度
+
+        // FNS -> 半音的近似映射（12 平均律）
         double semitone = Math.Log2((double)(fns | 2048) / 1024.0) * 12.0;
         int note = (int)(octave * 12 + semitone + 0.5);
-        
-        // 限制在有效MIDI范围
+
+        // 限制在有效 MIDI 范围
         return Math.Clamp(note, 0, 127);
     }
 }

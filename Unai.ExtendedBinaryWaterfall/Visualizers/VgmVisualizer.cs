@@ -398,7 +398,7 @@ public class VgmVisualizer : IDisposable
                 "C140" => new C140Tracker(),
                 "C352" => new C352Tracker(),
                 "K053260" => new K053260Tracker(),
-                "K054539" => new K054539Tracker(),
+                  "K054539" => new K054539Tracker2(),
                 "MultiPCM" => new MultiPCMTracker(),
                 "SCSP" => new ScspTracker(),
                 "WonderSwan" => new WSwanTracker(),
@@ -874,9 +874,15 @@ public class VgmVisualizer : IDisposable
     };
 
     // 获取通道标签
-    private static string GetChannelLabel(string chipName, int channelIndex)
-    {
-        return chipName switch
+        private static string GetChannelLabel(string chipName, int channelIndex)
+        {
+            // 归一化芯片名：去掉 “#2” 等后缀，保证双芯片用同一套命名规则
+            string baseName = chipName ?? string.Empty;
+            int hashIdx = baseName.IndexOf('#');
+            if (hashIdx > 0)
+                baseName = baseName[..hashIdx].TrimEnd();
+
+            return baseName switch
         {
             // YM2612: 新布局 - FM1-3, OP2-4(Extended), FM4-5, DAC
             "YM2612" => channelIndex switch

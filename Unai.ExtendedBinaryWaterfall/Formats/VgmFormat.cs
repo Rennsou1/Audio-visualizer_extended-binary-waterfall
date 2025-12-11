@@ -422,7 +422,7 @@ public static class VgmFormat
         AddChip("Y8950", header.Y8950Clock, 9);
         AddChip("YMF262", header.Ymf262Clock, 18);
         AddChip("YMF278B", header.Ymf278bClock, 24);
-        AddChip("YMF271", header.Ymf271Clock, 12);
+        AddChip("YMF271", header.Ymf271Clock, 48);
         AddChip("YMZ280B", header.Ymz280bClock, 8);
         AddChip("RF5C164", header.Rf5c164Clock, 8);
         AddChip("PWM", header.PwmClock, 2);

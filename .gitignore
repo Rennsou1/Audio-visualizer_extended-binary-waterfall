@@ -2,7 +2,6 @@
 [oO]bj/
 *.bup
 *.mkv
-.vscode/**
 *.glade~
 *.flac
 *.mp3
@@ -17,8 +16,7 @@ README.MD
 libvgm-src
 libvgm-build
 libvgm-wrapper
-.windsurf
-.vscode
 *.vgm
 *.vgz
 docs
+.*

@@ -1557,6 +1557,133 @@ public class OplTracker : VgmChipTracker
     }
 }
 
+// OPL3 (YMF262) 状态追踪器 - 18通道，双端口
+// 端口0: 通道0-8, 端口1: 通道9-17
+public class Opl3Tracker : VgmChipTracker
+{
+    // 18通道状态
+    private readonly int[] _fnum = new int[18];
+    private readonly int[] _block = new int[18];
+    private readonly int[] _tl = new int[18];       // Carrier TL (输出电平)
+    private readonly bool[] _keyOn = new bool[18];
+    private readonly int[] _panLR = new int[18];    // OPL3 立体声 (C0-C8 寄存器 bit 4-5)
+    
+    // 4-OP 模式标志 (寄存器 0x104)
+    private int _4opMode;
+    
+    public override void ProcessEvent(VgmEvent evt)
+    {
+        byte reg = evt.Register;
+        byte val = evt.Value;
+        // 根据端口计算通道偏移：端口0=0, 端口1=9
+        int portOffset = evt.Port == 1 ? 9 : 0;
+        
+        // F-Number 低位 (0xA0-0xA8)
+        if (reg >= 0xA0 && reg <= 0xA8)
+        {
+            int ch = (reg - 0xA0) + portOffset;
+            if (ch < 18)
+                _fnum[ch] = (_fnum[ch] & 0x300) | val;
+        }
+        // KeyOn + Block + F-Number 高位 (0xB0-0xB8)
+        else if (reg >= 0xB0 && reg <= 0xB8)
+        {
+            int ch = (reg - 0xB0) + portOffset;
+            if (ch < 18)
+            {
+                _fnum[ch] = (_fnum[ch] & 0x0FF) | ((val & 0x03) << 8);
+                _block[ch] = (val >> 2) & 0x07;
+                _keyOn[ch] = (val & 0x20) != 0;
+            }
+        }
+        // TL (总电平，每通道2个算子，取 Carrier 的 TL)
+        // 寄存器 0x40-0x55 (每端口18个算子，布局: 0-2,8-10,16-18 对应通道0-2,3-5,6-8的 OP1)
+        // 寄存器 0x43-0x45,0x4B-0x4D,0x53-0x55 对应 OP2 (Carrier)
+        else if (reg >= 0x40 && reg <= 0x55)
+        {
+            int idx = reg - 0x40;
+            // OPL 算子布局: 0-2 = CH0-2 OP1, 3-5 = CH0-2 OP2, 8-10 = CH3-5 OP1, etc.
+            int group = idx / 8;        // 0, 1, 2 (每组3个通道)
+            int inGroup = idx % 8;      // 0-7
+            if (inGroup < 6)            // 只处理有效算子
+            {
+                int opIdx = inGroup % 3;     // 0-2 通道内索引
+                bool isCarrier = inGroup >= 3; // 3-5 是 Carrier (OP2)
+                int baseCh = group * 3 + opIdx + portOffset;
+                if (isCarrier && baseCh < 18)
+                    _tl[baseCh] = val & 0x3F;
+            }
+        }
+        // 立体声/反馈/连接 (0xC0-0xC8)
+        else if (reg >= 0xC0 && reg <= 0xC8)
+        {
+            int ch = (reg - 0xC0) + portOffset;
+            if (ch < 18)
+            {
+                // bit 4 = Left, bit 5 = Right
+                _panLR[ch] = (val >> 4) & 0x03;
+            }
+        }
+        // 4-OP 模式控制 (端口1的寄存器 0x04)
+        else if (evt.Port == 1 && reg == 0x04)
+        {
+            _4opMode = val & 0x3F;
+        }
+    }
+    
+    public override void Reset()
+    {
+        Array.Clear(_fnum);
+        Array.Clear(_block);
+        Array.Clear(_tl);
+        Array.Clear(_keyOn);
+        Array.Clear(_panLR);
+        _4opMode = 0;
+    }
+    
+    public override void UpdateVisualizerState(VgmVisualizer.ChipState state)
+    {
+        for (int ch = 0; ch < 18 && ch < state.Channels.Length; ch++)
+        {
+            int vol = Math.Max(0, 127 - _tl[ch] * 2);
+            state.Channels[ch].KeyOn = _keyOn[ch];
+            state.Channels[ch].Volume = vol;
+            
+            // OPL3 立体声: panLR bit0=L, bit1=R
+            int panLR = _panLR[ch];
+            bool hasLeft = (panLR & 0x01) != 0;
+            bool hasRight = (panLR & 0x02) != 0;
+            // 如果未设置任何输出，默认为单声道（两边都输出）
+            if (panLR == 0)
+            {
+                state.Channels[ch].PanLeft = vol;
+                state.Channels[ch].PanRight = vol;
+            }
+            else
+            {
+                state.Channels[ch].PanLeft = hasLeft ? vol : 0;
+                state.Channels[ch].PanRight = hasRight ? vol : 0;
+            }
+            
+            if (_keyOn[ch] && _fnum[ch] > 0)
+            {
+                // OPL3: freq = fnum * clock / (72 * 2^(20-block))
+                // OPL3 使用 14.31818 MHz / 288 = 49716 Hz 采样率
+                double clock = Clock > 0 ? Clock : 14318180.0;
+                double freq = _fnum[ch] * clock / (72.0 * Math.Pow(2, 20 - _block[ch]) * 4.0);
+                var (note, cent) = VgmVisualizer.FrequencyToNoteAndCent(freq);
+                state.Channels[ch].Note = note;
+                state.Channels[ch].Detune = cent;
+            }
+            else
+            {
+                state.Channels[ch].Note = -1;
+                state.Channels[ch].Detune = 0;
+            }
+        }
+    }
+}
+
 // QSound 状态追踪器
 public class QSoundTracker : VgmChipTracker
 {

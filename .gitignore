@@ -20,3 +20,4 @@ libvgm-wrapper
 *.vgz
 docs
 .*
+*.txt

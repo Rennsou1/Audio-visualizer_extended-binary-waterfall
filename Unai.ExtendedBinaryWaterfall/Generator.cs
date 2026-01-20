@@ -196,6 +196,56 @@ public class Generator
     private readonly SKPaint _pianoRollGridPaint = new() { IsAntialias = false, Style = SKPaintStyle.Stroke };
     private readonly SKPaint _pianoRollNotePaint = new() { IsAntialias = true, Style = SKPaintStyle.Fill };
     
+    // MultiPCM Piano Roll 复用画笔
+    private readonly SKPaint _multiPcmBlackKeyPaint = new() { IsAntialias = false, Style = SKPaintStyle.Fill };
+    private readonly SKPaint _multiPcmGridPaint = new() { IsAntialias = false, Style = SKPaintStyle.Stroke };
+    private readonly SKPaint _multiPcmHistoryPaint = new() { IsAntialias = false, Style = SKPaintStyle.Fill };
+    private readonly SKPaint _multiPcmTextPaint = new() { IsAntialias = true };
+    private readonly SKPaint _multiPcmTimeLinePaint = new() { IsAntialias = false, Style = SKPaintStyle.Stroke };
+    private readonly SKPaint _multiPcmPoolPaint = new() { IsAntialias = false, Style = SKPaintStyle.Fill };
+    
+    // DrawChipView / DrawPianoBlocks 复用路径
+    private readonly SKPath _chipViewWhiteKeyPath = new();
+    private readonly SKPath _chipViewBlackKeyPath = new();
+    private readonly SKPath _drumIndicatorHitPath = new();
+    
+    // DrawPianoRoll 渐变缓存
+    private SKShader _pianoRollTopShader = null;
+    private SKShader _pianoRollBottomShader = null;
+    private float _cachedPianoRollFadeHeight = -1f;
+    private SKRect _cachedPianoRollRegion;
+    
+    // DrawPianoRoll 音符分组路径（按通道）
+    private readonly SKPath[] _notePathsByChannel = new SKPath[16];
+    private readonly SKPath _activeNotePath = new();
+    
+    // GPU 渲染模式支持
+    // 渲染回调委托：允许 GUI 直接提供 GPU Canvas 进行渲染
+    public delegate void RenderToCanvasDelegate(SKCanvas canvas, int width, int height, double currentTimeMs);
+    public event RenderToCanvasDelegate OnRenderFrame;
+    
+    // GPU 渲染模式标志
+    private bool _gpuRenderingEnabled = false;
+    private SKCanvas _externalCanvas = null;  // 外部提供的 GPU Canvas
+    
+    // 启用 GPU 渲染模式 - 将直接渲染到外部提供的 Canvas
+    public void EnableGpuRendering(bool enable = true)
+    {
+        _gpuRenderingEnabled = enable;
+    }
+    
+    // 设置外部 Canvas (由 GPU Surface 提供)
+    public void SetExternalCanvas(SKCanvas canvas)
+    {
+        _externalCanvas = canvas;
+    }
+    
+    // 获取当前渲染画布 (GPU 或 CPU)
+    private SKCanvas GetRenderCanvas()
+    {
+        return _gpuRenderingEnabled && _externalCanvas != null ? _externalCanvas : _frameCanvas;
+    }
+    
     // SIMD alpha 向量缓存（避免每帧创建）
     private static readonly Vector<byte> _simdAlphaMask;
     private static readonly Vector<byte> _simdPosMask;
@@ -610,6 +660,46 @@ public class Generator
 
     public int CurrentFrameWidth => _frameContent?.Width ?? 0;
     public int CurrentFrameHeight => _frameContent?.Height ?? 0;
+    
+    // 获取当前帧的 SKBitmap（用于 GPU 渲染直接绘制，避免字节数组复制）
+    public SKBitmap GetCurrentFrameBitmap()
+    {
+        return _frameContent;
+    }
+    
+    // 直接渲染当前帧到外部 Canvas（GPU 模式核心接口）
+    // 返回 true 表示渲染成功
+    public bool RenderToCanvas(SKCanvas canvas)
+    {
+        if (canvas == null || _frameContent == null) return false;
+        
+        try
+        {
+            canvas.DrawBitmap(_frameContent, 0, 0);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+    
+    // 直接渲染当前帧到外部 Canvas（带缩放适配）
+    public bool RenderToCanvas(SKCanvas canvas, SKRect destRect)
+    {
+        if (canvas == null || _frameContent == null) return false;
+        
+        try
+        {
+            var srcRect = new SKRect(0, 0, _frameContent.Width, _frameContent.Height);
+            canvas.DrawBitmap(_frameContent, srcRect, destRect);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     // 预览模式初始化（不需要导出器，以后要改）
     public void InitializeForPreview()
@@ -4330,12 +4420,14 @@ public class Generator
         }
         _sortedNotesBuffer.Sort((a, b) => a.Channel.CompareTo(b.Channel));
         
-        // 按通道分组批量绘制音符
-        using var notePath = new SKPath();
-        using var activePath = new SKPath();
+        // 批量绘制音符
+        // 禁用抗锯齿以提高大量矩形的渲染性能
+        _pianoRollNotePaint.IsAntialias = false;
+        
+        // 使用复用路径（避免每帧创建）
+        _activeNotePath.Reset();
         
         // 预计算常量
-        int lastChannel = -1;
         float halfWidth = noteWidth * 0.4f;
         float invMsPerPixel = 1f / msPerPixel;
         float regionLeft = region.Left;
@@ -4352,47 +4444,31 @@ public class Generator
             float noteHeight = Math.Max(3, noteEndY - noteStartY);
             var noteRect = new SKRect(noteX - halfWidth, noteStartY, noteX + halfWidth, noteStartY + noteHeight);
             
-            // 通道变化时，先绘制之前的批次
-            if (note.Channel != lastChannel && notePath.PointCount > 0)
-            {
-                _frameCanvas.DrawPath(notePath, _pianoRollNotePaint);
-                notePath.Reset();
-            }
+            // 根据力度调整颜色明暗度
+            var baseColor = _channelColorCache[note.Channel & 0xF];
+            float velocityScale = 0.5f + (note.Velocity / 127f) * 0.5f;
+            _pianoRollNotePaint.Color = new SKColor(
+                (byte)(baseColor.Red * velocityScale),
+                (byte)(baseColor.Green * velocityScale),
+                (byte)(baseColor.Blue * velocityScale),
+                (byte)(220 * velocityScale));
             
-            // 更新颜色（使用缓存的基础颜色）
-            if (note.Channel != lastChannel)
-            {
-                var baseColor = _channelColorCache[note.Channel & 0xF];
-                float velocityScale = 0.5f + (note.Velocity / 127f) * 0.5f;
-                _pianoRollNotePaint.Color = new SKColor(
-                    (byte)(baseColor.Red * velocityScale),
-                    (byte)(baseColor.Green * velocityScale),
-                    (byte)(baseColor.Blue * velocityScale),
-                    (byte)(220 * velocityScale));
-                lastChannel = note.Channel;
-            }
+            // 直接绘制每个音符
+            _frameCanvas.DrawRect(noteRect, _pianoRollNotePaint);
             
-            notePath.AddRect(noteRect);
-            
-            // 正在播放的音符
+            // 正在播放的音符添加到高亮路径
             if (note.StartMs <= currentTimeMs && note.EndMs >= currentTimeMs)
             {
-                activePath.AddRect(noteRect);
+                _activeNotePath.AddRect(noteRect);
             }
-        }
-        
-        // 绘制最后一批音符
-        if (notePath.PointCount > 0)
-        {
-            _frameCanvas.DrawPath(notePath, _pianoRollNotePaint);
         }
         
         // 绘制活动音符高亮
-        if (activePath.PointCount > 0)
+        if (_activeNotePath.PointCount > 0)
         {
             _strokePaint.Color = SKColors.White;
             _strokePaint.StrokeWidth = 1.5f;
-            _frameCanvas.DrawPath(activePath, _strokePaint);
+            _frameCanvas.DrawPath(_activeNotePath, _strokePaint);
         }
         
         // 播放指示器 "▶" 已移至主绘制循环，统一由 _visualizerTransition 管理位置
@@ -4400,28 +4476,43 @@ public class Generator
         // 绘制底部打击乐器显示区域（在遮罩之前）
         DrawDrumIndicators(region, currentTimeMs);
         
-        // 渐变遮罩
+        // 渐变遮罩（缓存机制，仅在区域变化时重建着色器）
         float fadeHeight = region.Height * 0.15f;
         
-        using (var topShader = SKShader.CreateLinearGradient(
-            new SKPoint(region.Left, region.Top),
-            new SKPoint(region.Left, region.Top + fadeHeight),
-            new[] { new SKColor(16, 16, 16, 255), new SKColor(16, 16, 16, 0) },
-            SKShaderTileMode.Clamp))
+        // 检查是否需要重建渐变着色器
+        if (_pianoRollTopShader == null || 
+            Math.Abs(_cachedPianoRollFadeHeight - fadeHeight) > 0.1f ||
+            Math.Abs(_cachedPianoRollRegion.Left - region.Left) > 0.1f ||
+            Math.Abs(_cachedPianoRollRegion.Top - region.Top) > 0.1f ||
+            Math.Abs(_cachedPianoRollRegion.Bottom - region.Bottom) > 0.1f)
         {
-            _gradientPaint.Shader = topShader;
-            _frameCanvas.DrawRect(new SKRect(region.Left, region.Top, region.Right, region.Top + fadeHeight), _gradientPaint);
+            // 释放旧着色器
+            _pianoRollTopShader?.Dispose();
+            _pianoRollBottomShader?.Dispose();
+            
+            // 创建新着色器
+            _pianoRollTopShader = SKShader.CreateLinearGradient(
+                new SKPoint(region.Left, region.Top),
+                new SKPoint(region.Left, region.Top + fadeHeight),
+                new[] { new SKColor(16, 16, 16, 255), new SKColor(16, 16, 16, 0) },
+                SKShaderTileMode.Clamp);
+            
+            _pianoRollBottomShader = SKShader.CreateLinearGradient(
+                new SKPoint(region.Left, region.Bottom - fadeHeight),
+                new SKPoint(region.Left, region.Bottom),
+                new[] { new SKColor(16, 16, 16, 0), new SKColor(16, 16, 16, 255) },
+                SKShaderTileMode.Clamp);
+            
+            _cachedPianoRollFadeHeight = fadeHeight;
+            _cachedPianoRollRegion = region;
         }
         
-        using (var bottomShader = SKShader.CreateLinearGradient(
-            new SKPoint(region.Left, region.Bottom - fadeHeight),
-            new SKPoint(region.Left, region.Bottom),
-            new[] { new SKColor(16, 16, 16, 0), new SKColor(16, 16, 16, 255) },
-            SKShaderTileMode.Clamp))
-        {
-            _gradientPaint.Shader = bottomShader;
-            _frameCanvas.DrawRect(new SKRect(region.Left, region.Bottom - fadeHeight, region.Right, region.Bottom), _gradientPaint);
-        }
+        // 使用缓存的着色器绘制渐变
+        _gradientPaint.Shader = _pianoRollTopShader;
+        _frameCanvas.DrawRect(new SKRect(region.Left, region.Top, region.Right, region.Top + fadeHeight), _gradientPaint);
+        
+        _gradientPaint.Shader = _pianoRollBottomShader;
+        _frameCanvas.DrawRect(new SKRect(region.Left, region.Bottom - fadeHeight, region.Right, region.Bottom), _gradientPaint);
         
         _gradientPaint.Shader = null;
     }
@@ -4771,9 +4862,26 @@ public class Generator
                          channel.Label ?? "CH", isOn ? _channelLabelOnColor : _channelLabelOffColor, VerticalAlign.Center);
                 colX = pianoX;
                 
-                // 钢琴方块键盘（使用自适应偏移和缩放，传递float类型八度数）
-                DrawPianoBlocks(colX, rowY + 1 * s, pianoWidth, rowHeight - 2 * s, 
-                               channel.Note, isOn, displayOctaves, noteOffset);
+                // 根据芯片的可视化样式选择不同的绘制方法
+                switch (chip.VisualizationStyle)
+                {
+                    case VgmVisualizer.PcmVisualizationStyle.Bar:
+                        // PCM 长条样式（固定音高+可切换采样）
+                        DrawPcmBar(colX, rowY + 1 * s, pianoWidth, rowHeight - 2 * s, isOn, channel.AttackFlash);
+                        break;
+                    
+                    case VgmVisualizer.PcmVisualizationStyle.Rhythm:
+                        // 节奏格子样式（固定音高+固定采样）
+                        DrawRhythmBlock(colX, rowY + 1 * s, pianoWidth, rowHeight - 2 * s, channel.AttackFlash);
+                        break;
+                    
+                    case VgmVisualizer.PcmVisualizationStyle.Piano:
+                    default:
+                        // 钢琴方块键盘（使用自适应偏移和缩放，传递float类型八度数）
+                        DrawPianoBlocks(colX, rowY + 1 * s, pianoWidth, rowHeight - 2 * s, 
+                                       channel.Note, isOn, displayOctaves, noteOffset);
+                        break;
+                }
                 colX += pianoWidth + gapWidth;
                 
                 // 音符名称
@@ -4849,28 +4957,29 @@ public class Generator
         // 时间范围
         float historyWindowMs = 4000f;
         
-        // 绘制黑键背景
+        // 绘制黑键背景（复用画笔）
         int[] blackKeys = { 1, 3, 6, 8, 10 };
-        using var blackKeyBgPaint = new SKPaint { Color = new SKColor(15, 15, 15), IsAntialias = false };
+        _multiPcmBlackKeyPaint.Color = new SKColor(15, 15, 15);
         for (int note = minNote; note < maxNote; note++)
         {
             int semitone = note % 12;
             if (Array.IndexOf(blackKeys, semitone) >= 0)
             {
                 float x = areaLeft + leftMargin + (note - minNote) * keyWidth;
-                _frameCanvas.DrawRect(x, areaTop + topMargin, keyWidth, pianoH, blackKeyBgPaint);
+                _frameCanvas.DrawRect(x, areaTop + topMargin, keyWidth, pianoH, _multiPcmBlackKeyPaint);
             }
         }
         
-        // 绘制八度分隔线
-        using var gridPaint = new SKPaint { Color = new SKColor(40, 40, 40), StrokeWidth = 1 * s, IsAntialias = false };
+        // 绘制八度分隔线（复用画笔）
+        _multiPcmGridPaint.Color = new SKColor(40, 40, 40);
+        _multiPcmGridPaint.StrokeWidth = 1 * s;
         for (int oct = 0; oct <= 8; oct++)
         {
             int note = oct * 12;
             if (note >= minNote && note <= maxNote)
             {
                 float x = areaLeft + leftMargin + (note - minNote) * keyWidth;
-                _frameCanvas.DrawLine(x, areaTop + topMargin, x, areaTop + topMargin + pianoH, gridPaint);
+                _frameCanvas.DrawLine(x, areaTop + topMargin, x, areaTop + topMargin + pianoH, _multiPcmGridPaint);
             }
         }
         
@@ -4893,8 +5002,7 @@ public class Generator
             }
         }
         
-        // 绘制历史音符（顶部=现在，底部=历史）
-        using var historyPaint = new SKPaint { IsAntialias = false };
+        // 绘制历史音符（顶部=现在，底部=历史，复用画笔）
         foreach (var entry in history)
         {
             if (entry.Note < minNote || entry.Note >= maxNote) continue;
@@ -4932,14 +5040,15 @@ public class Generator
                 brightness = 40 + fade * 80;  // 40-120
             }
             
-            historyPaint.Color = new SKColor((byte)brightness, (byte)brightness, (byte)brightness);
-            _frameCanvas.DrawRect(noteX, y1, noteW, noteH, historyPaint);
+            _multiPcmHistoryPaint.Color = new SKColor((byte)brightness, (byte)brightness, (byte)brightness);
+            _frameCanvas.DrawRect(noteX, y1, noteW, noteH, _multiPcmHistoryPaint);
         }
         
-        // 当前时间线
-        using var timeLinePaint = new SKPaint { Color = new SKColor(80, 80, 80), StrokeWidth = 1 * s, IsAntialias = false };
+        // 当前时间线（复用画笔）
+        _multiPcmTimeLinePaint.Color = new SKColor(80, 80, 80);
+        _multiPcmTimeLinePaint.StrokeWidth = 1 * s;
         _frameCanvas.DrawLine(areaLeft + leftMargin, areaTop + topMargin, 
-                             areaLeft + leftMargin + pianoW, areaTop + topMargin, timeLinePaint);
+                             areaLeft + leftMargin + pianoW, areaTop + topMargin, _multiPcmTimeLinePaint);
         
         // 收集活跃音符信息用于标签显示
         string[] noteNames = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
@@ -4962,7 +5071,7 @@ public class Generator
         // 按 X 位置排序，检测重叠
         activeNotes.Sort((a, b) => a.x.CompareTo(b.x));
         
-        using var textPaint = new SKPaint { IsAntialias = true };
+        // 使用复用画笔绘制文本
         float minLabelSpacing = 35 * s;  // 标签最小间距
         float lastLabelX = float.MinValue;
         
@@ -4988,33 +5097,33 @@ public class Generator
             int octave = note / 12;
             
             // 第1行: 音符名
-            textPaint.Color = SKColors.White;
-            textPaint.TextSize = 9 * s;
-            textPaint.TextAlign = SKTextAlign.Center;
-            _frameCanvas.DrawText($"{noteName}{octave}", centerX, areaTop + topMargin - 32 * s, textPaint);
+            _multiPcmTextPaint.Color = SKColors.White;
+            _multiPcmTextPaint.TextSize = 9 * s;
+            _multiPcmTextPaint.TextAlign = SKTextAlign.Center;
+            _frameCanvas.DrawText($"{noteName}{octave}", centerX, areaTop + topMargin - 32 * s, _multiPcmTextPaint);
             
             // 第2行: D:值
             string detuneStr = detune >= 0 ? $"D:+{detune}" : $"D:{detune}";
-            textPaint.Color = new SKColor(170, 170, 170);
-            _frameCanvas.DrawText(detuneStr, centerX, areaTop + topMargin - 21 * s, textPaint);
+            _multiPcmTextPaint.Color = new SKColor(170, 170, 170);
+            _frameCanvas.DrawText(detuneStr, centerX, areaTop + topMargin - 21 * s, _multiPcmTextPaint);
             
             // 第3行: 音量
-            textPaint.Color = new SKColor(136, 136, 136);
-            _frameCanvas.DrawText($"V:{vol}", centerX, areaTop + topMargin - 10 * s, textPaint);
+            _multiPcmTextPaint.Color = new SKColor(136, 136, 136);
+            _frameCanvas.DrawText($"V:{vol}", centerX, areaTop + topMargin - 10 * s, _multiPcmTextPaint);
         }
         
         // 底部八度标签（在钢琴区下方）
         float octaveLabelY = areaTop + topMargin + pianoH + 12 * s;
-        textPaint.Color = new SKColor(100, 100, 100);
-        textPaint.TextSize = 10 * s;
-        textPaint.TextAlign = SKTextAlign.Left;
+        _multiPcmTextPaint.Color = new SKColor(100, 100, 100);
+        _multiPcmTextPaint.TextSize = 10 * s;
+        _multiPcmTextPaint.TextAlign = SKTextAlign.Left;
         for (int oct = 0; oct <= 8; oct++)
         {
             int note = oct * 12;
             if (note >= minNote && note < maxNote)
             {
                 float x = areaLeft + leftMargin + (note - minNote) * keyWidth;
-                _frameCanvas.DrawText($"o{oct}", x + 2 * s, octaveLabelY, textPaint);
+                _frameCanvas.DrawText($"o{oct}", x + 2 * s, octaveLabelY, _multiPcmTextPaint);
             }
         }
         
@@ -5026,12 +5135,12 @@ public class Generator
         float totalPoolW = 28 * (cellSize + cellGap) - cellGap;
         
         // 活跃通道数显示
-        textPaint.TextSize = 9 * s;
-        textPaint.Color = new SKColor(120, 120, 120);
-        textPaint.TextAlign = SKTextAlign.Left;
-        _frameCanvas.DrawText($"CH: {activeCount}/28", poolBarX + totalPoolW + 10 * s, poolY + cellSize - 1 * s, textPaint);
+        _multiPcmTextPaint.TextSize = 9 * s;
+        _multiPcmTextPaint.Color = new SKColor(120, 120, 120);
+        _multiPcmTextPaint.TextAlign = SKTextAlign.Left;
+        _frameCanvas.DrawText($"CH: {activeCount}/28", poolBarX + totalPoolW + 10 * s, poolY + cellSize - 1 * s, _multiPcmTextPaint);
         
-        using var poolPaint = new SKPaint { IsAntialias = false };
+        // 使用复用画笔绘制通道池
         for (int i = 0; i < 28 && i < channels.Length; i++)
         {
             float x = poolBarX + i * (cellSize + cellGap);
@@ -5040,20 +5149,20 @@ public class Generator
             if (ch.KeyOn && ch.Volume > 0)
             {
                 byte brightness = (byte)(150 + (ch.Volume / 127f) * 105);
-                poolPaint.Color = new SKColor(brightness, brightness, brightness);
+                _multiPcmPoolPaint.Color = new SKColor(brightness, brightness, brightness);
             }
             else
             {
-                poolPaint.Color = new SKColor(35, 35, 35);
+                _multiPcmPoolPaint.Color = new SKColor(35, 35, 35);
             }
-            _frameCanvas.DrawRect(x, poolY, cellSize, cellSize, poolPaint);
+            _frameCanvas.DrawRect(x, poolY, cellSize, cellSize, _multiPcmPoolPaint);
         }
         
         // 芯片名称
-        textPaint.Color = SKColors.White;
-        textPaint.TextSize = 12 * s;
-        textPaint.TextAlign = SKTextAlign.Left;
-        _frameCanvas.DrawText("MultiPCM (YMW258-F)", areaLeft, areaTop + 12 * s, textPaint);
+        _multiPcmTextPaint.Color = SKColors.White;
+        _multiPcmTextPaint.TextSize = 12 * s;
+        _multiPcmTextPaint.TextAlign = SKTextAlign.Left;
+        _frameCanvas.DrawText("MultiPCM (YMW258-F)", areaLeft, areaTop + 12 * s, _multiPcmTextPaint);
     }
     
     // VGM 可视化静态颜色（避免每帧创建 SKColor 对象）
@@ -5087,9 +5196,9 @@ public class Generator
         float fractionalOffset = noteOffset - offsetNotes;
         float pixelOffset = fractionalOffset * keyWidth;
         
-        // 使用两个 SKPath 分别收集白键和黑键
-        using var whiteKeyPath = new SKPath();
-        using var blackKeyPath = new SKPath();
+        // 使用复用 SKPath（避免每帧创建）
+        _chipViewWhiteKeyPath.Reset();
+        _chipViewBlackKeyPath.Reset();
         
         // 绘制的实际键范围（从 offsetNotes 开始）
         for (int i = 0; i < totalKeys; i++)
@@ -5110,18 +5219,18 @@ public class Generator
             var keyRect = new SKRect(Math.Max(x, keyX), y, Math.Min(x + width, keyX + keyDrawWidth), y + height);
             
             if (isBlackKey)
-                blackKeyPath.AddRect(keyRect);
+                _chipViewBlackKeyPath.AddRect(keyRect);
             else
-                whiteKeyPath.AddRect(keyRect);
+                _chipViewWhiteKeyPath.AddRect(keyRect);
         }
         
         // 批量绘制白键
         _fillPaint.Color = _pianoKeyOffColor;
-        _frameCanvas.DrawPath(whiteKeyPath, _fillPaint);
+        _frameCanvas.DrawPath(_chipViewWhiteKeyPath, _fillPaint);
         
         // 批量绘制黑键
         _fillPaint.Color = _pianoBlackKeyColor;
-        _frameCanvas.DrawPath(blackKeyPath, _fillPaint);
+        _frameCanvas.DrawPath(_chipViewBlackKeyPath, _fillPaint);
         
         // 绘制活跃键（考虑偏移）
         if (isOn && note >= 0)
@@ -5167,6 +5276,45 @@ public class Generator
                 }
             }
         }
+    }
+    
+    // 绘制 PCM 长条样式（固定音高+可切换采样的芯片，如 OKIM6295） 
+    // 视觉效果：黑灰长条，触发时变白并渐变到灰色，结束时渐变回黑灰色 
+    private void DrawPcmBar(float x, float y, float width, float height, bool isOn, float attackFlash)
+    {
+        float s = ResolutionScale;
+        
+        // 颜色定义
+        byte baseGray = isOn ? (byte)136 : (byte)51;  // 持续播放=灰色(0x88)，结束=黑灰色(0x33)
+        byte flashGray = (byte)(baseGray + (255 - baseGray) * attackFlash);  // 触发时闪白
+        
+        var barColor = new SKColor(flashGray, flashGray, flashGray);
+        
+        // 绘制长条背景
+        _fillPaint.Color = new SKColor(34, 34, 34);  // 深黑灰背景 #222222
+        _frameCanvas.DrawRect(x, y, width, height, _fillPaint);
+        
+        // 绘制活跃状态的长条
+        if (isOn || attackFlash > 0.01f)
+        {
+            _fillPaint.Color = barColor;
+            _frameCanvas.DrawRect(x + 1 * s, y + 1 * s, width - 2 * s, height - 2 * s, _fillPaint);
+        }
+    }
+    
+    // 绘制节奏格子样式（固定音高+固定采样的芯片，如 YM2608 RHY）
+    // 视觉效果：与钢琴窗同宽同高的单个黑灰格子，触发时闪白并快速渐变回黑灰色
+    private void DrawRhythmBlock(float x, float y, float width, float height, float attackFlash)
+    {
+        // 颜色定义：触发时闪白，然后快速渐变回黑灰色
+        byte baseGray = 51;  // 默认黑灰色 #333333
+        byte flashGray = (byte)(baseGray + (255 - baseGray) * attackFlash);
+        
+        var blockColor = new SKColor(flashGray, flashGray, flashGray);
+        
+        // 绘制格子
+        _fillPaint.Color = blockColor;
+        _frameCanvas.DrawRect(x, y, width, height, _fillPaint);
     }
     
     // 绘制立体声音量条（L/R双柱横向显示，支持打击闪光）

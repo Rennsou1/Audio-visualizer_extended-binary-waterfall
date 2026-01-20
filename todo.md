@@ -1,0 +1,60 @@
+# 未来添加功能
+
+- [x] **Stream View**
+    - View: Binary Waterfall
+    - wav，flac等流式传输格式
+
+- [x] **MIDI View**
+    - View: Piano Roll
+    - MIDI格式
+
+- [ ] **Track View**
+    - View: Tracker
+    - .mod .it .s3m .xm 等Tracker格式
+    - https://openmpt.org/
+
+- [ ] **VGM View** (待完善)
+    - View: Note and Register
+    - .VGM .VGZ 等VGM格式
+    - https://github.com/ValleyBell/libvgm
+    - https://github.com/kuma4649/MDPlayer
+
+- [ ] **MML View**
+    - View: Real Time MML + Register
+    - .MML .M .MDX 等MML格式 (优先实现MDX)
+    - https://github.com/kuma4649/mml2vgm
+    - https://github.com/vampirefrog/mdxtools
+    - https://github.com/Rennsou1/MXDRV-Manual
+    - http://dmpsoft.s17.xrea.com/hoot/index.html
+
+
+# BUG
+
+- [x] **"RF5C" 无法正常渲染音频**
+    - 备注1：需要对libvgm源码进行修改后编译（https://github.com/Rennsou1/libvgm）
+    - 备注2：原项目已修复该错误（https://github.com/ValleyBell/libvgm）
+    - 原因：在 `libvgm-src/player/vgmplayer_cmdhandler.cpp` 中存在边界检查条件 bug
+        - 原来：
+          ```cpp
+          if (_pcmBank[dbType].data.size() - dbPos > dataLen)
+              return;  // just outright ignore writes that would go out-of-bounds
+          ```
+        - 修复后：
+          ```cpp
+          if (_pcmBank[dbType].data.size() - dbPos < dataLen)
+              return;  // just outright ignore writes that would go out-of-bounds
+          ```
+    - 这段代码是处理 VGM 0x68 命令（PCM RAM Write）的函数 `Cmd_PcmRamWrite()`
+    - 由于条件完全反了，所有 PCM RAM Write 命令都被忽略，导致 RF5C164 芯片的 RAM 中没有任何采样数据，音频无法播放
+    - 这个 bug 影响所有使用 0x68 命令（PCM RAM Write）的 VGM 文件
+
+- [ ] **MIDI 在音符过多的情况下会闪烁** (未修复)
+- [ ] **VGM音量条抖动** (待验证)
+- [ ] **D值不正确** (部分修复)
+- [ ] **大部分芯片VGM VIEW不正常（无数值，错误显示）** (修复中)
+    - [ ] GBA
+    - [ ] K051649
+    - [ ] K053260
+    - [ ] K055556
+    - [ ] K05556
+    - [ ] GA20

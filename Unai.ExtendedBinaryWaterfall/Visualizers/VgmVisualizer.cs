@@ -7,6 +7,14 @@ namespace Unai.ExtendedBinaryWaterfall;
 // VGM 可视化器
 public class VgmVisualizer : IDisposable
 {
+    // PCM 可视化样式枚举
+    public enum PcmVisualizationStyle
+    {
+        Piano,      // 标准钢琴键盘视图（FM 和可变音高 PCM）
+        Bar,        // 长条样式（固定音高+可切换采样）
+        Rhythm      // 节奏格子样式（固定音高+固定采样，如 YM2608 RHY）
+    }
+    
     // 芯片通道状态
     public class ChannelState
     {
@@ -35,6 +43,7 @@ public class VgmVisualizer : IDisposable
         public float AttackFlash;     // 打击闪光强度 (0-1)，触发时为1，快速衰减
         public string Label;          // 通道标签
         public int Detune;            // Detune 音高偏移值 (有符号)
+        public int SampleId;          // 当前采样 ID（用于 PCM 芯片）
     }
 
     // 芯片状态
@@ -43,6 +52,7 @@ public class VgmVisualizer : IDisposable
         public VgmChipInfo Info;
         public ChannelState[] Channels;
         public byte[] Registers;
+        public PcmVisualizationStyle VisualizationStyle;  // PCM 可视化样式
     }
     
     // 音符历史记录（用于 Piano Roll 视图）
@@ -93,8 +103,14 @@ public class VgmVisualizer : IDisposable
     private float _pianoOffsetTarget;     // 目标偏移量
     private float _pianoDisplayOctaves;   // 当前显示的八度数（用于缩放）
     private float _pianoDisplayOctavesTarget; // 目标显示八度数
-    private const float PIANO_SLIDE_SPEED = 6f;   // 滑动速度（较慢，约500ms完成）
-    private const float PIANO_ZOOM_SPEED = 4f;    // 缩放速度（更慢，约750ms完成）
+    // 钢琴窗动画时间控制（使用 Ease-out Cubic 缓动函数）
+    private const float PIANO_ANIMATION_DURATION = 0.8f; // 动画时长 800ms
+    private float _pianoOffsetAnimTime;        // 偏移动画已用时间
+    private float _pianoOffsetStart;           // 偏移动画起点
+    private float _pianoScaleAnimTime;         // 缩放动画已用时间  
+    private float _pianoScaleStart;            // 缩放动画起点
+    private float _lastPianoOffsetTarget;      // 上次的偏移目标（用于检测目标变化）
+    private float _lastPianoScaleTarget;       // 上次的缩放目标
     
     // 滑动稳定性控制
     private float _lastSlideTime;         // 上次触发滑动的时间累计
@@ -225,25 +241,45 @@ public class VgmVisualizer : IDisposable
             }
         }
         
-        // 平滑过渡偏移（使用非线性插值，避免抖动）
-        float offsetDiff = _pianoOffsetTarget - _pianoOffset;
-        if (Math.Abs(offsetDiff) > 0.005f)
+        // 平滑过渡偏移（使用时间基准的 Ease-out Cubic 缓动函数，精确 800ms）
+        if (Math.Abs(_pianoOffsetTarget - _lastPianoOffsetTarget) > 0.01f)
         {
-            // 差距大时快速移动，差距小时慢速（指数衰减）
-            float speed = PIANO_SLIDE_SPEED * (0.3f + Math.Abs(offsetDiff) * 0.7f);
-            _pianoOffset += offsetDiff * Math.Min(1f, speed * deltaTime);
+            // 目标变化，重启动画
+            _pianoOffsetStart = _pianoOffset;
+            _pianoOffsetAnimTime = 0;
+            _lastPianoOffsetTarget = _pianoOffsetTarget;
+        }
+        
+        float offsetDiff = _pianoOffsetTarget - _pianoOffset;
+        if (Math.Abs(offsetDiff) > 0.001f && _pianoOffsetAnimTime < PIANO_ANIMATION_DURATION)
+        {
+            _pianoOffsetAnimTime += deltaTime;
+            float t = Math.Clamp(_pianoOffsetAnimTime / PIANO_ANIMATION_DURATION, 0f, 1f);
+            // Ease-out Cubic: 1 - (1-t)^3
+            float eased = 1f - MathF.Pow(1f - t, 3f);
+            _pianoOffset = _pianoOffsetStart + (_pianoOffsetTarget - _pianoOffsetStart) * eased;
         }
         else
         {
             _pianoOffset = _pianoOffsetTarget;
         }
         
-        // 平滑过渡缩放（更慢的速度）
-        float scaleDiff = _pianoDisplayOctavesTarget - _pianoDisplayOctaves;
-        if (Math.Abs(scaleDiff) > 0.005f)
+        // 平滑过渡缩放（同样使用 Ease-out Cubic，精确 800ms）
+        if (Math.Abs(_pianoDisplayOctavesTarget - _lastPianoScaleTarget) > 0.01f)
         {
-            float speed = PIANO_ZOOM_SPEED * (0.2f + Math.Abs(scaleDiff) * 0.3f);
-            _pianoDisplayOctaves += scaleDiff * Math.Min(1f, speed * deltaTime);
+            // 目标变化，重启动画
+            _pianoScaleStart = _pianoDisplayOctaves;
+            _pianoScaleAnimTime = 0;
+            _lastPianoScaleTarget = _pianoDisplayOctavesTarget;
+        }
+        
+        float scaleDiff = _pianoDisplayOctavesTarget - _pianoDisplayOctaves;
+        if (Math.Abs(scaleDiff) > 0.001f && _pianoScaleAnimTime < PIANO_ANIMATION_DURATION)
+        {
+            _pianoScaleAnimTime += deltaTime;
+            float t = Math.Clamp(_pianoScaleAnimTime / PIANO_ANIMATION_DURATION, 0f, 1f);
+            float eased = 1f - MathF.Pow(1f - t, 3f);
+            _pianoDisplayOctaves = _pianoScaleStart + (_pianoDisplayOctavesTarget - _pianoScaleStart) * eased;
         }
         else
         {
@@ -261,10 +297,10 @@ public class VgmVisualizer : IDisposable
     private string _cachedVersionString;
     
     // 声像平滑设置（毫秒）
-    // 平衡抖动抑制和冲击感
-    private const float PAN_RELEASE_MS = 120f;   // 释放时间（保持冲击感）
-    private const float PAN_ATTACK_MS = 15f;     // 上升时间（快速响应）
-    private const float PEAK_DECAY_MS = 150f;    // 峰值衰减时间（较大值抑制抖动）
+    // 优化：更快的响应速度，同时通过死区和容差抑制抖动
+    private const float PAN_RELEASE_MS = 80f;    // 释放时间（更快响应）
+    private const float PAN_ATTACK_MS = 8f;      // 上升时间（极快响应）
+    private const float PEAK_DECAY_MS = 100f;    // 峰值衰减时间（较快衰减）
 
     public IReadOnlyList<ChipState> ChipStates => _chipStates;
     public VgmHeader Header => _header;
@@ -336,7 +372,8 @@ public class VgmVisualizer : IDisposable
             {
                 Info = chip,
                 Channels = new ChannelState[chip.ChannelCount],
-                Registers = new byte[256]
+                Registers = new byte[256],
+                VisualizationStyle = GetPcmVisualizationStyle(chip.Name)
             };
 
             for (int i = 0; i < chip.ChannelCount; i++)
@@ -389,7 +426,8 @@ public class VgmVisualizer : IDisposable
                 "NES APU" => new NesApuTracker(),
                 "GB DMG" => new GbDmgTracker(),
                 "HuC6280" => new HuC6280Tracker(),
-                "YM3812" or "YM3526" or "Y8950" or "YMF262" => new OplTracker(),
+                "YM3812" or "YM3526" or "Y8950" => new OplTracker(),
+                "YMF262" => new Opl3Tracker(),  // OPL3 使用专用18通道Tracker
                 "QSound" => new QSoundTracker(),
                 "K051649" => new K051649Tracker(),
                 "POKEY" => new PokeyTracker(),
@@ -679,10 +717,10 @@ public class VgmVisualizer : IDisposable
             return;
         }
         
-        // 容差值：避免微小波动导致跳动（约 5% 的变化会被忽略）
-        const float TOLERANCE = 0.05f;
-        // 输入平滑时间常数（毫秒）
-        const float INPUT_SMOOTH_MS = 40f;
+        // 容差值：避免微小波动导致跳动（约 8% 的变化会被忽略）
+        const float TOLERANCE = 0.08f;
+        // 输入平滑时间常数（毫秒）- 更快的输入响应
+        const float INPUT_SMOOTH_MS = 20f;
         
         float peakDecay = deltaMs / PEAK_DECAY_MS;
         float attackFactor = MathF.Min(1f, deltaMs / PAN_ATTACK_MS);
@@ -774,7 +812,7 @@ public class VgmVisualizer : IDisposable
             
             // 显示值跟随峰值平滑变化（添加死区检测避免维持音量时抖动）
             float diffLeft = ch.PeakPanLeft - ch.DisplayPanLeft;
-            if (MathF.Abs(diffLeft) < 0.005f)
+            if (MathF.Abs(diffLeft) < 0.01f)
             {
                 // 死区：差值很小时直接锁定到目标值
                 ch.DisplayPanLeft = ch.PeakPanLeft;
@@ -785,7 +823,7 @@ public class VgmVisualizer : IDisposable
                 ch.DisplayPanLeft = MathF.Max(0, ch.DisplayPanLeft - releaseFactor);
                 
             float diffRight = ch.PeakPanRight - ch.DisplayPanRight;
-            if (MathF.Abs(diffRight) < 0.005f)
+            if (MathF.Abs(diffRight) < 0.01f)
             {
                 ch.DisplayPanRight = ch.PeakPanRight;
             }
@@ -872,6 +910,51 @@ public class VgmVisualizer : IDisposable
         "ES5506" => VgmCommandParser.CHIP_ES5506,
         _ => 0
     };
+
+    // 根据芯片名称获取 PCM 可视化样式
+    // 分类依据：
+    // - Piano: FM 芯片和可变音高 PCM 芯片（支持任意音高回放）
+    // - Bar: 固定音高+可切换采样的 PCM 芯片（只能切换采样，无法改变音高）
+    // - Rhythm: 固定音高+固定采样的节奏通道（如 YM2608 RHY）
+    private static PcmVisualizationStyle GetPcmVisualizationStyle(string chipName)
+    {
+        // 去掉 "#2" 等后缀
+        string baseName = chipName ?? string.Empty;
+        int hashIdx = baseName.IndexOf('#');
+        if (hashIdx > 0)
+            baseName = baseName[..hashIdx].TrimEnd();
+        
+        return baseName switch
+        {
+            // 固定音高+可切换采样 -> Bar 样式
+            // OKIM6295: 固定采样率，由时钟和 Pin7 决定
+            // OKIM6258: ADPCM 回放，固定采样率
+            // YMZ280B: ADPCM 回放，固定采样率
+            // RF5C68/164: 虽然有 pitch 控制，但实际使用中通常作为固定音高采样器
+            // uPD7759: ADPCM 回放，固定采样率
+            // PWM: 简单 PCM 回放
+            // VSU: Virtual Boy 音源
+            // X1-010: 采样回放芯片
+            // C140: 虽然有 pitch 但通常用于固定音高
+            // K053260: 固定音高 PCM
+            // SAA1099: 简单方波/噪声芯片
+            // Y8950: ADPCM 部分
+            "OKIM6295" or "OKIM6258" or "YMZ280B" or 
+            "RF5C68" or "RF5C164" or "uPD7759" or 
+            "PWM" or "VSU" or "X1-010" or "SAA1099" => PcmVisualizationStyle.Bar,
+            
+            // 可变音高+可切换采样 -> Piano 样式（默认）
+            // MultiPCM, SegaPCM, C352, K054539, SCSP, WonderSwan, ES5503, ES5506
+            // QSound, GA20, C140, K053260 等都支持 pitch 控制
+            // YM2608 的 ADPCM 通道和 YM2610 的 ADPCM-B 通道也支持可变音高
+            
+            // 注意: YM2608 和 YM2610 的 FM 部分使用 Piano，ADPCM 部分需要特殊处理
+            // 但由于这里是芯片级别的判断，无法区分单独通道
+            // 通道级别的样式判断需要在渲染时根据通道标签进行
+            
+            _ => PcmVisualizationStyle.Piano  // 默认使用钢琴样式
+        };
+    }
 
     // 获取通道标签
         private static string GetChannelLabel(string chipName, int channelIndex)
